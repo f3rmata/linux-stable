@@ -1277,4 +1277,8 @@ int __sys_getsockopt(int fd, int level, int optname, char __user *optval,
 		int __user *optlen);
 int __sys_setsockopt(int fd, int level, int optname, char __user *optval,
 		int optlen);
+asmlinkage long sys_reset_swap_stats(void);
+asmlinkage long sys_get_swap_stats(int __user *ondemand_swapin_num,
+				   int __user *prefetch_swapin_num,
+				   int __user *hit_on_prefetch_num);
 #endif

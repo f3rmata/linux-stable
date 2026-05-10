@@ -68,6 +68,12 @@
 #include "internal.h"
 #include "swap.h"
 
+#ifdef CONFIG_HERMIT
+#include <linux/hermit.h>
+#include <linux/hermit_utils.h>
+#include <linux/swap_stats.h>
+#endif
+
 #define CREATE_TRACE_POINTS
 #include <trace/events/vmscan.h>
 
@@ -7183,6 +7189,31 @@ unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
 
 	return nr_reclaimed;
 }
+
+#ifdef CONFIG_HERMIT
+unsigned long hermit_try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
+						  unsigned long nr_pages,
+						  gfp_t gfp_mask, bool may_swap,
+						  struct task_struct *cthd,
+						  int *adc_pf_bits,
+						  uint64_t pf_breakdown[])
+{
+	unsigned int reclaim_options = may_swap ? MEMCG_RECLAIM_MAY_SWAP : 0;
+	unsigned long nr_reclaimed;
+	uint64_t pf_ts;
+
+	(void)cthd;
+	(void)adc_pf_bits;
+
+	pf_ts = pf_cycles_start();
+	nr_reclaimed = try_to_free_mem_cgroup_pages(memcg, nr_pages, gfp_mask,
+						    reclaim_options);
+	adc_pf_breakdown_end(pf_breakdown, ADC_PAGE_RECLAIM,
+			     pf_cycles_end() - pf_ts);
+
+	return nr_reclaimed;
+}
+#endif
 #endif
 
 static void kswapd_age_node(struct pglist_data *pgdat, struct scan_control *sc)

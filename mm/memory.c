@@ -78,6 +78,10 @@
 #include <linux/ptrace.h>
 #include <linux/vmalloc.h>
 #include <linux/sched/sysctl.h>
+#ifdef CONFIG_HERMIT
+#include <linux/hermit.h>
+#include <linux/swap_stats.h>
+#endif
 
 #include <trace/events/kmem.h>
 
@@ -3728,6 +3732,51 @@ static vm_fault_t handle_pte_marker(struct vm_fault *vmf)
 	return VM_FAULT_SIGBUS;
 }
 
+#ifdef CONFIG_HERMIT
+static struct folio *hermit_alloc_swap_folio(struct vm_fault *vmf)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct folio *folio;
+	swp_entry_t entry;
+
+	folio = vma_alloc_folio(GFP_HIGHUSER_MOVABLE, 0, vma, vmf->address,
+				false);
+	if (!folio)
+		return NULL;
+
+	entry = pte_to_swp_entry(vmf->orig_pte);
+	if (mem_cgroup_swapin_charge_folio(folio, vma->vm_mm, GFP_KERNEL,
+					   entry)) {
+		folio_put(folio);
+		return NULL;
+	}
+
+	return folio;
+}
+
+static inline bool hermit_should_bypass_swapcache(struct vm_fault *vmf,
+						  swp_entry_t entry)
+{
+	if (!hmt_ctl_flag(HMT_BPS_SCACHE))
+		return false;
+	if (IS_ENABLED(CONFIG_ZSWAP))
+		return false;
+	if (unlikely(userfaultfd_armed(vmf->vma)))
+		return false;
+	return __swap_count(entry) == 1;
+}
+
+static inline void hermit_account_ondemand_swapin(void)
+{
+	adc_profile_counter_inc(ADC_ONDEMAND_SWAPIN);
+}
+
+static inline void hermit_account_bypass_fallback(void)
+{
+	adc_profile_counter_inc(ADC_OPTIM_FAILED);
+}
+#endif
+
 /*
  * We enter with non-exclusive mmap_lock (to exclude vma changes,
  * but allow concurrent faults), and pte mapped but not yet locked.
@@ -3745,6 +3794,10 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	rmap_t rmap_flags = RMAP_NONE;
 	bool need_clear_cache = false;
 	bool exclusive = false;
+#ifdef CONFIG_HERMIT
+	bool hermit_bypass = false;
+	bool tried_hermit_bypass = false;
+#endif
 	swp_entry_t entry;
 	pte_t pte;
 	vm_fault_t ret = 0;
@@ -3810,8 +3863,23 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	swapcache = folio;
 
 	if (!folio) {
-		if (data_race(si->flags & SWP_SYNCHRONOUS_IO) &&
-		    __swap_count(entry) == 1) {
+		bool sync_direct = data_race(si->flags & SWP_SYNCHRONOUS_IO) &&
+				   __swap_count(entry) == 1;
+		bool bypass_swapcache = sync_direct;
+
+#ifdef CONFIG_HERMIT
+		hermit_bypass = hermit_should_bypass_swapcache(vmf, entry);
+		bypass_swapcache = bypass_swapcache || hermit_bypass;
+#endif
+		if (bypass_swapcache) {
+#ifdef CONFIG_HERMIT
+			if (!sync_direct && hermit_bypass) {
+				tried_hermit_bypass = true;
+				folio = hermit_alloc_swap_folio(vmf);
+				if (!folio)
+					goto fallback_swapin;
+			}
+#endif
 			/*
 			 * Prevent parallel swapin from proceeding with
 			 * the cache flag. Otherwise, another thread may
@@ -3820,6 +3888,8 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 			 * pte_same() returns true due to entry reuse.
 			 */
 			if (swapcache_prepare(entry)) {
+				if (folio)
+					folio_put(folio);
 				/* Relax a bit to prevent rapid repeated page faults */
 				schedule_timeout_uninterruptible(1);
 				goto out;
@@ -3827,19 +3897,27 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 			need_clear_cache = true;
 
 			/* skip swapcache */
-			folio = vma_alloc_folio(GFP_HIGHUSER_MOVABLE, 0,
-						vma, vmf->address, false);
-			page = &folio->page;
+			if (!folio)
+				folio = vma_alloc_folio(GFP_HIGHUSER_MOVABLE, 0,
+							vma, vmf->address,
+							false);
 			if (folio) {
+				page = &folio->page;
 				__folio_set_locked(folio);
 				__folio_set_swapbacked(folio);
 
-				if (mem_cgroup_swapin_charge_folio(folio,
-							vma->vm_mm, GFP_KERNEL,
-							entry)) {
-					ret = VM_FAULT_OOM;
-					goto out_page;
+#ifdef CONFIG_HERMIT
+				if (sync_direct || !tried_hermit_bypass) {
+#endif
+					if (mem_cgroup_swapin_charge_folio(
+						    folio, vma->vm_mm,
+						    GFP_KERNEL, entry)) {
+						ret = VM_FAULT_OOM;
+						goto out_page;
+					}
+#ifdef CONFIG_HERMIT
 				}
+#endif
 				mem_cgroup_swapin_uncharge_swap(entry);
 
 				shadow = get_shadow_from_swap_cache(entry);
@@ -3854,12 +3932,22 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 				folio->private = NULL;
 			}
 		} else {
+#ifdef CONFIG_HERMIT
+fallback_swapin:
+#endif
 			page = swapin_readahead(entry, GFP_HIGHUSER_MOVABLE,
 						vmf);
 			if (page)
 				folio = page_folio(page);
 			swapcache = folio;
 		}
+
+#ifdef CONFIG_HERMIT
+		if (!folio && !sync_direct && tried_hermit_bypass) {
+			hermit_account_bypass_fallback();
+			goto fallback_swapin;
+		}
+#endif
 
 		if (!folio) {
 			/*
@@ -3878,6 +3966,9 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 		ret = VM_FAULT_MAJOR;
 		count_vm_event(PGMAJFAULT);
 		count_memcg_event_mm(vma->vm_mm, PGMAJFAULT);
+#ifdef CONFIG_HERMIT
+		hermit_account_ondemand_swapin();
+#endif
 	} else if (PageHWPoison(page)) {
 		/*
 		 * hwpoisoned dirty swapcache pages are kept for killing

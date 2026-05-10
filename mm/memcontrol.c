@@ -74,6 +74,12 @@
 
 #include <trace/events/vmscan.h>
 
+#ifdef CONFIG_HERMIT
+#include <linux/hermit.h>
+#include <linux/hermit_utils.h>
+#include <linux/swap_stats.h>
+#endif
+
 struct cgroup_subsys memory_cgrp_subsys __read_mostly;
 EXPORT_SYMBOL(memory_cgrp_subsys);
 
@@ -2681,8 +2687,13 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
 	unsigned long pflags;
 
 retry:
-	if (consume_stock(memcg, nr_pages))
+	if (consume_stock(memcg, nr_pages)) {
+#ifdef CONFIG_HERMIT
+		atomic64_add(nr_pages, &memcg->total_pg_charge);
+		hmt_async_reclaim(current->mm, memcg);
+#endif
 		return 0;
+	}
 
 	if (!do_memsw_account() ||
 	    page_counter_try_charge(&memcg->memsw, batch, &counter)) {
@@ -2791,6 +2802,11 @@ force:
 	if (!raised_max_event)
 		memcg_memory_event(mem_over_limit, MEMCG_MAX);
 
+#ifdef CONFIG_HERMIT
+	atomic64_add(nr_pages, &memcg->total_pg_charge);
+	hmt_async_reclaim(current->mm, memcg);
+#endif
+
 	/*
 	 * The allocation either can't fail or will lead to more memory
 	 * being freed very soon.  Allow memory usage go over the limit
@@ -2805,6 +2821,11 @@ force:
 done_restock:
 	if (batch > nr_pages)
 		refill_stock(memcg, batch - nr_pages);
+
+#ifdef CONFIG_HERMIT
+	atomic64_add(nr_pages, &memcg->total_pg_charge);
+	hmt_async_reclaim(current->mm, memcg);
+#endif
 
 	/*
 	 * If the hierarchy is above the normal consumption range, schedule
@@ -5330,6 +5351,9 @@ static void __mem_cgroup_free(struct mem_cgroup *memcg)
 
 static void mem_cgroup_free(struct mem_cgroup *memcg)
 {
+#ifdef CONFIG_HERMIT
+	hermit_cleanup_memcg(memcg);
+#endif
 	lru_gen_exit_memcg(memcg);
 	memcg_wb_domain_exit(memcg);
 	__mem_cgroup_free(memcg);
@@ -5399,6 +5423,9 @@ static struct mem_cgroup *mem_cgroup_alloc(struct mem_cgroup *parent)
 	spin_lock_init(&memcg->deferred_split_queue.split_queue_lock);
 	INIT_LIST_HEAD(&memcg->deferred_split_queue.split_queue);
 	memcg->deferred_split_queue.split_queue_len = 0;
+#endif
+#ifdef CONFIG_HERMIT
+	hermit_init_memcg(memcg);
 #endif
 	lru_gen_init_memcg(memcg);
 	return memcg;
@@ -7666,6 +7693,38 @@ void __mem_cgroup_uncharge_swap(swp_entry_t entry, unsigned int nr_pages)
 	}
 	rcu_read_unlock();
 }
+
+#ifdef CONFIG_HERMIT
+void hermit_mem_cgroup_swapout(struct mem_cgroup *memcg, unsigned nr_entries)
+{
+	struct mem_cgroup *swap_memcg;
+
+	if (mem_cgroup_disabled())
+		return;
+
+	if (cgroup_subsys_on_dfl(memory_cgrp_subsys))
+		return;
+
+	if (!memcg)
+		return;
+
+	swap_memcg = memcg;
+
+	if (nr_entries > 1)
+		mem_cgroup_id_get_many(swap_memcg, nr_entries - 1);
+	mod_memcg_state(swap_memcg, MEMCG_SWAP, nr_entries);
+
+	if (!mem_cgroup_is_root(memcg)) {
+		page_counter_uncharge(&memcg->memory, nr_entries);
+		atomic64_add(nr_entries, &memcg->total_pg_uncharge);
+	}
+
+	VM_BUG_ON(!irqs_disabled());
+	__count_memcg_events(memcg, PGPGOUT, 1);
+
+	css_put(&memcg->css);
+}
+#endif
 
 long mem_cgroup_get_nr_swap_pages(struct mem_cgroup *memcg)
 {

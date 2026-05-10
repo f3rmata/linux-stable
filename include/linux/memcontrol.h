@@ -21,6 +21,7 @@
 #include <linux/vmstat.h>
 #include <linux/writeback.h>
 #include <linux/page-flags.h>
+#include <linux/hermit_types.h>
 
 struct mem_cgroup;
 struct obj_cgroup;
@@ -220,6 +221,9 @@ struct mem_cgroup {
 		struct page_counter memsw;	/* v1 only */
 	};
 
+	atomic64_t total_pg_charge;
+	atomic64_t total_pg_uncharge;
+
 	/* Legacy consumer-oriented counters */
 	struct page_counter kmem;		/* v1 only */
 	struct page_counter tcpmem;		/* v1 only */
@@ -332,6 +336,9 @@ struct mem_cgroup {
 	/* per-memcg mm_struct list */
 	struct lru_gen_mm_list mm_list;
 #endif
+
+	struct hmt_swap_ctrl hmt_sc;
+	struct hmt_work_struct sthds[HMT_MAX_NR_STHDS];
 
 	struct mem_cgroup_per_node *nodeinfo[];
 };
@@ -687,7 +694,13 @@ static inline int mem_cgroup_charge(struct folio *folio, struct mm_struct *mm,
 }
 
 int mem_cgroup_swapin_charge_folio(struct folio *folio, struct mm_struct *mm,
-				  gfp_t gfp, swp_entry_t entry);
+				   gfp_t gfp, swp_entry_t entry);
+#ifdef CONFIG_HERMIT
+int hermit_mem_cgroup_swapin_charge_page(struct page *page,
+					 struct mm_struct *mm, gfp_t gfp,
+					 int *adc_pf_bits,
+					 uint64_t pf_breakdown[]);
+#endif
 void mem_cgroup_swapin_uncharge_swap(swp_entry_t entry);
 
 void __mem_cgroup_uncharge(struct folio *folio);

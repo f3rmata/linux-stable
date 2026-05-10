@@ -421,6 +421,13 @@ extern unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
 						  unsigned long nr_pages,
 						  gfp_t gfp_mask,
 						  unsigned int reclaim_options);
+#ifdef CONFIG_HERMIT
+extern unsigned long
+hermit_try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
+				    unsigned long nr_pages, gfp_t gfp_mask,
+				    bool may_swap, struct task_struct *cthd,
+				    int *adc_pf_bits, uint64_t pf_breakdown[]);
+#endif
 extern unsigned long mem_cgroup_shrink_node(struct mem_cgroup *mem,
 						gfp_t gfp_mask, bool noswap,
 						pg_data_t *pgdat,
@@ -673,6 +680,10 @@ static inline void mem_cgroup_uncharge_swap(swp_entry_t entry, unsigned int nr_p
 	__mem_cgroup_uncharge_swap(entry, nr_pages);
 }
 
+#ifdef CONFIG_HERMIT
+extern void hermit_mem_cgroup_swapout(struct mem_cgroup *memcg,
+				      unsigned nr_entries);
+#endif
 extern long mem_cgroup_get_nr_swap_pages(struct mem_cgroup *memcg);
 extern bool mem_cgroup_swap_full(struct folio *folio);
 #else
@@ -691,6 +702,12 @@ static inline void mem_cgroup_uncharge_swap(swp_entry_t entry,
 {
 }
 
+#ifdef CONFIG_HERMIT
+static inline void hermit_mem_cgroup_swapout(struct mem_cgroup *memcg,
+					     unsigned nr_entries)
+{
+}
+#endif
 static inline long mem_cgroup_get_nr_swap_pages(struct mem_cgroup *memcg)
 {
 	return get_nr_swap_pages();

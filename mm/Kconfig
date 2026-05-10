@@ -368,6 +368,13 @@ config RANDOM_KMALLOC_CACHES
 
 endmenu # SLAB allocator options
 
+config HERMIT
+	bool "Hermit rdma system"
+	default n
+    depends on MEMCG && SWAP
+	help
+	  Use Hermit RDMA Swap feature.
+
 config SHUFFLE_PAGE_ALLOCATOR
 	bool "Page allocator randomization"
 	default SLAB_FREELIST_RANDOM && ACPI_NUMA

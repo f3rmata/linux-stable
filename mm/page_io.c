@@ -27,6 +27,11 @@
 #include <linux/zswap.h>
 #include "swap.h"
 
+#ifdef CONFIG_HERMIT
+#include <linux/swap_stats.h>
+#include <linux/hermit_backend.h>
+#endif
+
 static void __end_swap_bio_write(struct bio *bio)
 {
 	struct folio *folio = bio_first_folio_all(bio);
@@ -41,9 +46,10 @@ static void __end_swap_bio_write(struct bio *bio)
 		 * Also clear PG_reclaim to avoid folio_rotate_reclaimable()
 		 */
 		folio_mark_dirty(folio);
-		pr_alert_ratelimited("Write-error on swap-device (%u:%u:%llu)\n",
-				     MAJOR(bio_dev(bio)), MINOR(bio_dev(bio)),
-				     (unsigned long long)bio->bi_iter.bi_sector);
+		pr_alert_ratelimited(
+			"Write-error on swap-device (%u:%u:%llu)\n",
+			MAJOR(bio_dev(bio)), MINOR(bio_dev(bio)),
+			(unsigned long long)bio->bi_iter.bi_sector);
 		folio_clear_reclaim(folio);
 	}
 	folio_end_writeback(folio);
@@ -60,9 +66,10 @@ static void __end_swap_bio_read(struct bio *bio)
 	struct folio *folio = bio_first_folio_all(bio);
 
 	if (bio->bi_status) {
-		pr_alert_ratelimited("Read-error on swap-device (%u:%u:%llu)\n",
-				     MAJOR(bio_dev(bio)), MINOR(bio_dev(bio)),
-				     (unsigned long long)bio->bi_iter.bi_sector);
+		pr_alert_ratelimited(
+			"Read-error on swap-device (%u:%u:%llu)\n",
+			MAJOR(bio_dev(bio)), MINOR(bio_dev(bio)),
+			(unsigned long long)bio->bi_iter.bi_sector);
 	} else {
 		folio_mark_uptodate(folio);
 	}
@@ -76,8 +83,7 @@ static void end_swap_bio_read(struct bio *bio)
 }
 
 int generic_swapfile_activate(struct swap_info_struct *sis,
-				struct file *swap_file,
-				sector_t *span)
+			      struct file *swap_file, sector_t *span)
 {
 	struct address_space *mapping = swap_file->f_mapping;
 	struct inode *inode = mapping->host;
@@ -102,7 +108,7 @@ int generic_swapfile_activate(struct swap_info_struct *sis,
 	page_no = 0;
 	last_block = i_size_read(inode) >> blkbits;
 	while ((probe_block + blocks_per_page) <= last_block &&
-			page_no < sis->max) {
+	       page_no < sis->max) {
 		unsigned block_in_page;
 		sector_t first_block;
 
@@ -122,7 +128,7 @@ int generic_swapfile_activate(struct swap_info_struct *sis,
 		}
 
 		for (block_in_page = 1; block_in_page < blocks_per_page;
-					block_in_page++) {
+		     block_in_page++) {
 			sector_t block;
 
 			block = probe_block + block_in_page;
@@ -138,7 +144,7 @@ int generic_swapfile_activate(struct swap_info_struct *sis,
 		}
 
 		first_block >>= (PAGE_SHIFT - blkbits);
-		if (page_no) {	/* exclude the header page */
+		if (page_no) { /* exclude the header page */
 			if (first_block < lowest_block)
 				lowest_block = first_block;
 			if (first_block > highest_block)
@@ -160,7 +166,7 @@ reprobe:
 	ret = nr_extents;
 	*span = 1 + highest_block - lowest_block;
 	if (page_no == 0)
-		page_no = 1;	/* force Empty message */
+		page_no = 1; /* force Empty message */
 	sis->max = page_no;
 	sis->pages = page_no - 1;
 	sis->highest_bit = page_no - 1;
@@ -232,14 +238,16 @@ static void bio_associate_blkg_from_page(struct bio *bio, struct folio *folio)
 	rcu_read_unlock();
 }
 #else
-#define bio_associate_blkg_from_page(bio, folio)		do { } while (0)
+#define bio_associate_blkg_from_page(bio, folio) \
+	do {                                     \
+	} while (0)
 #endif /* CONFIG_MEMCG && CONFIG_BLK_CGROUP */
 
 struct swap_iocb {
-	struct kiocb		iocb;
-	struct bio_vec		bvec[SWAP_CLUSTER_MAX];
-	int			pages;
-	int			len;
+	struct kiocb iocb;
+	struct bio_vec bvec[SWAP_CLUSTER_MAX];
+	int pages;
+	int len;
 };
 static mempool_t *sio_pool;
 
@@ -327,7 +335,8 @@ static void swap_writepage_fs(struct page *page, struct writeback_control *wbc)
 }
 
 static void swap_writepage_bdev_sync(struct page *page,
-		struct writeback_control *wbc, struct swap_info_struct *sis)
+				     struct writeback_control *wbc,
+				     struct swap_info_struct *sis)
 {
 	struct bio_vec bv;
 	struct bio bio;
@@ -349,7 +358,8 @@ static void swap_writepage_bdev_sync(struct page *page,
 }
 
 static void swap_writepage_bdev_async(struct page *page,
-		struct writeback_control *wbc, struct swap_info_struct *sis)
+				      struct writeback_control *wbc,
+				      struct swap_info_struct *sis)
 {
 	struct bio *bio;
 	struct folio *folio = page_folio(page);
@@ -422,8 +432,7 @@ static void sio_read_complete(struct kiocb *iocb, long ret)
 	mempool_free(sio, sio_pool);
 }
 
-static void swap_readpage_fs(struct page *page,
-			     struct swap_iocb **plug)
+static void swap_readpage_fs(struct page *page, struct swap_iocb **plug)
 {
 	struct swap_info_struct *sis = page_swap_info(page);
 	struct swap_iocb *sio = NULL;
@@ -458,7 +467,7 @@ static void swap_readpage_fs(struct page *page,
 }
 
 static void swap_readpage_bdev_sync(struct page *page,
-		struct swap_info_struct *sis)
+				    struct swap_info_struct *sis)
 {
 	struct bio_vec bv;
 	struct bio bio;
@@ -478,7 +487,7 @@ static void swap_readpage_bdev_sync(struct page *page,
 }
 
 static void swap_readpage_bdev_async(struct page *page,
-		struct swap_info_struct *sis)
+				     struct swap_info_struct *sis)
 {
 	struct bio *bio;
 
@@ -541,4 +550,46 @@ void __swap_read_unplug(struct swap_iocb *sio)
 	ret = mapping->a_ops->swap_rw(&sio->iocb, &from);
 	if (ret != -EIOCBQUEUED)
 		sio_read_complete(&sio->iocb, ret);
+}
+
+/* [Hermit] */
+inline int hermit_issue_read(struct page *page, swp_entry_t entry)
+{
+	int cpu;
+	struct folio *folio = page_folio(page);
+	/* __SetPageLocked(page); */
+	/* __SetPageSwapBacked(page); */
+	__folio_set_locked(folio);
+	__folio_set_swapbacked(folio);
+
+	cpu = get_cpu();
+	/* Provide entry to swap_readpage() */
+	/* set_page_private(page, entry.val); */
+	folio->swap = entry;
+	swap_readpage(page, true, NULL);
+	/* set_page_private(page, 0); */
+	folio->private = NULL;
+
+	put_cpu();
+
+	return cpu;
+}
+
+inline int hermit_poll_read(int cpu, struct page *page, bool unlock,
+			    uint64_t pf_breakdown[])
+{
+	BUG_ON(!page);
+	adc_pf_breakdown_stt(pf_breakdown, ADC_POLL_LOAD, pf_cycles_start());
+	if (!PageLocked(page))
+		goto done;
+	// frontswap_poll_load(cpu);
+	// adapt to new api
+	hermit_backend_poll_load(cpu);
+
+	// SetPageUptodate(page);
+	if (unlock)
+		unlock_page(page);
+done:
+	adc_pf_breakdown_end(pf_breakdown, ADC_POLL_LOAD, pf_cycles_end());
+	return 0;
 }

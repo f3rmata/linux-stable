@@ -21,6 +21,10 @@
 #include <linux/swap_slots.h>
 #include <linux/huge_mm.h>
 #include <linux/shmem_fs.h>
+#ifdef CONFIG_HERMIT
+#include <linux/hermit.h>
+#include <linux/swap_stats.h>
+#endif
 #include "internal.h"
 #include "swap.h"
 
@@ -59,6 +63,18 @@ static bool enable_vma_readahead __read_mostly = true;
 	(atomic_long_read(&(vma)->swap_readahead_info) ? : 4)
 
 static atomic_t swapin_readahead_hits = ATOMIC_INIT(4);
+
+#ifdef CONFIG_HERMIT
+static inline void hermit_account_prefetch_swapin(void)
+{
+	adc_profile_counter_inc(ADC_PREFETCH_SWAPIN);
+}
+
+static inline void hermit_account_prefetch_hit(void)
+{
+	adc_profile_counter_inc(ADC_HIT_ON_PREFETCH);
+}
+#endif
 
 void show_swap_cache_info(void)
 {
@@ -363,6 +379,9 @@ struct folio *swap_cache_get_folio(swp_entry_t entry,
 			count_vm_event(SWAP_RA_HIT);
 			if (!vma || !vma_ra)
 				atomic_inc(&swapin_readahead_hits);
+#ifdef CONFIG_HERMIT
+			hermit_account_prefetch_hit();
+#endif
 		}
 	} else {
 		folio = NULL;
@@ -655,8 +674,11 @@ struct page *swap_cluster_readahead(swp_entry_t entry, gfp_t gfp_mask,
 		if (page_allocated) {
 			swap_readpage(page, false, &splug);
 			if (offset != entry_offset) {
-				SetPageReadahead(page);
+				folio_set_readahead(page_folio(page));
 				count_vm_event(SWAP_RA);
+#ifdef CONFIG_HERMIT
+				hermit_account_prefetch_swapin();
+#endif
 			}
 		}
 		put_page(page);
@@ -821,8 +843,11 @@ static struct page *swap_vma_readahead(swp_entry_t fentry, gfp_t gfp_mask,
 		if (page_allocated) {
 			swap_readpage(page, false, &splug);
 			if (i != ra_info.offset) {
-				SetPageReadahead(page);
+				folio_set_readahead(page_folio(page));
 				count_vm_event(SWAP_RA);
+#ifdef CONFIG_HERMIT
+				hermit_account_prefetch_swapin();
+#endif
 			}
 		}
 		put_page(page);
