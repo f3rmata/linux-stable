@@ -15,6 +15,11 @@ static inline void swap_read_unplug(struct swap_iocb *plug)
 	if (unlikely(plug))
 		__swap_read_unplug(plug);
 }
+#ifdef CONFIG_HERMIT
+int hermit_issue_read(struct page *page, swp_entry_t entry);
+int hermit_poll_read(int cpu, struct page *page, bool unlock,
+		     uint64_t pf_breakdown[]);
+#endif
 void swap_write_unplug(struct swap_iocb *sio);
 int swap_writepage(struct page *page, struct writeback_control *wbc);
 void __swap_writepage(struct page *page, struct writeback_control *wbc);

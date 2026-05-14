@@ -222,6 +222,65 @@ static inline void count_swpout_vm_event(struct folio *folio)
 	count_vm_events(PSWPOUT, folio_nr_pages(folio));
 }
 
+#ifdef CONFIG_HERMIT
+static bool hermit_swap_writepage(struct page *page)
+{
+	struct folio *folio = page_folio(page);
+	swp_entry_t entry;
+	int cpu, ret;
+
+	if (!hermit_backend_ready())
+		return false;
+
+	/*
+	 * Keep the first DRAM backend bring-up conservative.  The backend API is
+	 * page-sized, while native swap can submit a whole large folio.
+	 */
+	if (folio_nr_pages(folio) != 1)
+		return false;
+
+	entry = page_swap_entry(page);
+	cpu = get_cpu();
+	ret = hermit_backend_store(entry, page, cpu, false);
+	put_cpu();
+	if (ret)
+		return false;
+
+	count_swpout_vm_event(folio);
+	adc_profile_counter_inc(ADC_HERMIT_SWAPOUT);
+	folio_start_writeback(folio);
+	folio_unlock(folio);
+	folio_end_writeback(folio);
+	return true;
+}
+
+static bool hermit_swap_readpage(struct page *page)
+{
+	struct folio *folio = page_folio(page);
+	swp_entry_t entry;
+	int cpu, ret;
+
+	if (!hermit_backend_ready())
+		return false;
+
+	if (folio_nr_pages(folio) != 1)
+		return false;
+
+	entry = page_swap_entry(page);
+	cpu = get_cpu();
+	ret = hermit_backend_load(entry, page, cpu, false);
+	put_cpu();
+	if (ret)
+		return false;
+
+	if (!folio_test_uptodate(folio))
+		folio_mark_uptodate(folio);
+	count_vm_event(PSWPIN);
+	folio_unlock(folio);
+	return true;
+}
+#endif
+
 #if defined(CONFIG_MEMCG) && defined(CONFIG_BLK_CGROUP)
 static void bio_associate_blkg_from_page(struct bio *bio, struct folio *folio)
 {
@@ -383,6 +442,10 @@ void __swap_writepage(struct page *page, struct writeback_control *wbc)
 	struct swap_info_struct *sis = page_swap_info(page);
 
 	VM_BUG_ON_PAGE(!PageSwapCache(page), page);
+#ifdef CONFIG_HERMIT
+	if (hermit_swap_writepage(page))
+		return;
+#endif
 	/*
 	 * ->flags can be updated non-atomicially (scan_swap_map_slots),
 	 * but that will never affect SWP_FS_OPS, so the data_race
@@ -525,6 +588,10 @@ void swap_readpage(struct page *page, bool synchronous, struct swap_iocb **plug)
 	if (zswap_load(folio)) {
 		folio_mark_uptodate(folio);
 		folio_unlock(folio);
+#ifdef CONFIG_HERMIT
+	} else if (hermit_swap_readpage(page)) {
+		/* Page has been read and unlocked by the Hermit backend. */
+#endif
 	} else if (data_race(sis->flags & SWP_FS_OPS)) {
 		swap_readpage_fs(page, plug);
 	} else if (synchronous || (sis->flags & SWP_SYNCHRONOUS_IO)) {
@@ -552,25 +619,29 @@ void __swap_read_unplug(struct swap_iocb *sio)
 		sio_read_complete(&sio->iocb, ret);
 }
 
+#ifdef CONFIG_HERMIT
 /* [Hermit] */
 inline int hermit_issue_read(struct page *page, swp_entry_t entry)
 {
-	int cpu;
+	int cpu, ret;
 	struct folio *folio = page_folio(page);
-	/* __SetPageLocked(page); */
-	/* __SetPageSwapBacked(page); */
-	__folio_set_locked(folio);
-	__folio_set_swapbacked(folio);
+
+	if (!hermit_backend_ready())
+		return -EOPNOTSUPP;
+
+	if (!folio_test_locked(folio))
+		__folio_set_locked(folio);
+	if (!folio_test_swapbacked(folio))
+		__folio_set_swapbacked(folio);
 
 	cpu = get_cpu();
-	/* Provide entry to swap_readpage() */
-	/* set_page_private(page, entry.val); */
 	folio->swap = entry;
-	swap_readpage(page, true, NULL);
-	/* set_page_private(page, 0); */
+	ret = hermit_backend_load(entry, page, cpu, false);
+	put_cpu();
 	folio->private = NULL;
 
-	put_cpu();
+	if (ret)
+		return ret;
 
 	return cpu;
 }
@@ -587,9 +658,10 @@ inline int hermit_poll_read(int cpu, struct page *page, bool unlock,
 	hermit_backend_poll_load(cpu);
 
 	// SetPageUptodate(page);
-	if (unlock)
+	if (unlock && PageLocked(page))
 		unlock_page(page);
 done:
 	adc_pf_breakdown_end(pf_breakdown, ADC_POLL_LOAD, pf_cycles_end());
 	return 0;
 }
+#endif
