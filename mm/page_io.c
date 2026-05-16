@@ -254,7 +254,7 @@ static bool hermit_swap_writepage(struct page *page)
 	if (ret)
 		return false;
 
-	count_swpout_vm_event(folio);
+	// count_swpout_vm_event(folio);
 	adc_profile_counter_inc(ADC_SWAPOUT);
 	adc_profile_counter_inc(ADC_HERMIT_SWAPOUT);
 	accum_adc_time_stat(ADC_RDMA_WRITE_LAT, pf_end - pf_ts);
@@ -263,10 +263,10 @@ static bool hermit_swap_writepage(struct page *page)
 		set_adc_pf_bits(&ctx->adc_pf_bits, ADC_PF_SWAPOUT_BIT);
 		set_adc_pf_bits(&ctx->adc_pf_bits, ADC_PF_HERMIT_BIT);
 	}
-	folio_start_writeback(folio);
-	folio_unlock(folio);
-	folio_end_writeback(folio);
-	return true;
+	// folio_start_writeback(folio);
+	// folio_unlock(folio);
+	// folio_end_writeback(folio);
+	return false;
 }
 
 static bool hermit_swap_readpage(struct page *page)
