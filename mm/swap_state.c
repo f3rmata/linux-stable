@@ -23,6 +23,7 @@
 #include <linux/shmem_fs.h>
 #ifdef CONFIG_HERMIT
 #include <linux/hermit.h>
+#include <linux/hermit_profile.h>
 #include <linux/swap_stats.h>
 #endif
 #include "internal.h"
@@ -33,10 +34,10 @@
  * vmscan's shrink_page_list.
  */
 static const struct address_space_operations swap_aops = {
-	.writepage	= swap_writepage,
-	.dirty_folio	= noop_dirty_folio,
+	.writepage = swap_writepage,
+	.dirty_folio = noop_dirty_folio,
 #ifdef CONFIG_MIGRATION
-	.migrate_folio	= migrate_folio,
+	.migrate_folio = migrate_folio,
 #endif
 };
 
@@ -44,23 +45,23 @@ struct address_space *swapper_spaces[MAX_SWAPFILES] __read_mostly;
 static unsigned int nr_swapper_spaces[MAX_SWAPFILES] __read_mostly;
 static bool enable_vma_readahead __read_mostly = true;
 
-#define SWAP_RA_WIN_SHIFT	(PAGE_SHIFT / 2)
-#define SWAP_RA_HITS_MASK	((1UL << SWAP_RA_WIN_SHIFT) - 1)
-#define SWAP_RA_HITS_MAX	SWAP_RA_HITS_MASK
-#define SWAP_RA_WIN_MASK	(~PAGE_MASK & ~SWAP_RA_HITS_MASK)
+#define SWAP_RA_WIN_SHIFT (PAGE_SHIFT / 2)
+#define SWAP_RA_HITS_MASK ((1UL << SWAP_RA_WIN_SHIFT) - 1)
+#define SWAP_RA_HITS_MAX SWAP_RA_HITS_MASK
+#define SWAP_RA_WIN_MASK (~PAGE_MASK & ~SWAP_RA_HITS_MASK)
 
-#define SWAP_RA_HITS(v)		((v) & SWAP_RA_HITS_MASK)
-#define SWAP_RA_WIN(v)		(((v) & SWAP_RA_WIN_MASK) >> SWAP_RA_WIN_SHIFT)
-#define SWAP_RA_ADDR(v)		((v) & PAGE_MASK)
+#define SWAP_RA_HITS(v) ((v) & SWAP_RA_HITS_MASK)
+#define SWAP_RA_WIN(v) (((v) & SWAP_RA_WIN_MASK) >> SWAP_RA_WIN_SHIFT)
+#define SWAP_RA_ADDR(v) ((v) & PAGE_MASK)
 
-#define SWAP_RA_VAL(addr, win, hits)				\
-	(((addr) & PAGE_MASK) |					\
-	 (((win) << SWAP_RA_WIN_SHIFT) & SWAP_RA_WIN_MASK) |	\
+#define SWAP_RA_VAL(addr, win, hits)                         \
+	(((addr) & PAGE_MASK) |                              \
+	 (((win) << SWAP_RA_WIN_SHIFT) & SWAP_RA_WIN_MASK) | \
 	 ((hits) & SWAP_RA_HITS_MASK))
 
 /* Initial readahead hits is 4 to start up with a small window */
-#define GET_SWAP_RA_VAL(vma)					\
-	(atomic_long_read(&(vma)->swap_readahead_info) ? : 4)
+#define GET_SWAP_RA_VAL(vma) \
+	(atomic_long_read(&(vma)->swap_readahead_info) ?: 4)
 
 static atomic_t swapin_readahead_hits = ATOMIC_INIT(4);
 
@@ -99,8 +100,8 @@ void *get_shadow_from_swap_cache(swp_entry_t entry)
  * add_to_swap_cache resembles filemap_add_folio on swapper_space,
  * but sets SwapCache flag and private instead of mapping and index.
  */
-int add_to_swap_cache(struct folio *folio, swp_entry_t entry,
-			gfp_t gfp, void **shadowp)
+int add_to_swap_cache(struct folio *folio, swp_entry_t entry, gfp_t gfp,
+		      void **shadowp)
 {
 	struct address_space *address_space = swap_address_space(entry);
 	pgoff_t idx = swp_offset(entry);
@@ -152,8 +153,8 @@ unlock:
  * This must be called only on folios that have
  * been verified to be in the swap cache.
  */
-void __delete_from_swap_cache(struct folio *folio,
-			swp_entry_t entry, void *shadow)
+void __delete_from_swap_cache(struct folio *folio, swp_entry_t entry,
+			      void *shadow)
 {
 	struct address_space *address_space = swap_address_space(entry);
 	int i;
@@ -213,7 +214,8 @@ bool add_to_swap(struct folio *folio)
 	 * Add it to the swap cache.
 	 */
 	err = add_to_swap_cache(folio, entry,
-			__GFP_HIGH|__GFP_NOMEMALLOC|__GFP_NOWARN, NULL);
+				__GFP_HIGH | __GFP_NOMEMALLOC | __GFP_NOWARN,
+				NULL);
 	if (err)
 		/*
 		 * add_to_swap_cache() doesn't return -EEXIST, so we can safely
@@ -260,7 +262,7 @@ void delete_from_swap_cache(struct folio *folio)
 }
 
 void clear_shadow_from_swap_cache(int type, unsigned long begin,
-				unsigned long end)
+				  unsigned long end)
 {
 	unsigned long curr = begin;
 	void *old;
@@ -345,7 +347,8 @@ static inline bool swap_use_vma_readahead(void)
  * Caller must lock the swap device or hold a reference to keep it valid.
  */
 struct folio *swap_cache_get_folio(swp_entry_t entry,
-		struct vm_area_struct *vma, unsigned long addr)
+				   struct vm_area_struct *vma,
+				   unsigned long addr)
 {
 	struct folio *folio;
 
@@ -401,7 +404,7 @@ struct folio *swap_cache_get_folio(swp_entry_t entry,
  * Return: The found folio or %NULL.
  */
 struct folio *filemap_get_incore_folio(struct address_space *mapping,
-		pgoff_t index)
+				       pgoff_t index)
 {
 	swp_entry_t swp;
 	struct swap_info_struct *si;
@@ -429,13 +432,18 @@ struct folio *filemap_get_incore_folio(struct address_space *mapping,
 }
 
 struct page *__read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
-			struct vm_area_struct *vma, unsigned long addr,
-			bool *new_page_allocated)
+				     struct vm_area_struct *vma,
+				     unsigned long addr,
+				     bool *new_page_allocated)
 {
 	struct swap_info_struct *si;
 	struct folio *folio;
 	struct page *page;
 	void *shadow = NULL;
+#ifdef CONFIG_HERMIT
+	uint64_t *pf_breakdown = hermit_pf_current_breakdown();
+	uint64_t pf_ts;
+#endif
 
 	*new_page_allocated = false;
 	si = get_swap_device(entry);
@@ -449,8 +457,16 @@ struct page *__read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
 		 * called after swap_cache_get_folio() failed, re-calling
 		 * that would confuse statistics.
 		 */
+#ifdef CONFIG_HERMIT
+		pf_ts = pf_cycles_start();
+		adc_pf_breakdown_stt(pf_breakdown, ADC_DEDUP_SWAPIN, pf_ts);
+#endif
 		folio = filemap_get_folio(swap_address_space(entry),
-						swp_offset(entry));
+					  swp_offset(entry));
+#ifdef CONFIG_HERMIT
+		adc_pf_breakdown_end(pf_breakdown, ADC_DEDUP_SWAPIN,
+				     pf_cycles_end());
+#endif
 		if (!IS_ERR(folio)) {
 			page = folio_file_page(folio, swp_offset(entry));
 			goto got_page;
@@ -472,9 +488,17 @@ struct page *__read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
 		 * before marking swap_map SWAP_HAS_CACHE, when -EEXIST will
 		 * cause any racers to loop around until we add it to cache.
 		 */
+#ifdef CONFIG_HERMIT
+		pf_ts = pf_cycles_start();
+		adc_pf_breakdown_stt(pf_breakdown, ADC_ALLOC_PAGE, pf_ts);
+#endif
 		folio = vma_alloc_folio(gfp_mask, 0, vma, addr, false);
+#ifdef CONFIG_HERMIT
+		adc_pf_breakdown_end(pf_breakdown, ADC_ALLOC_PAGE,
+				     pf_cycles_end());
+#endif
 		if (!folio)
-                        goto fail_put_swap;
+			goto fail_put_swap;
 
 		/*
 		 * Swap entry may have been freed since our caller observed it.
@@ -504,11 +528,27 @@ struct page *__read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
 	__folio_set_locked(folio);
 	__folio_set_swapbacked(folio);
 
+#ifdef CONFIG_HERMIT
+	pf_ts = pf_cycles_start();
+	adc_pf_breakdown_stt(pf_breakdown, ADC_CGROUP_ACCOUNT, pf_ts);
+#endif
 	if (mem_cgroup_swapin_charge_folio(folio, NULL, gfp_mask, entry))
+#ifdef CONFIG_HERMIT
+	{
+		adc_pf_breakdown_end(pf_breakdown, ADC_CGROUP_ACCOUNT,
+				     pf_cycles_end());
 		goto fail_unlock;
+	}
+#else
+		goto fail_unlock;
+#endif
+#ifdef CONFIG_HERMIT
+	adc_pf_breakdown_end(pf_breakdown, ADC_CGROUP_ACCOUNT, pf_cycles_end());
+#endif
 
 	/* May fail (-ENOMEM) if XArray node allocation failed. */
-	if (add_to_swap_cache(folio, entry, gfp_mask & GFP_RECLAIM_MASK, &shadow))
+	if (add_to_swap_cache(folio, entry, gfp_mask & GFP_RECLAIM_MASK,
+			      &shadow))
 		goto fail_unlock;
 
 	mem_cgroup_swapin_uncharge_swap(entry);
@@ -548,8 +588,19 @@ struct page *read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
 				   unsigned long addr, struct swap_iocb **plug)
 {
 	bool page_was_allocated;
-	struct page *retpage = __read_swap_cache_async(entry, gfp_mask,
-			vma, addr, &page_was_allocated);
+	struct page *retpage;
+#ifdef CONFIG_HERMIT
+	uint64_t *pf_breakdown = hermit_pf_current_breakdown();
+	uint64_t pf_ts = pf_cycles_start();
+
+	adc_pf_breakdown_stt(pf_breakdown, ADC_RD_CACHE_ASYNC, pf_ts);
+#endif
+
+	retpage = __read_swap_cache_async(entry, gfp_mask, vma, addr,
+					  &page_was_allocated);
+#ifdef CONFIG_HERMIT
+	adc_pf_breakdown_end(pf_breakdown, ADC_RD_CACHE_ASYNC, pf_cycles_end());
+#endif
 
 	if (page_was_allocated)
 		swap_readpage(retpage, false, plug);
@@ -558,10 +609,8 @@ struct page *read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
 }
 
 static unsigned int __swapin_nr_pages(unsigned long prev_offset,
-				      unsigned long offset,
-				      int hits,
-				      int max_pages,
-				      int prev_win)
+				      unsigned long offset, int hits,
+				      int max_pages, int prev_win)
 {
 	unsigned int pages, last_ra;
 
@@ -637,7 +686,7 @@ static unsigned long swapin_nr_pages(unsigned long offset)
  * Caller must hold read mmap_lock if vmf->vma is not NULL.
  */
 struct page *swap_cluster_readahead(swp_entry_t entry, gfp_t gfp_mask,
-				struct vm_fault *vmf)
+				    struct vm_fault *vmf)
 {
 	struct page *page;
 	unsigned long entry_offset = swp_offset(entry);
@@ -650,6 +699,12 @@ struct page *swap_cluster_readahead(swp_entry_t entry, gfp_t gfp_mask,
 	bool page_allocated;
 	struct vm_area_struct *vma = vmf->vma;
 	unsigned long addr = vmf->address;
+#ifdef CONFIG_HERMIT
+	uint64_t *pf_breakdown = hermit_pf_current_breakdown();
+	struct page *retpage;
+
+	adc_pf_breakdown_stt(pf_breakdown, ADC_PREFETCH, pf_cycles_start());
+#endif
 
 	mask = swapin_nr_pages(offset) - 1;
 	if (!mask)
@@ -658,17 +713,17 @@ struct page *swap_cluster_readahead(swp_entry_t entry, gfp_t gfp_mask,
 	/* Read a page_cluster sized and aligned cluster around offset. */
 	start_offset = offset & ~mask;
 	end_offset = offset | mask;
-	if (!start_offset)	/* First page is swap header. */
+	if (!start_offset) /* First page is swap header. */
 		start_offset++;
 	if (end_offset >= si->max)
 		end_offset = si->max - 1;
 
 	blk_start_plug(&plug);
-	for (offset = start_offset; offset <= end_offset ; offset++) {
+	for (offset = start_offset; offset <= end_offset; offset++) {
 		/* Ok, do the async read-ahead now */
 		page = __read_swap_cache_async(
-			swp_entry(swp_type(entry), offset),
-			gfp_mask, vma, addr, &page_allocated);
+			swp_entry(swp_type(entry), offset), gfp_mask, vma, addr,
+			&page_allocated);
 		if (!page)
 			continue;
 		if (page_allocated) {
@@ -686,10 +741,16 @@ struct page *swap_cluster_readahead(swp_entry_t entry, gfp_t gfp_mask,
 	blk_finish_plug(&plug);
 	swap_read_unplug(splug);
 
-	lru_add_drain();	/* Push any new pages onto the LRU now */
+	lru_add_drain(); /* Push any new pages onto the LRU now */
 skip:
 	/* The page was likely read above, so no need for plugging here */
+#ifdef CONFIG_HERMIT
+	retpage = read_swap_cache_async(entry, gfp_mask, vma, addr, NULL);
+	adc_pf_breakdown_end(pf_breakdown, ADC_PREFETCH, pf_cycles_end());
+	return retpage;
+#else
 	return read_swap_cache_async(entry, gfp_mask, vma, addr, NULL);
+#endif
 }
 
 int init_swap_address_space(unsigned int type, unsigned long nr_pages)
@@ -727,7 +788,7 @@ void exit_swap_address_space(unsigned int type)
 	swapper_spaces[type] = NULL;
 }
 
-#define SWAP_RA_ORDER_CEILING	5
+#define SWAP_RA_ORDER_CEILING 5
 
 struct vma_swap_readahead {
 	unsigned short win;
@@ -757,10 +818,9 @@ static void swap_ra_info(struct vm_fault *vmf,
 	pfn = PFN_DOWN(SWAP_RA_ADDR(ra_val));
 	prev_win = SWAP_RA_WIN(ra_val);
 	hits = SWAP_RA_HITS(ra_val);
-	ra_info->win = win = __swapin_nr_pages(pfn, fpfn, hits,
-					       max_win, prev_win);
-	atomic_long_set(&vma->swap_readahead_info,
-			SWAP_RA_VAL(faddr, win, 0));
+	ra_info->win = win =
+		__swapin_nr_pages(pfn, fpfn, hits, max_win, prev_win);
+	atomic_long_set(&vma->swap_readahead_info, SWAP_RA_VAL(faddr, win, 0));
 	if (win == 1)
 		return;
 
@@ -776,8 +836,7 @@ static void swap_ra_info(struct vm_fault *vmf,
 		lpfn = fpfn - left;
 		rpfn = fpfn + win - left;
 	}
-	start = max3(lpfn, PFN_DOWN(vma->vm_start),
-		     PFN_DOWN(faddr & PMD_MASK));
+	start = max3(lpfn, PFN_DOWN(vma->vm_start), PFN_DOWN(faddr & PMD_MASK));
 	end = min3(rpfn, PFN_DOWN(vma->vm_end),
 		   PFN_DOWN((faddr & PMD_MASK) + PMD_SIZE));
 
@@ -814,6 +873,12 @@ static struct page *swap_vma_readahead(swp_entry_t fentry, gfp_t gfp_mask,
 	struct vma_swap_readahead ra_info = {
 		.win = 1,
 	};
+#ifdef CONFIG_HERMIT
+	uint64_t *pf_breakdown = hermit_pf_current_breakdown();
+	struct page *retpage;
+
+	adc_pf_breakdown_stt(pf_breakdown, ADC_PREFETCH, pf_cycles_start());
+#endif
 
 	swap_ra_info(vmf, &ra_info);
 	if (ra_info.win == 1)
@@ -836,8 +901,8 @@ static struct page *swap_vma_readahead(swp_entry_t fentry, gfp_t gfp_mask,
 			continue;
 		pte_unmap(pte);
 		pte = NULL;
-		page = __read_swap_cache_async(entry, gfp_mask, vma,
-					       addr, &page_allocated);
+		page = __read_swap_cache_async(entry, gfp_mask, vma, addr,
+					       &page_allocated);
 		if (!page)
 			continue;
 		if (page_allocated) {
@@ -859,8 +924,14 @@ static struct page *swap_vma_readahead(swp_entry_t fentry, gfp_t gfp_mask,
 	lru_add_drain();
 skip:
 	/* The page was likely read above, so no need for plugging here */
-	return read_swap_cache_async(fentry, gfp_mask, vma, vmf->address,
-				     NULL);
+#ifdef CONFIG_HERMIT
+	retpage = read_swap_cache_async(fentry, gfp_mask, vma, vmf->address,
+					NULL);
+	adc_pf_breakdown_end(pf_breakdown, ADC_PREFETCH, pf_cycles_end());
+	return retpage;
+#else
+	return read_swap_cache_async(fentry, gfp_mask, vma, vmf->address, NULL);
+#endif
 }
 
 /**
@@ -876,23 +947,22 @@ skip:
  * or vma-based(ie, virtual address based on faulty address) readahead.
  */
 struct page *swapin_readahead(swp_entry_t entry, gfp_t gfp_mask,
-				struct vm_fault *vmf)
+			      struct vm_fault *vmf)
 {
 	return swap_use_vma_readahead() ?
-			swap_vma_readahead(entry, gfp_mask, vmf) :
-			swap_cluster_readahead(entry, gfp_mask, vmf);
+		       swap_vma_readahead(entry, gfp_mask, vmf) :
+		       swap_cluster_readahead(entry, gfp_mask, vmf);
 }
 
 #ifdef CONFIG_SYSFS
 static ssize_t vma_ra_enabled_show(struct kobject *kobj,
-				     struct kobj_attribute *attr, char *buf)
+				   struct kobj_attribute *attr, char *buf)
 {
-	return sysfs_emit(buf, "%s\n",
-			  enable_vma_readahead ? "true" : "false");
+	return sysfs_emit(buf, "%s\n", enable_vma_readahead ? "true" : "false");
 }
 static ssize_t vma_ra_enabled_store(struct kobject *kobj,
-				      struct kobj_attribute *attr,
-				      const char *buf, size_t count)
+				    struct kobj_attribute *attr,
+				    const char *buf, size_t count)
 {
 	ssize_t ret;
 

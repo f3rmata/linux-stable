@@ -81,6 +81,7 @@
 #ifdef CONFIG_HERMIT
 #include <linux/hermit.h>
 #include <linux/hermit_backend.h>
+#include <linux/hermit_profile.h>
 #include <linux/swap_stats.h>
 #endif
 
@@ -3892,16 +3893,16 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 #ifdef CONFIG_HERMIT
 	bool hermit_bypass = false;
 	bool tried_hermit_bypass = false;
-#ifdef ADC_PROFILE_PF_BREAKDOWN
-	uint64_t pf_breakdown[NUM_ADC_PF_BREAKDOWN_TYPE] = { 0 };
-#else
-	uint64_t *pf_breakdown = NULL;
-#endif
-	int adc_pf_bits = 0;
+	struct hermit_pf_profile_ctx hermit_local_ctx;
+	struct hermit_pf_profile_ctx *hermit_ctx;
+	uint64_t *pf_breakdown;
+	int *adc_pf_bits;
 	int hermit_read_cpu = -1;
+	bool hermit_local_profile = false;
 	bool hermit_page_io = false;
 	bool hermit_upd_metadata = false;
 	bool hermit_setpte = false;
+	bool hermit_set_pagemap_unlock = false;
 	uint64_t hermit_pf_ts;
 #endif
 	swp_entry_t entry;
@@ -3910,9 +3911,22 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	void *shadow = NULL;
 
 #ifdef CONFIG_HERMIT
-	hermit_pf_ts = pf_cycles_start();
-	adc_pf_breakdown_stt(pf_breakdown, ADC_TOTAL_PF, hermit_pf_ts);
-	adc_pf_breakdown_stt(pf_breakdown, ADC_LOCK_GET_PTE, hermit_pf_ts);
+	hermit_ctx = hermit_pf_current_ctx();
+	if (!hermit_ctx) {
+		hermit_pf_profile_init(&hermit_local_ctx);
+		hermit_ctx = &hermit_local_ctx;
+		hermit_local_profile = true;
+	}
+	pf_breakdown = hermit_ctx->pf_breakdown;
+	adc_pf_bits = &hermit_ctx->adc_pf_bits;
+
+	if (hermit_local_profile) {
+		hermit_pf_ts = pf_cycles_start();
+		adc_pf_breakdown_stt(pf_breakdown, ADC_TOTAL_PF,
+				     hermit_pf_ts);
+		adc_pf_breakdown_stt(pf_breakdown, ADC_LOCK_GET_PTE,
+				     hermit_pf_ts);
+	}
 #endif
 
 	if (!pte_unmap_same(vmf))
@@ -3970,7 +3984,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 		goto out;
 
 #ifdef CONFIG_HERMIT
-	set_adc_pf_bits(&adc_pf_bits, ADC_PF_SWAP_BIT);
+	set_adc_pf_bits(adc_pf_bits, ADC_PF_SWAP_BIT);
 	hermit_pf_ts = pf_cycles_end();
 	adc_pf_breakdown_end(pf_breakdown, ADC_LOCK_GET_PTE, hermit_pf_ts);
 	adc_pf_breakdown_stt(pf_breakdown, ADC_LOOKUP_SWAPCACHE,
@@ -4077,7 +4091,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 #ifdef CONFIG_HERMIT
 				hermit_direct_swap_readpage(
 					page, entry, hermit_bypass,
-					&hermit_read_cpu, &adc_pf_bits,
+					&hermit_read_cpu, adc_pf_bits,
 					pf_breakdown);
 #else
 				/* To provide entry to swap_readpage() */
@@ -4122,7 +4136,7 @@ fallback_swapin:
 		count_vm_event(PGMAJFAULT);
 		count_memcg_event_mm(vma->vm_mm, PGMAJFAULT);
 #ifdef CONFIG_HERMIT
-		set_adc_pf_bits(&adc_pf_bits, ADC_PF_MAJOR_BIT);
+		set_adc_pf_bits(adc_pf_bits, ADC_PF_MAJOR_BIT);
 		hermit_account_ondemand_swapin();
 #endif
 	} else if (PageHWPoison(page)) {
@@ -4347,6 +4361,8 @@ unlock:
 		pte_unmap_unlock(vmf->pte, vmf->ptl);
 out:
 #ifdef CONFIG_HERMIT
+	hermit_pf_section_start(pf_breakdown, ADC_SET_PAGEMAP_UNLOCK,
+				&hermit_set_pagemap_unlock);
 	if (hermit_read_cpu >= 0)
 		hermit_poll_pending_read(&hermit_read_cpu, page, false,
 					 pf_breakdown);
@@ -4354,7 +4370,11 @@ out:
 	hermit_pf_section_end(pf_breakdown, ADC_UPD_METADATA,
 			      &hermit_upd_metadata);
 	hermit_pf_section_end(pf_breakdown, ADC_SETPTE, &hermit_setpte);
-	hermit_finish_swap_fault_profile(adc_pf_bits, pf_breakdown);
+	if (hermit_local_profile) {
+		hermit_pf_section_end(pf_breakdown, ADC_SET_PAGEMAP_UNLOCK,
+				      &hermit_set_pagemap_unlock);
+		hermit_finish_swap_fault_profile(*adc_pf_bits, pf_breakdown);
+	}
 #endif
 	/* Clear the swap cache pin for direct swapin after PTL unlock */
 	if (need_clear_cache)
@@ -4363,6 +4383,10 @@ out:
 		put_swap_device(si);
 	return ret;
 out_nomap:
+#ifdef CONFIG_HERMIT
+	hermit_pf_section_start(pf_breakdown, ADC_SET_PAGEMAP_UNLOCK,
+				&hermit_set_pagemap_unlock);
+#endif
 	if (vmf->pte)
 		pte_unmap_unlock(vmf->pte, vmf->ptl);
 out_page:
@@ -4375,10 +4399,16 @@ out_page:
 	folio_unlock(folio);
 out_release:
 #ifdef CONFIG_HERMIT
+	hermit_pf_section_start(pf_breakdown, ADC_SET_PAGEMAP_UNLOCK,
+				&hermit_set_pagemap_unlock);
 	hermit_pf_section_end(pf_breakdown, ADC_UPD_METADATA,
 			      &hermit_upd_metadata);
 	hermit_pf_section_end(pf_breakdown, ADC_SETPTE, &hermit_setpte);
-	hermit_finish_swap_fault_profile(adc_pf_bits, pf_breakdown);
+	if (hermit_local_profile) {
+		hermit_pf_section_end(pf_breakdown, ADC_SET_PAGEMAP_UNLOCK,
+				      &hermit_set_pagemap_unlock);
+		hermit_finish_swap_fault_profile(*adc_pf_bits, pf_breakdown);
+	}
 #endif
 	folio_put(folio);
 	if (folio != swapcache && swapcache) {

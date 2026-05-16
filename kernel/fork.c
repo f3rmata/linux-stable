@@ -2410,6 +2410,9 @@ __latent_entropy struct task_struct *copy_process(
 #ifdef CONFIG_IO_URING
 	p->io_uring = NULL;
 #endif
+#ifdef CONFIG_HERMIT
+	p->hermit_pf_ctx = NULL;
+#endif
 
 #if defined(SPLIT_RSS_COUNTING)
 	memset(&p->rss_stat, 0, sizeof(p->rss_stat));

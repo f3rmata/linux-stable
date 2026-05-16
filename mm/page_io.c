@@ -28,6 +28,7 @@
 #include "swap.h"
 
 #ifdef CONFIG_HERMIT
+#include <linux/hermit_profile.h>
 #include <linux/swap_stats.h>
 #include <linux/hermit_backend.h>
 #endif
@@ -226,6 +227,9 @@ static inline void count_swpout_vm_event(struct folio *folio)
 static bool hermit_swap_writepage(struct page *page)
 {
 	struct folio *folio = page_folio(page);
+	struct hermit_pf_profile_ctx *ctx = hermit_pf_current_ctx();
+	uint64_t *pf_breakdown = ctx ? ctx->pf_breakdown : NULL;
+	uint64_t pf_ts, pf_end;
 	swp_entry_t entry;
 	int cpu, ret;
 
@@ -241,13 +245,24 @@ static bool hermit_swap_writepage(struct page *page)
 
 	entry = page_swap_entry(page);
 	cpu = get_cpu();
+	pf_ts = pf_cycles_start();
+	adc_pf_breakdown_stt(pf_breakdown, ADC_WRITE_PAGE, pf_ts);
 	ret = hermit_backend_store(entry, page, cpu, false);
 	put_cpu();
+	pf_end = pf_cycles_end();
+	adc_pf_breakdown_end(pf_breakdown, ADC_WRITE_PAGE, pf_end);
 	if (ret)
 		return false;
 
 	count_swpout_vm_event(folio);
+	adc_profile_counter_inc(ADC_SWAPOUT);
 	adc_profile_counter_inc(ADC_HERMIT_SWAPOUT);
+	accum_adc_time_stat(ADC_RDMA_WRITE_LAT, pf_end - pf_ts);
+	accum_adc_time_stat(ADC_SWAP_OUT_DUR, pf_end - pf_ts);
+	if (ctx) {
+		set_adc_pf_bits(&ctx->adc_pf_bits, ADC_PF_SWAPOUT_BIT);
+		set_adc_pf_bits(&ctx->adc_pf_bits, ADC_PF_HERMIT_BIT);
+	}
 	folio_start_writeback(folio);
 	folio_unlock(folio);
 	folio_end_writeback(folio);
@@ -257,6 +272,8 @@ static bool hermit_swap_writepage(struct page *page)
 static bool hermit_swap_readpage(struct page *page)
 {
 	struct folio *folio = page_folio(page);
+	uint64_t *pf_breakdown = hermit_pf_current_breakdown();
+	uint64_t pf_ts, pf_end;
 	swp_entry_t entry;
 	int cpu, ret;
 
@@ -268,10 +285,15 @@ static bool hermit_swap_readpage(struct page *page)
 
 	entry = page_swap_entry(page);
 	cpu = get_cpu();
+	pf_ts = pf_cycles_start();
+	adc_pf_breakdown_stt(pf_breakdown, ADC_READ_PAGE, pf_ts);
 	ret = hermit_backend_load(entry, page, cpu, false);
 	put_cpu();
+	pf_end = pf_cycles_end();
+	adc_pf_breakdown_end(pf_breakdown, ADC_READ_PAGE, pf_end);
 	if (ret)
 		return false;
+	accum_adc_time_stat(ADC_RDMA_READ_LAT, pf_end - pf_ts);
 
 	if (!folio_test_uptodate(folio))
 		folio_mark_uptodate(folio);
@@ -623,6 +645,8 @@ void __swap_read_unplug(struct swap_iocb *sio)
 /* [Hermit] */
 inline int hermit_issue_read(struct page *page, swp_entry_t entry)
 {
+	uint64_t *pf_breakdown = hermit_pf_current_breakdown();
+	uint64_t pf_ts, pf_end;
 	int cpu, ret;
 	struct folio *folio = page_folio(page);
 
@@ -636,13 +660,18 @@ inline int hermit_issue_read(struct page *page, swp_entry_t entry)
 
 	cpu = get_cpu();
 	folio->swap = entry;
+	pf_ts = pf_cycles_start();
+	adc_pf_breakdown_stt(pf_breakdown, ADC_READ_PAGE, pf_ts);
 	ret = hermit_backend_load(entry, page, cpu, false);
 	put_cpu();
+	pf_end = pf_cycles_end();
+	adc_pf_breakdown_end(pf_breakdown, ADC_READ_PAGE, pf_end);
 	folio->private = NULL;
 
 	if (ret)
 		return ret;
 
+	accum_adc_time_stat(ADC_RDMA_READ_LAT, pf_end - pf_ts);
 	return cpu;
 }
 

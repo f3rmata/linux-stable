@@ -77,6 +77,7 @@
 #ifdef CONFIG_HERMIT
 #include <linux/hermit.h>
 #include <linux/hermit_utils.h>
+#include <linux/hermit_profile.h>
 #include <linux/swap_stats.h>
 #endif
 
@@ -2685,6 +2686,11 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
 	bool drained = false;
 	bool raised_max_event = false;
 	unsigned long pflags;
+#ifdef CONFIG_HERMIT
+	struct hermit_pf_profile_ctx *hermit_ctx = hermit_pf_current_ctx();
+	uint64_t *pf_breakdown = hermit_ctx ? hermit_ctx->pf_breakdown : NULL;
+	uint64_t pf_ts;
+#endif
 
 retry:
 	if (consume_stock(memcg, nr_pages)) {
@@ -2730,10 +2736,28 @@ retry:
 	memcg_memory_event(mem_over_limit, MEMCG_MAX);
 	raised_max_event = true;
 
+#ifdef CONFIG_HERMIT
+	if (pf_breakdown) {
+		pf_ts = pf_cycles_end();
+		adc_pf_breakdown_end(pf_breakdown, ADC_CGROUP_ACCOUNT,
+				     pf_ts);
+		adc_pf_breakdown_stt(pf_breakdown, ADC_PAGE_RECLAIM,
+				     pf_ts);
+	}
+#endif
 	psi_memstall_enter(&pflags);
 	nr_reclaimed = try_to_free_mem_cgroup_pages(mem_over_limit, nr_pages,
 						    gfp_mask, reclaim_options);
 	psi_memstall_leave(&pflags);
+#ifdef CONFIG_HERMIT
+	if (pf_breakdown) {
+		pf_ts = pf_cycles_end();
+		adc_pf_breakdown_end(pf_breakdown, ADC_PAGE_RECLAIM,
+				     pf_ts);
+		adc_pf_breakdown_stt(pf_breakdown, ADC_CGROUP_ACCOUNT,
+				     pf_ts);
+	}
+#endif
 
 	if (mem_cgroup_margin(mem_over_limit) >= nr_pages)
 		goto retry;

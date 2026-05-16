@@ -70,6 +70,7 @@
 
 #ifdef CONFIG_HERMIT
 #include <linux/hermit.h>
+#include <linux/hermit_profile.h>
 #include <linux/hermit_utils.h>
 #include <linux/swap_stats.h>
 #endif
@@ -173,7 +174,25 @@ struct scan_control {
 
 	/* for recording the reclaimed slab by now */
 	struct reclaim_state reclaim_state;
+
+#ifdef CONFIG_HERMIT
+	int *hermit_adc_pf_bits;
+	uint64_t *hermit_pf_breakdown;
+#endif
 };
+
+#ifdef CONFIG_HERMIT
+static inline void hermit_sc_set_current_profile(struct scan_control *sc)
+{
+	sc->hermit_adc_pf_bits = hermit_pf_current_bits();
+	sc->hermit_pf_breakdown = hermit_pf_current_breakdown();
+}
+
+static inline uint64_t *hermit_sc_breakdown(struct scan_control *sc)
+{
+	return sc ? sc->hermit_pf_breakdown : NULL;
+}
+#endif
 
 #ifdef ARCH_HAS_PREFETCHW
 #define prefetchw_prev_lru_folio(_folio, _base, _field)			\
@@ -1726,6 +1745,14 @@ static unsigned int shrink_folio_list(struct list_head *folio_list,
 	unsigned int pgactivate = 0;
 	bool do_demote_pass;
 	struct swap_iocb *plug = NULL;
+#ifdef CONFIG_HERMIT
+	uint64_t *pf_breakdown = hermit_sc_breakdown(sc);
+	uint64_t pf_ts, pf_end;
+
+	set_adc_pf_bits(sc->hermit_adc_pf_bits, ADC_PF_SWAPOUT_BIT);
+	adc_pf_breakdown_stt(pf_breakdown, ADC_BATCHING_OUT,
+			     pf_cycles_start());
+#endif
 
 	memset(stat, 0, sizeof(*stat));
 	cond_resched();
@@ -1870,8 +1897,18 @@ retry:
 			}
 		}
 
-		if (!ignore_references)
+		if (!ignore_references) {
+#ifdef CONFIG_HERMIT
+			pf_ts = pf_cycles_start();
+#endif
 			references = folio_check_references(folio, sc);
+#ifdef CONFIG_HERMIT
+			pf_ts = pf_cycles_end() - pf_ts;
+			adc_pf_breakdown_end(pf_breakdown, ADC_PG_CHECK_REF,
+					     pf_ts);
+			accum_adc_time_stat(ADC_RMAP1_LAT, pf_ts);
+#endif
+		}
 
 		switch (references) {
 		case FOLIOREF_ACTIVATE:
@@ -1963,7 +2000,18 @@ retry:
 			if (folio_test_pmd_mappable(folio))
 				flags |= TTU_SPLIT_HUGE_PMD;
 
+#ifdef CONFIG_HERMIT
+			pf_ts = pf_cycles_start();
+			adc_pf_breakdown_stt(pf_breakdown, ADC_TRY_TO_UNMAP,
+					     pf_ts);
+#endif
 			try_to_unmap(folio, flags);
+#ifdef CONFIG_HERMIT
+			pf_end = pf_cycles_end();
+			adc_pf_breakdown_end(pf_breakdown, ADC_TRY_TO_UNMAP,
+					     pf_end);
+			accum_adc_time_stat(ADC_RMAP2_LAT, pf_end - pf_ts);
+#endif
 			if (folio_mapped(folio)) {
 				stat->nr_unmap_fail += nr_pages;
 				if (!was_swapbacked &&
@@ -2025,7 +2073,16 @@ retry:
 			 * potentially exists to avoid CPU writes after I/O
 			 * starts and then write it out here.
 			 */
+#ifdef CONFIG_HERMIT
+			pf_ts = pf_cycles_start();
+#endif
 			try_to_unmap_flush_dirty();
+#ifdef CONFIG_HERMIT
+			pf_ts = pf_cycles_end() - pf_ts;
+			adc_pf_breakdown_end(pf_breakdown, ADC_TLB_FLUSH_DIRTY,
+					     pf_ts);
+			accum_adc_time_stat(ADC_TLB_FLUSH_DIR, pf_ts);
+#endif
 			switch (pageout(folio, mapping, &plug)) {
 			case PAGE_KEEP:
 				goto keep_locked;
@@ -2079,7 +2136,19 @@ retry:
 		 * the folio on the LRU so it is swappable.
 		 */
 		if (folio_needs_release(folio)) {
-			if (!filemap_release_folio(folio, sc->gfp_mask))
+			bool released;
+
+#ifdef CONFIG_HERMIT
+			pf_ts = pf_cycles_start();
+			adc_pf_breakdown_stt(pf_breakdown, ADC_RLS_PG_RM_MAP,
+					     pf_ts);
+#endif
+			released = filemap_release_folio(folio, sc->gfp_mask);
+#ifdef CONFIG_HERMIT
+			adc_pf_breakdown_end(pf_breakdown, ADC_RLS_PG_RM_MAP,
+					     pf_cycles_end());
+#endif
+			if (!released)
 				goto activate_locked;
 			if (!mapping && folio_ref_count(folio) == 1) {
 				folio_unlock(folio);
@@ -2101,8 +2170,26 @@ retry:
 
 		if (folio_test_anon(folio) && !folio_test_swapbacked(folio)) {
 			/* follow __remove_mapping for reference */
+#ifdef CONFIG_HERMIT
+			pf_ts = pf_cycles_start();
+			adc_pf_breakdown_stt(pf_breakdown, ADC_RLS_PG_RM_MAP,
+					     pf_ts);
+#endif
 			if (!folio_ref_freeze(folio, 1))
+#ifdef CONFIG_HERMIT
+			{
+				adc_pf_breakdown_end(pf_breakdown,
+						     ADC_RLS_PG_RM_MAP,
+						     pf_cycles_end());
 				goto keep_locked;
+			}
+#else
+				goto keep_locked;
+#endif
+#ifdef CONFIG_HERMIT
+			adc_pf_breakdown_end(pf_breakdown, ADC_RLS_PG_RM_MAP,
+					     pf_cycles_end());
+#endif
 			/*
 			 * The folio has only one reference left, which is
 			 * from the isolation. After the caller puts the
@@ -2113,9 +2200,27 @@ retry:
 			 */
 			count_vm_events(PGLAZYFREED, nr_pages);
 			count_memcg_folio_events(folio, PGLAZYFREED, nr_pages);
-		} else if (!mapping || !__remove_mapping(mapping, folio, true,
-							 sc->target_mem_cgroup))
-			goto keep_locked;
+		} else {
+			bool removed = false;
+
+			if (mapping) {
+#ifdef CONFIG_HERMIT
+				pf_ts = pf_cycles_start();
+				adc_pf_breakdown_stt(pf_breakdown,
+						     ADC_RLS_PG_RM_MAP,
+						     pf_ts);
+#endif
+				removed = __remove_mapping(mapping, folio, true,
+							   sc->target_mem_cgroup);
+#ifdef CONFIG_HERMIT
+				adc_pf_breakdown_end(pf_breakdown,
+						     ADC_RLS_PG_RM_MAP,
+						     pf_cycles_end());
+#endif
+			}
+			if (!mapping || !removed)
+				goto keep_locked;
+		}
 
 		folio_unlock(folio);
 free_it:
@@ -2197,7 +2302,15 @@ keep:
 	pgactivate = stat->nr_activate[0] + stat->nr_activate[1];
 
 	mem_cgroup_uncharge_list(&free_folios);
+#ifdef CONFIG_HERMIT
+	pf_ts = pf_cycles_start();
+#endif
 	try_to_unmap_flush();
+#ifdef CONFIG_HERMIT
+	pf_ts = pf_cycles_end() - pf_ts;
+	adc_pf_breakdown_end(pf_breakdown, ADC_UNMAP_TLB_FLUSH, pf_ts);
+	accum_adc_time_stat(ADC_TLB_FLUSH_LAT, pf_ts);
+#endif
 	free_unref_page_list(&free_folios);
 
 	list_splice(&ret_folios, folio_list);
@@ -2205,6 +2318,11 @@ keep:
 
 	if (plug)
 		swap_write_unplug(plug);
+#ifdef CONFIG_HERMIT
+	adc_pf_breakdown_end(pf_breakdown, ADC_BATCHING_OUT,
+			     pf_cycles_end());
+	adc_counter_add(nr_reclaimed, ADC_RECLAIM);
+#endif
 	return nr_reclaimed;
 }
 
@@ -2694,6 +2812,12 @@ static void shrink_active_list(unsigned long nr_to_scan,
 	unsigned nr_rotated = 0;
 	int file = is_file_lru(lru);
 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+#ifdef CONFIG_HERMIT
+	uint64_t *pf_breakdown = hermit_sc_breakdown(sc);
+
+	adc_pf_breakdown_stt(pf_breakdown, ADC_SHRNK_ACTV_LST,
+			     pf_cycles_start());
+#endif
 
 	lru_add_drain();
 
@@ -2774,6 +2898,10 @@ static void shrink_active_list(unsigned long nr_to_scan,
 		lru_note_cost(lruvec, file, 0, nr_rotated);
 	mem_cgroup_uncharge_list(&l_active);
 	free_unref_page_list(&l_active);
+#ifdef CONFIG_HERMIT
+	adc_pf_breakdown_end(pf_breakdown, ADC_SHRNK_ACTV_LST,
+			     pf_cycles_end());
+#endif
 	trace_mm_vmscan_lru_shrink_active(pgdat->node_id, nr_taken, nr_activate,
 			nr_deactivate, nr_rotated, sc->priority, file);
 }
@@ -6529,8 +6657,16 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 
 		shrink_lruvec(lruvec, sc);
 
+#ifdef CONFIG_HERMIT
+		adc_pf_breakdown_stt(hermit_sc_breakdown(sc), ADC_SHRNK_SLAB,
+				     pf_cycles_start());
+#endif
 		shrink_slab(sc->gfp_mask, pgdat->node_id, memcg,
 			    sc->priority);
+#ifdef CONFIG_HERMIT
+		adc_pf_breakdown_end(hermit_sc_breakdown(sc), ADC_SHRNK_SLAB,
+				     pf_cycles_end());
+#endif
 
 		/* Record the group's reclaim efficiency */
 		if (!sc->proactive)
@@ -7177,6 +7313,9 @@ unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
 	 */
 	struct zonelist *zonelist = node_zonelist(numa_node_id(), sc.gfp_mask);
 
+#ifdef CONFIG_HERMIT
+	hermit_sc_set_current_profile(&sc);
+#endif
 	set_task_reclaim_state(current, &sc.reclaim_state);
 	trace_mm_vmscan_memcg_reclaim_begin(0, sc.gfp_mask);
 	noreclaim_flag = memalloc_noreclaim_save();
@@ -7200,16 +7339,39 @@ unsigned long hermit_try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
 {
 	unsigned int reclaim_options = may_swap ? MEMCG_RECLAIM_MAY_SWAP : 0;
 	unsigned long nr_reclaimed;
+	struct hermit_pf_profile_ctx hermit_ctx;
+	struct hermit_pf_profile_ctx *old_ctx = NULL;
+	uint64_t *active_pf_breakdown = pf_breakdown;
+	bool pushed_ctx = false;
 	uint64_t pf_ts;
 
 	(void)cthd;
-	(void)adc_pf_bits;
+
+	if (pf_breakdown) {
+		hermit_pf_profile_init(&hermit_ctx);
+		memcpy(hermit_ctx.pf_breakdown, pf_breakdown,
+		       sizeof(hermit_ctx.pf_breakdown));
+		if (adc_pf_bits)
+			hermit_ctx.adc_pf_bits = *adc_pf_bits;
+		old_ctx = hermit_pf_push_ctx(&hermit_ctx);
+		active_pf_breakdown = hermit_ctx.pf_breakdown;
+		pushed_ctx = true;
+	}
 
 	pf_ts = pf_cycles_start();
+	adc_pf_breakdown_stt(active_pf_breakdown, ADC_PAGE_RECLAIM, pf_ts);
 	nr_reclaimed = try_to_free_mem_cgroup_pages(memcg, nr_pages, gfp_mask,
 						    reclaim_options);
-	adc_pf_breakdown_end(pf_breakdown, ADC_PAGE_RECLAIM,
-			     pf_cycles_end() - pf_ts);
+	adc_pf_breakdown_end(active_pf_breakdown, ADC_PAGE_RECLAIM,
+			     pf_cycles_end());
+
+	if (pushed_ctx) {
+		memcpy(pf_breakdown, hermit_ctx.pf_breakdown,
+		       sizeof(hermit_ctx.pf_breakdown));
+		if (adc_pf_bits)
+			*adc_pf_bits = hermit_ctx.adc_pf_bits;
+		hermit_pf_pop_ctx(old_ctx);
+	}
 
 	return nr_reclaimed;
 }

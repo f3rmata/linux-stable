@@ -736,6 +736,8 @@ struct wake_q_node {
 	struct wake_q_node *next;
 };
 
+struct hermit_pf_profile_ctx;
+
 struct kmap_ctrl {
 #ifdef CONFIG_KMAP_LOCAL
 	int				idx;
@@ -878,6 +880,9 @@ struct task_struct {
 
 	struct mm_struct		*mm;
 	struct mm_struct		*active_mm;
+#ifdef CONFIG_HERMIT
+	struct hermit_pf_profile_ctx	*hermit_pf_ctx;
+#endif
 
 	int				exit_state;
 	int				exit_code;

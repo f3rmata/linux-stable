@@ -20,6 +20,10 @@
 #include <linux/efi.h>			/* efi_crash_gracefully_on_page_fault()*/
 #include <linux/mm_types.h>
 #include <linux/mm.h>			/* find_and_lock_vma() */
+#ifdef CONFIG_HERMIT
+#include <linux/hermit_profile.h>
+#include <linux/swap_stats.h>
+#endif
 
 #include <asm/cpufeature.h>		/* boot_cpu_has, ...		*/
 #include <asm/traps.h>			/* dotraplinkage, ...		*/
@@ -1473,6 +1477,11 @@ DEFINE_IDTENTRY_RAW_ERRORCODE(exc_page_fault)
 {
 	unsigned long address = read_cr2();
 	irqentry_state_t state;
+#ifdef CONFIG_HERMIT
+	struct hermit_pf_profile_ctx hermit_pf_ctx;
+	struct hermit_pf_profile_ctx *old_hermit_pf_ctx;
+	uint64_t pf_ts_start, pf_ts_end;
+#endif
 
 	prefetchw(&current->mm->mmap_lock);
 
@@ -1500,6 +1509,11 @@ DEFINE_IDTENTRY_RAW_ERRORCODE(exc_page_fault)
 	if (kvm_handle_async_pf(regs, (u32)address))
 		return;
 
+#ifdef CONFIG_HERMIT
+	hermit_pf_profile_init(&hermit_pf_ctx);
+	pf_ts_start = pf_cycles_start();
+#endif
+
 	/*
 	 * Entry handling for valid #PF from kernel mode is slightly
 	 * different: RCU is already watching and ct_irq_enter() must not
@@ -1512,9 +1526,39 @@ DEFINE_IDTENTRY_RAW_ERRORCODE(exc_page_fault)
 	 */
 	state = irqentry_enter(regs);
 
+#ifdef CONFIG_HERMIT
+	pf_ts_end = pf_cycles_end();
+	adc_pf_breakdown_end(hermit_pf_ctx.pf_breakdown,
+			     ADC_TRAP_TO_KERNEL, pf_ts_end - pf_ts_start);
+	adc_pf_breakdown_stt(hermit_pf_ctx.pf_breakdown,
+			     ADC_LOCK_GET_PTE, pf_ts_start);
+	old_hermit_pf_ctx = hermit_pf_push_ctx(&hermit_pf_ctx);
+#endif
+
 	instrumentation_begin();
 	handle_page_fault(regs, error_code, address);
 	instrumentation_end();
 
+#ifdef CONFIG_HERMIT
+	hermit_pf_pop_ctx(old_hermit_pf_ctx);
+	pf_ts_end = pf_cycles_end();
+	adc_pf_breakdown_end(hermit_pf_ctx.pf_breakdown, ADC_TOTAL_PF,
+			     pf_ts_end - pf_ts_start);
+	adc_pf_breakdown_stt(hermit_pf_ctx.pf_breakdown, ADC_RET_TO_USER,
+			     pf_ts_end);
+#endif
+
 	irqentry_exit(regs, state);
+
+#ifdef CONFIG_HERMIT
+	pf_ts_end = pf_cycles_end();
+	adc_pf_breakdown_end(hermit_pf_ctx.pf_breakdown, ADC_RET_TO_USER,
+			     pf_ts_end);
+	adc_pf_breakdown_end(hermit_pf_ctx.pf_breakdown,
+			     ADC_SET_PAGEMAP_UNLOCK, pf_ts_end);
+	record_adc_pf_time(hermit_pf_ctx.adc_pf_bits,
+			   hermit_pf_ctx.pf_breakdown[ADC_TOTAL_PF]);
+	parse_adc_pf_breakdown(hermit_pf_ctx.adc_pf_bits,
+			       hermit_pf_ctx.pf_breakdown);
+#endif
 }
