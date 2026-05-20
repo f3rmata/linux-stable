@@ -75,6 +75,9 @@
 #include <linux/memremap.h>
 #include <linux/userfaultfd_k.h>
 #include <linux/mm_inline.h>
+#ifdef CONFIG_HERMIT
+#include <linux/hermit.h>
+#endif
 
 #include <asm/tlb.h>
 
@@ -1252,6 +1255,14 @@ void page_add_anon_rmap(struct page *page, struct vm_area_struct *vma,
 		else
 			__page_check_anon_rmap(folio, page, vma, address);
 	}
+#ifdef CONFIG_HERMIT
+	if (!compound && folio_nr_pages(folio) == 1 && folio_test_anon(folio)) {
+		if (folio_mapcount(folio) == 1)
+			hmt_set_page_vaddr(page, address);
+		else
+			hmt_set_page_vaddr(page, 0);
+	}
+#endif
 
 	mlock_vma_folio(folio, vma, compound);
 }
@@ -1291,6 +1302,10 @@ void folio_add_new_anon_rmap(struct folio *folio, struct vm_area_struct *vma,
 
 	__lruvec_stat_mod_folio(folio, NR_ANON_MAPPED, nr);
 	__page_set_anon_rmap(folio, &folio->page, vma, address, 1);
+#ifdef CONFIG_HERMIT
+	if (folio_nr_pages(folio) == 1)
+		hmt_set_page_vaddr(&folio->page, address);
+#endif
 }
 
 /**
@@ -1397,6 +1412,10 @@ void page_remove_rmap(struct page *page, struct vm_area_struct *vma,
 	enum node_stat_item idx;
 
 	VM_BUG_ON_PAGE(compound && !PageHead(page), page);
+#ifdef CONFIG_HERMIT
+	if (!compound && folio_nr_pages(folio) == 1 && folio_test_anon(folio))
+		hmt_set_page_vaddr(page, 0);
+#endif
 
 	/* Hugetlb pages are not counted in NR_*MAPPED */
 	if (unlikely(folio_test_hugetlb(folio))) {
@@ -1806,6 +1825,39 @@ void try_to_unmap(struct folio *folio, enum ttu_flags flags)
 	else
 		rmap_walk(folio, &rwc);
 }
+
+#ifdef CONFIG_HERMIT
+bool hermit_try_to_unmap(struct vpage *vpage, struct page *page,
+			 enum ttu_flags flags)
+{
+	struct folio *folio;
+	bool ret;
+
+	if (!vpage || !page || vpage->page != page || !vpage->vma)
+		return false;
+
+	folio = page_folio(page);
+	if (folio_nr_pages(folio) != 1 || !folio_test_anon(folio) ||
+	    folio_test_ksm(folio) || folio_test_hugetlb(folio))
+		return false;
+	if (folio_mapcount(folio) != 1 || !folio_mapped(folio))
+		return false;
+	if (flags & (TTU_RMAP_LOCKED | TTU_SPLIT_HUGE_PMD))
+		return false;
+	if (vpage->address < vpage->vma->vm_start ||
+	    vpage->address >= vpage->vma->vm_end)
+		return false;
+
+	ret = try_to_unmap_one(folio, vpage->vma, vpage->address,
+			       (void *)flags);
+	if (!ret || folio_mapped(folio)) {
+		hmt_set_page_vaddr(page, 0);
+		return false;
+	}
+
+	return true;
+}
+#endif
 
 /*
  * @arg: enum ttu_flags will be passed to this argument.

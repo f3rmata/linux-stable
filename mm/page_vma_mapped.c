@@ -4,6 +4,9 @@
 #include <linux/hugetlb.h>
 #include <linux/swap.h>
 #include <linux/swapops.h>
+#ifdef CONFIG_HERMIT
+#include <linux/hermit.h>
+#endif
 
 #include "internal.h"
 
@@ -317,6 +320,33 @@ next_pte:
 
 	return false;
 }
+
+#ifdef CONFIG_HERMIT
+bool hermit_addr_vma_walk(struct page_vma_mapped_walk *pvmw, bool force_lock)
+{
+	if (!pvmw || !pvmw->vma)
+		return false;
+	if (pvmw->address < pvmw->vma->vm_start ||
+	    pvmw->address >= pvmw->vma->vm_end)
+		return false;
+
+	/*
+	 * The 6.6-safe Hermit path always returns a locked PTE and requires the
+	 * caller to release it with page_vma_mapped_walk_done().  Keep the
+	 * force_lock argument for source compatibility with the 5.14 helpers.
+	 */
+	(void)force_lock;
+	pvmw->pmd = NULL;
+	pvmw->pte = NULL;
+	pvmw->ptl = NULL;
+	return page_vma_mapped_walk(pvmw) && pvmw->pte;
+}
+
+bool hermit_addr_vma_walk_nolock(struct page_vma_mapped_walk *pvmw)
+{
+	return hermit_addr_vma_walk(pvmw, true);
+}
+#endif
 
 /**
  * page_mapped_in_vma - check whether a page is really mapped in a VMA

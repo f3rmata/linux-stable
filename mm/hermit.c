@@ -267,61 +267,56 @@ int hermit_page_referenced(struct vpage *vpage, struct page *page,
 			   int is_locked, struct mem_cgroup *memcg,
 			   unsigned long *vm_flags)
 {
-	struct folio *folio = page_folio(page);
-	int we_locked = 0;
+	struct folio *folio;
+	struct page_vma_mapped_walk pvmw;
 	int referenced = 0;
 
-	unsigned long address = vpage->address;
-	struct vm_area_struct *vma = vpage->vma;
-	pte_t *pte = vpage->pte;
+	unsigned long address;
+	struct vm_area_struct *vma;
 
 	*vm_flags = 0;
-	BUG_ON(!PageAnon(page));
-	BUG_ON(!folio_raw_mapping(folio));
-	// BUG_ON(folio_mapcount(folio) != 1);
-	if (folio_mapcount(folio) > 1) {
-		pr_err("%s:%d folio_mapcount > 1!\n", __func__, __LINE__);
-		return folio_referenced(folio, is_locked, memcg, vm_flags);
-	}
+	if (!vpage || !page || vpage->page != page || !vpage->vma)
+		return -1;
 
-	if (!is_locked && (!folio_test_anon(folio) || folio_test_ksm(folio))) {
-		we_locked = trylock_page(page);
-		if (!we_locked)
-			return 1;
-	}
+	folio = page_folio(page);
+	address = vpage->address;
+	vma = vpage->vma;
+	pvmw = (struct page_vma_mapped_walk) {
+		.pfn = page_to_pfn(page),
+		.nr_pages = 1,
+		.pgoff = page_to_pgoff(page),
+		.vma = vma,
+		.address = address,
+	};
+
+	if (!folio_test_anon(folio) || folio_test_ksm(folio) ||
+	    folio_test_hugetlb(folio) || folio_nr_pages(folio) != 1 ||
+	    folio_mapcount(folio) != 1)
+		return -1;
+	if (!is_locked && !folio_trylock(folio))
+		return -1;
+
+	if (!hermit_addr_vma_walk(&pvmw, true))
+		goto failed;
 
 	if (vma->vm_flags & VM_LOCKED) {
-		// page_vma_mapped_walk_done(&pvmw);
-		if (pte && !PageHuge(page))
-			pte_unmap(pte);
 		*vm_flags |= VM_LOCKED;
+		mlock_vma_folio(folio, vma, false);
+		page_vma_mapped_walk_done(&pvmw);
 		goto walk_done;
 	}
 
 	// page_referenced_one
-	if (pte) {
-		if (ptep_clear_flush_young_notify(vma, address, pte)) {
-			/*
-			 * Don't treat a reference through
-			 * a sequentially read mapping as such.
-			 * If the page has been used in another mapping,
-			 * we will catch it; if this other mapping is
-			 * already gone, the unmap path will have set
-			 * PG_referenced or activated the page.
-			 */
-			if (likely(!(vma->vm_flags & VM_SEQ_READ)))
-				referenced++;
-		}
-	}
-	// NOTE: shouldn't get THP
-	/* else if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE)) {
-		if (pmdp_clear_flush_young_notify(vma, address, pvmw.pmd))
+	if (ptep_clear_flush_young_notify(vma, address, pvmw.pte)) {
+		/*
+		 * Don't treat a reference through a sequentially read mapping
+		 * as such. If the page has been used in another mapping, the
+		 * native fallback will catch it once the vaddr hint is cleared.
+		 */
+		if (likely(!(vma->vm_flags & VM_SEQ_READ)))
 			referenced++;
-	} */
-	else {
-		/* unexpected pmd-mapped page? */
-		WARN_ON_ONCE(1);
 	}
+	page_vma_mapped_walk_done(&pvmw);
 
 walk_done:
 	if (referenced)
@@ -333,5 +328,13 @@ walk_done:
 		*vm_flags |= vma->vm_flags;
 	}
 
+	if (!is_locked)
+		folio_unlock(folio);
 	return referenced;
+
+failed:
+	hmt_set_page_vaddr(page, 0);
+	if (!is_locked && folio_test_locked(folio))
+		folio_unlock(folio);
+	return -1;
 }

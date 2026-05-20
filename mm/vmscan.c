@@ -192,6 +192,99 @@ static inline uint64_t *hermit_sc_breakdown(struct scan_control *sc)
 {
 	return sc ? sc->hermit_pf_breakdown : NULL;
 }
+
+static bool folio2vpage_locked(struct folio *folio, struct vpage *vpage,
+			       struct mm_struct **locked_mm)
+{
+	struct page *page = &folio->page;
+	struct mm_struct *mm = current->mm;
+	struct vm_area_struct *vma;
+	struct page_vma_mapped_walk pvmw = {
+		.pfn = folio_pfn(folio),
+		.nr_pages = 1,
+		.pgoff = folio_pgoff(folio),
+	};
+	unsigned long vaddr;
+
+	*locked_mm = NULL;
+	if (!hmt_ctl_flag(HMT_VADDR_OUT) || !mm)
+		return false;
+	if (folio_nr_pages(folio) != 1 || !folio_test_anon(folio) ||
+	    folio_test_ksm(folio) || folio_test_hugetlb(folio) ||
+	    folio_mapcount(folio) != 1)
+		return false;
+
+	vaddr = hmt_get_page_vaddr(page);
+	if (!vaddr)
+		return false;
+	if (!mmap_read_trylock(mm))
+		return false;
+
+	vma = vma_lookup(mm, vaddr);
+	if (!vma || vaddr < vma->vm_start || vaddr >= vma->vm_end)
+		goto clear_hint;
+
+	pvmw.vma = vma;
+	pvmw.address = vaddr;
+	if (!hermit_addr_vma_walk(&pvmw, true))
+		goto clear_hint;
+	page_vma_mapped_walk_done(&pvmw);
+
+	vpage->vma = vma;
+	vpage->address = vaddr;
+	vpage->pte = NULL;
+	vpage->ptl = NULL;
+	vpage->page = page;
+	*locked_mm = mm;
+	return true;
+
+clear_hint:
+	hmt_set_page_vaddr(page, 0);
+	mmap_read_unlock(mm);
+	return false;
+}
+
+static void unlock_vpage_mmap(struct mm_struct *mm)
+{
+	mmap_read_unlock(mm);
+}
+
+static bool hermit_folio_referenced(struct folio *folio, struct scan_control *sc,
+				    int *referenced_ptes,
+				    unsigned long *vm_flags)
+{
+	struct mm_struct *mm;
+	struct vpage vpage;
+	int ret;
+
+	if (!folio2vpage_locked(folio, &vpage, &mm))
+		return false;
+
+	ret = hermit_page_referenced(&vpage, &folio->page, 1,
+				     sc->target_mem_cgroup, vm_flags);
+	if (ret < 0) {
+		unlock_vpage_mmap(mm);
+		return false;
+	}
+
+	*referenced_ptes = ret;
+	unlock_vpage_mmap(mm);
+	return true;
+}
+
+static bool hermit_try_to_unmap_folio(struct folio *folio, enum ttu_flags flags)
+{
+	struct mm_struct *mm;
+	struct vpage vpage;
+	bool ret;
+
+	if (!folio2vpage_locked(folio, &vpage, &mm))
+		return false;
+
+	ret = hermit_try_to_unmap(&vpage, &folio->page, flags);
+	unlock_vpage_mmap(mm);
+	return ret;
+}
 #endif
 
 #ifdef ARCH_HAS_PREFETCHW
@@ -1554,13 +1647,23 @@ enum folio_references {
 };
 
 static enum folio_references folio_check_references(struct folio *folio,
-						  struct scan_control *sc)
+						  struct scan_control *sc,
+						  bool *used_hermit_rmap)
 {
 	int referenced_ptes, referenced_folio;
 	unsigned long vm_flags;
 
-	referenced_ptes = folio_referenced(folio, 1, sc->target_mem_cgroup,
-					   &vm_flags);
+	if (used_hermit_rmap)
+		*used_hermit_rmap = false;
+#ifdef CONFIG_HERMIT
+	if (hermit_folio_referenced(folio, sc, &referenced_ptes, &vm_flags)) {
+		if (used_hermit_rmap)
+			*used_hermit_rmap = true;
+	} else
+#endif
+		referenced_ptes = folio_referenced(folio, 1,
+						   sc->target_mem_cgroup,
+						   &vm_flags);
 	referenced_folio = folio_test_clear_referenced(folio);
 
 	/*
@@ -1899,14 +2002,18 @@ retry:
 
 		if (!ignore_references) {
 #ifdef CONFIG_HERMIT
+			bool used_hermit_rmap = false;
 			pf_ts = pf_cycles_start();
 #endif
-			references = folio_check_references(folio, sc);
+			references = folio_check_references(folio, sc,
+							    &used_hermit_rmap);
 #ifdef CONFIG_HERMIT
 			pf_ts = pf_cycles_end() - pf_ts;
 			adc_pf_breakdown_end(pf_breakdown, ADC_PG_CHECK_REF,
 					     pf_ts);
-			accum_adc_time_stat(ADC_RMAP1_LAT, pf_ts);
+			accum_adc_time_stat(used_hermit_rmap ?
+					    ADC_HERMIT_RMAP1_LAT :
+					    ADC_RMAP1_LAT, pf_ts);
 #endif
 		}
 
@@ -1996,6 +2103,9 @@ retry:
 		if (folio_mapped(folio)) {
 			enum ttu_flags flags = TTU_BATCH_FLUSH;
 			bool was_swapbacked = folio_test_swapbacked(folio);
+#ifdef CONFIG_HERMIT
+			bool used_hermit_unmap = false;
+#endif
 
 			if (folio_test_pmd_mappable(folio))
 				flags |= TTU_SPLIT_HUGE_PMD;
@@ -2005,12 +2115,20 @@ retry:
 			adc_pf_breakdown_stt(pf_breakdown, ADC_TRY_TO_UNMAP,
 					     pf_ts);
 #endif
+#ifdef CONFIG_HERMIT
+			if (!(flags & TTU_SPLIT_HUGE_PMD))
+				used_hermit_unmap =
+					hermit_try_to_unmap_folio(folio, flags);
+			if (!used_hermit_unmap)
+#endif
 			try_to_unmap(folio, flags);
 #ifdef CONFIG_HERMIT
 			pf_end = pf_cycles_end();
 			adc_pf_breakdown_end(pf_breakdown, ADC_TRY_TO_UNMAP,
 					     pf_end);
-			accum_adc_time_stat(ADC_RMAP2_LAT, pf_end - pf_ts);
+			accum_adc_time_stat(used_hermit_unmap ?
+					    ADC_HERMIT_RMAP2_LAT :
+					    ADC_RMAP2_LAT, pf_end - pf_ts);
 #endif
 			if (folio_mapped(folio)) {
 				stat->nr_unmap_fail += nr_pages;

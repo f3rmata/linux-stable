@@ -163,7 +163,7 @@ int hermit_page_referenced(struct vpage *vpage, struct page *page,
 			   int is_locked, struct mem_cgroup *memcg,
 			   unsigned long *vm_flags);
 // implemented in rmap.c & pagewalk.c
-void hermit_try_to_unmap(struct vpage *vpage, struct page *page,
+bool hermit_try_to_unmap(struct vpage *vpage, struct page *page,
 			 enum ttu_flags flags);
 
 bool hermit_addr_vma_walk(struct page_vma_mapped_walk *pvmw, bool force_lock);
