@@ -229,7 +229,7 @@ static bool hermit_swap_writepage(struct page *page)
 	struct folio *folio = page_folio(page);
 	struct hermit_pf_profile_ctx *ctx = hermit_pf_current_ctx();
 	uint64_t *pf_breakdown = ctx ? ctx->pf_breakdown : NULL;
-	uint64_t pf_ts, pf_end;
+	uint64_t pf_ts, pf_end, poll_ts;
 	swp_entry_t entry;
 	int cpu, ret;
 
@@ -248,9 +248,18 @@ static bool hermit_swap_writepage(struct page *page)
 	pf_ts = pf_cycles_start();
 	adc_pf_breakdown_stt(pf_breakdown, ADC_WRITE_PAGE, pf_ts);
 	ret = hermit_backend_store(entry, page, cpu, false);
-	put_cpu();
 	pf_end = pf_cycles_end();
 	adc_pf_breakdown_end(pf_breakdown, ADC_WRITE_PAGE, pf_end);
+	if (ret) {
+		put_cpu();
+		return false;
+	}
+
+	poll_ts = pf_cycles_start();
+	adc_pf_breakdown_stt(pf_breakdown, ADC_POLL_STORE, poll_ts);
+	ret = hermit_backend_poll_store(cpu);
+	put_cpu();
+	adc_pf_breakdown_end(pf_breakdown, ADC_POLL_STORE, pf_cycles_end());
 	if (ret)
 		return false;
 
@@ -662,7 +671,7 @@ inline int hermit_issue_read(struct page *page, swp_entry_t entry)
 	folio->swap = entry;
 	pf_ts = pf_cycles_start();
 	adc_pf_breakdown_stt(pf_breakdown, ADC_READ_PAGE, pf_ts);
-	ret = hermit_backend_load(entry, page, cpu, false);
+	ret = hermit_backend_load(entry, page, cpu, true);
 	put_cpu();
 	pf_end = pf_cycles_end();
 	adc_pf_breakdown_end(pf_breakdown, ADC_READ_PAGE, pf_end);

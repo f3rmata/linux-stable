@@ -117,3 +117,33 @@ int hermit_backend_peek_load(int cpu)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(hermit_backend_peek_load);
+
+int hermit_backend_poll_store(int cpu)
+{
+	const struct hermit_backend_ops *ops;
+	int ret = 0;
+
+	rcu_read_lock();
+	ops = rcu_dereference(hermit_backend_ops);
+	if (ops && ops->poll_store)
+		ret = ops->poll_store(cpu);
+	rcu_read_unlock();
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(hermit_backend_poll_store);
+
+int hermit_backend_peek_store(int cpu)
+{
+	const struct hermit_backend_ops *ops;
+	int ret = -EOPNOTSUPP;
+
+	rcu_read_lock();
+	ops = rcu_dereference(hermit_backend_ops);
+	if (ops && ops->peek_store)
+		ret = ops->peek_store(cpu);
+	rcu_read_unlock();
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(hermit_backend_peek_store);
