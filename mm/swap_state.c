@@ -22,6 +22,7 @@
 #include <linux/huge_mm.h>
 #include <linux/shmem_fs.h>
 #ifdef CONFIG_HERMIT
+#include <linux/hermit_backend.h>
 #include <linux/hermit.h>
 #include <linux/hermit_profile.h>
 #include <linux/swap_stats.h>
@@ -933,6 +934,91 @@ skip:
 	return read_swap_cache_async(fentry, gfp_mask, vma, vmf->address, NULL);
 #endif
 }
+
+#ifdef CONFIG_HERMIT
+/*
+ * Conservative replacement for 5.14 hermit_vma_prefetch() on the direct
+ * bypass-swapcache fault path.  The demand page is read outside swapcache;
+ * neighboring pages are prefetched into swapcache and therefore still use the
+ * normal 6.6 swap_readpage() completion rules.
+ */
+void hermit_direct_swapin_readahead(struct vm_fault *vmf, int cpu)
+{
+	struct blk_plug plug;
+	struct swap_iocb *splug = NULL;
+	struct vm_area_struct *vma = vmf->vma;
+	struct page *page;
+	pte_t *pte = NULL, pentry;
+	unsigned long addr;
+	swp_entry_t entry;
+	unsigned int i;
+	bool page_allocated;
+	uint64_t *pf_breakdown = hermit_pf_current_breakdown();
+	struct vma_swap_readahead ra_info = {
+		.win = 1,
+	};
+
+	if (!swap_use_vma_readahead())
+		return;
+
+	adc_pf_breakdown_stt(pf_breakdown, ADC_PREFETCH, pf_cycles_start());
+	swap_ra_info(vmf, &ra_info);
+	if (ra_info.win == 1)
+		goto done;
+
+	addr = vmf->address - (ra_info.offset * PAGE_SIZE);
+
+	blk_start_plug(&plug);
+	for (i = 0; i < ra_info.nr_pte; i++, addr += PAGE_SIZE) {
+		uint64_t pf_ts;
+
+		if (cpu >= 0 && hermit_backend_peek_load(cpu) == 0)
+			break;
+
+		if (!pte++) {
+			pte = pte_offset_map(vmf->pmd, addr);
+			if (!pte)
+				break;
+		}
+		if (i == ra_info.offset)
+			continue;
+
+		pentry = ptep_get_lockless(pte);
+		if (!is_swap_pte(pentry))
+			continue;
+
+		entry = pte_to_swp_entry(pentry);
+		if (unlikely(non_swap_entry(entry)))
+			continue;
+
+		pte_unmap(pte);
+		pte = NULL;
+		pf_ts = pf_cycles_start();
+		adc_pf_breakdown_stt(pf_breakdown, ADC_RD_CACHE_ASYNC, pf_ts);
+		page = __read_swap_cache_async(entry, GFP_HIGHUSER_MOVABLE,
+					       vma, addr, &page_allocated);
+		adc_pf_breakdown_end(pf_breakdown, ADC_RD_CACHE_ASYNC,
+				     pf_cycles_end());
+		if (!page)
+			continue;
+
+		if (page_allocated) {
+			swap_readpage(page, false, &splug);
+			folio_set_readahead(page_folio(page));
+			count_vm_event(SWAP_RA);
+			hermit_account_prefetch_swapin();
+		}
+		put_page(page);
+	}
+	if (pte)
+		pte_unmap(pte);
+	blk_finish_plug(&plug);
+	swap_read_unplug(splug);
+	lru_add_drain();
+done:
+	adc_pf_breakdown_end(pf_breakdown, ADC_PREFETCH, pf_cycles_end());
+}
+#endif
 
 /**
  * swapin_readahead - swap in pages in hope we need them soon

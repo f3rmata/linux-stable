@@ -88,6 +88,30 @@ int hermit_backend_store(swp_entry_t entry, struct page *page, int cpu,
 }
 EXPORT_SYMBOL_GPL(hermit_backend_store);
 
+void hermit_backend_invalidate_page(swp_entry_t entry)
+{
+	const struct hermit_backend_ops *ops;
+
+	rcu_read_lock();
+	ops = rcu_dereference(hermit_backend_ops);
+	if (ops && ops->invalidate_page)
+		ops->invalidate_page(entry);
+	rcu_read_unlock();
+}
+EXPORT_SYMBOL_GPL(hermit_backend_invalidate_page);
+
+void hermit_backend_invalidate_area(unsigned int type)
+{
+	const struct hermit_backend_ops *ops;
+
+	rcu_read_lock();
+	ops = rcu_dereference(hermit_backend_ops);
+	if (ops && ops->invalidate_area)
+		ops->invalidate_area(type);
+	rcu_read_unlock();
+}
+EXPORT_SYMBOL_GPL(hermit_backend_invalidate_area);
+
 int hermit_backend_poll_load(int cpu)
 {
 	const struct hermit_backend_ops *ops;

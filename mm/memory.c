@@ -3830,7 +3830,8 @@ static inline void hermit_account_bypass_fallback(void)
 	adc_profile_counter_inc(ADC_OPTIM_FAILED);
 }
 
-static inline void hermit_direct_swap_readpage(struct page *page,
+static inline void hermit_direct_swap_readpage(struct vm_fault *vmf,
+					       struct page *page,
 					       swp_entry_t entry,
 					       bool hermit_bypass,
 					       int *read_cpu,
@@ -3847,6 +3848,7 @@ static inline void hermit_direct_swap_readpage(struct page *page,
 		if (cpu >= 0) {
 			set_adc_pf_bits(adc_pf_bits, ADC_PF_HERMIT_BIT);
 			*read_cpu = cpu;
+			hermit_direct_swapin_readahead(vmf, cpu);
 			if (!hmt_ctl_flag(HMT_LAZY_POLL)) {
 				hermit_poll_read(cpu, page, true, pf_breakdown);
 				*read_cpu = -1;
@@ -4090,7 +4092,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 
 #ifdef CONFIG_HERMIT
 				hermit_direct_swap_readpage(
-					page, entry, hermit_bypass,
+					vmf, page, entry, hermit_bypass,
 					&hermit_read_cpu, adc_pf_bits,
 					pf_breakdown);
 #else

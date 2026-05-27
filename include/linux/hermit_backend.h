@@ -8,6 +8,8 @@
 struct hermit_backend_ops {
 	int (*load)(swp_entry_t entry, struct page *page, int cpu, bool async);
 	int (*store)(swp_entry_t entry, struct page *page, int cpu, bool async);
+	void (*invalidate_page)(swp_entry_t entry);
+	void (*invalidate_area)(unsigned int type);
 	int (*poll_load)(int cpu);
 	int (*peek_load)(int cpu);
 	int (*poll_store)(int cpu);
@@ -23,6 +25,8 @@ int hermit_backend_load(swp_entry_t entry, struct page *page, int cpu,
 			bool async);
 int hermit_backend_store(swp_entry_t entry, struct page *page, int cpu,
 			 bool async);
+void hermit_backend_invalidate_page(swp_entry_t entry);
+void hermit_backend_invalidate_area(unsigned int type);
 int hermit_backend_poll_load(int cpu);
 int hermit_backend_peek_load(int cpu);
 int hermit_backend_poll_store(int cpu);

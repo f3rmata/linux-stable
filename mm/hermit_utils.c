@@ -7,6 +7,27 @@
 #include <linux/memcontrol.h>
 #include <linux/swap_stats.h>
 #include <linux/swap.h>
+#include <linux/init.h>
+
+static struct workqueue_struct *hermit_high_wq;
+
+static bool hermit_queue_high_work(struct hmt_work_struct *work)
+{
+	return queue_work(hermit_high_wq ?: system_unbound_wq, &work->work);
+}
+
+static int __init hermit_high_wq_init(void)
+{
+	hermit_high_wq = alloc_workqueue("hermit_high_reclaim",
+					 WQ_UNBOUND | WQ_MEM_RECLAIM |
+						 WQ_CPU_INTENSIVE,
+					 0);
+	if (!hermit_high_wq)
+		pr_warn("hermit: falling back to system_unbound_wq for high reclaim\n");
+
+	return 0;
+}
+subsys_initcall(hermit_high_wq_init);
 
 void hmt_async_reclaim(struct mm_struct *mm, struct mem_cgroup *memcg)
 {
@@ -37,7 +58,7 @@ void hmt_async_reclaim(struct mm_struct *mm, struct mem_cgroup *memcg)
 	atomic_set(&hmt_sc->sthd_cnt, next_sthd_cnt);
 	spin_unlock_irq(&hmt_sc->lock);
 	for (i = 0; i < next_sthd_cnt; i++)
-		schedule_work_on(hmt_sthd_cores[i], &memcg->sthds[i].work);
+		hermit_queue_high_work(&memcg->sthds[i]);
 }
 
 // copied from memcontrol.c
@@ -297,9 +318,8 @@ static void hermit_high_work_func(struct work_struct *work)
 		hermit_reclaim_high(cthd, hmt_sc, /* master = */ id == 0,
 				    MEMCG_CHARGE_BATCH, GFP_KERNEL);
 	}
-	if (id < hmt_get_sthd_cnt(memcg, hmt_sc)) {
-		schedule_work_on(hmt_sthd_cores[id], &memcg->sthds[id].work);
-	}
+	if (!READ_ONCE(hmt_sc->stop) && id < hmt_get_sthd_cnt(memcg, hmt_sc))
+		hermit_queue_high_work(&memcg->sthds[id]);
 	css_put(&memcg->css);
 	atomic_dec(&hmt_sc->active_sthd_cnt);
 	mmdrop(mm);
@@ -322,14 +342,14 @@ void hermit_init_memcg(struct mem_cgroup *memcg)
 
 void hermit_cleanup_memcg(struct mem_cgroup *memcg)
 {
+	int i;
+
 	if (!memcg)
 		return;
 
 	WRITE_ONCE(memcg->hmt_sc.stop, true);
+	for (i = 0; i < HMT_MAX_NR_STHDS; i++)
+		cancel_work_sync(&memcg->sthds[i].work);
 	while (atomic_read(&memcg->hmt_sc.active_sthd_cnt))
 		cond_resched();
-
-	// int i;
-	// for (i = 0; i < HMT_MAX_NR_STHDS; i++)
-	// 	cancel_work_sync(&memcg->sthds[i].work);
 }
