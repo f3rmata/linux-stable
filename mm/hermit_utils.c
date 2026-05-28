@@ -35,7 +35,7 @@ void hmt_async_reclaim(struct mm_struct *mm, struct mem_cgroup *memcg)
 	int next_sthd_cnt;
 	int i;
 	// BUG_ON(mm != current->mm);
-	if (!mm || mem_cgroup_is_root(memcg) ||
+	if (!hmt_ctl_flag(HMT_APT_RECLAIM) || !mm || mem_cgroup_is_root(memcg) ||
 	    !spin_trylock_irq(&memcg->hmt_sc.lock))
 		return;
 
@@ -255,12 +255,14 @@ static inline void accum_swout_dur(struct hmt_swap_ctrl *sc, uint64_t dur,
 						sc->swout_dur.total);
 }
 
-static unsigned long hermit_reclaim_high(struct task_struct *cthd,
+static unsigned long hermit_reclaim_high(struct mem_cgroup *memcg,
 					 struct hmt_swap_ctrl *sc, bool master,
 					 unsigned int nr_pages, gfp_t gfp_mask)
 {
 	unsigned long total_reclaimed = 0;
-	struct mem_cgroup *memcg = mem_cgroup_from_task(cthd);
+
+	if (!memcg || mem_cgroup_is_root(memcg))
+		return 0;
 
 	do {
 #ifdef ADC_PROFILE_PF_BREAKDOWN
@@ -275,7 +277,7 @@ static unsigned long hermit_reclaim_high(struct task_struct *cthd,
 		swout_dur = -pf_cycles_start();
 		// psi_memstall_enter(&pflags);
 		nr_reclaimed = hermit_try_to_free_mem_cgroup_pages(
-			memcg, nr_pages, gfp_mask, true, cthd, NULL,
+			memcg, nr_pages, gfp_mask, true, NULL, NULL,
 			pf_breakdown);
 		total_reclaimed += nr_reclaimed;
 		// psi_memstall_leave(&pflags);
@@ -298,31 +300,20 @@ static void hermit_high_work_func(struct work_struct *work)
 	struct mem_cgroup *memcg =
 		container_of(hmt_ws, struct mem_cgroup, sthds[id]);
 	struct hmt_swap_ctrl *hmt_sc = &memcg->hmt_sc;
-	struct mm_struct *mm = hmt_sc->mm;
-	struct task_struct *cthd = NULL;
 
 	if (READ_ONCE(hmt_sc->stop))
 		return;
-	if (!mm) {
-		pr_err("%s:%d\n", __func__, __LINE__);
-		return;
-	}
 
-	mmgrab(mm);
-	rcu_read_lock();
-	cthd = rcu_dereference(mm->owner);
-	rcu_read_unlock();
 	atomic_inc(&hmt_sc->active_sthd_cnt);
 	css_get(&memcg->css);
 	if (id < hmt_get_sthd_cnt(memcg, hmt_sc)) {
-		hermit_reclaim_high(cthd, hmt_sc, /* master = */ id == 0,
+		hermit_reclaim_high(memcg, hmt_sc, /* master = */ id == 0,
 				    MEMCG_CHARGE_BATCH, GFP_KERNEL);
 	}
 	if (!READ_ONCE(hmt_sc->stop) && id < hmt_get_sthd_cnt(memcg, hmt_sc))
 		hermit_queue_high_work(&memcg->sthds[id]);
 	css_put(&memcg->css);
 	atomic_dec(&hmt_sc->active_sthd_cnt);
-	mmdrop(mm);
 }
 
 void hermit_init_memcg(struct mem_cgroup *memcg)
