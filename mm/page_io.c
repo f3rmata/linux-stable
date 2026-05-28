@@ -244,21 +244,18 @@ static bool hermit_swap_writepage(struct page *page)
 		return false;
 
 	entry = page_swap_entry(page);
-	cpu = get_cpu();
+	cpu = raw_smp_processor_id();
 	pf_ts = pf_cycles_start();
 	adc_pf_breakdown_stt(pf_breakdown, ADC_WRITE_PAGE, pf_ts);
 	ret = hermit_backend_store(entry, page, cpu, false);
 	pf_end = pf_cycles_end();
 	adc_pf_breakdown_end(pf_breakdown, ADC_WRITE_PAGE, pf_end);
-	if (ret) {
-		put_cpu();
+	if (ret)
 		return false;
-	}
 
 	poll_ts = pf_cycles_start();
 	adc_pf_breakdown_stt(pf_breakdown, ADC_POLL_STORE, poll_ts);
 	ret = hermit_backend_poll_store(cpu);
-	put_cpu();
 	adc_pf_breakdown_end(pf_breakdown, ADC_POLL_STORE, pf_cycles_end());
 	if (ret)
 		return false;
@@ -293,11 +290,10 @@ static bool hermit_swap_readpage(struct page *page)
 		return false;
 
 	entry = page_swap_entry(page);
-	cpu = get_cpu();
+	cpu = raw_smp_processor_id();
 	pf_ts = pf_cycles_start();
 	adc_pf_breakdown_stt(pf_breakdown, ADC_READ_PAGE, pf_ts);
 	ret = hermit_backend_load(entry, page, cpu, false);
-	put_cpu();
 	pf_end = pf_cycles_end();
 	adc_pf_breakdown_end(pf_breakdown, ADC_READ_PAGE, pf_end);
 	if (ret)
@@ -667,12 +663,11 @@ inline int hermit_issue_read(struct page *page, swp_entry_t entry)
 	if (!folio_test_swapbacked(folio))
 		__folio_set_swapbacked(folio);
 
-	cpu = get_cpu();
+	cpu = raw_smp_processor_id();
 	folio->swap = entry;
 	pf_ts = pf_cycles_start();
 	adc_pf_breakdown_stt(pf_breakdown, ADC_READ_PAGE, pf_ts);
 	ret = hermit_backend_load(entry, page, cpu, true);
-	put_cpu();
 	pf_end = pf_cycles_end();
 	adc_pf_breakdown_end(pf_breakdown, ADC_READ_PAGE, pf_end);
 	folio->private = NULL;

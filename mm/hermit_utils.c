@@ -124,6 +124,9 @@ inline unsigned hmt_get_sthd_cnt(struct mem_cgroup *memcg,
 	uint64_t mem_limit = READ_ONCE(memcg->memory.max);
 	uint64_t nr_avail_pgs = mem_limit - page_counter_read(&memcg->memory);
 
+	if (!hmt_ctl_flag(HMT_APT_RECLAIM))
+		return 0;
+
 	// 0 for Hermit scheduling. 1 and 2 to simulate Fastswap's policy.
 	unsigned mode = hmt_ctl_vars[HMT_RECLAIM_MODE];
 	if (mode == 0 && sc->swin_thrghpt && sc->swout_thrghpt) {
@@ -301,16 +304,18 @@ static void hermit_high_work_func(struct work_struct *work)
 		container_of(hmt_ws, struct mem_cgroup, sthds[id]);
 	struct hmt_swap_ctrl *hmt_sc = &memcg->hmt_sc;
 
-	if (READ_ONCE(hmt_sc->stop))
+	if (READ_ONCE(hmt_sc->stop) || !hmt_ctl_flag(HMT_APT_RECLAIM))
 		return;
 
 	atomic_inc(&hmt_sc->active_sthd_cnt);
 	css_get(&memcg->css);
-	if (id < hmt_get_sthd_cnt(memcg, hmt_sc)) {
+	if (!READ_ONCE(hmt_sc->stop) && hmt_ctl_flag(HMT_APT_RECLAIM) &&
+	    id < hmt_get_sthd_cnt(memcg, hmt_sc)) {
 		hermit_reclaim_high(memcg, hmt_sc, /* master = */ id == 0,
 				    MEMCG_CHARGE_BATCH, GFP_KERNEL);
 	}
-	if (!READ_ONCE(hmt_sc->stop) && id < hmt_get_sthd_cnt(memcg, hmt_sc))
+	if (!READ_ONCE(hmt_sc->stop) && hmt_ctl_flag(HMT_APT_RECLAIM) &&
+	    id < hmt_get_sthd_cnt(memcg, hmt_sc))
 		hermit_queue_high_work(&memcg->sthds[id]);
 	css_put(&memcg->css);
 	atomic_dec(&hmt_sc->active_sthd_cnt);
