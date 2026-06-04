@@ -7,6 +7,7 @@
 
 #include <linux/rmap.h>
 #include <linux/hermit_types.h>
+#include <linux/atomic.h>
 
 /*
  * global variables for profile and control
@@ -22,6 +23,7 @@ enum hmt_ctl_flag_type {
 	HMT_SPEC_LOCK,
 	HMT_LAZY_POLL,
 	HMT_APT_RECLAIM,
+	HMT_EXCLUSIVE_SWAPOUT,
 	NUM_HMT_CTL_FLAGS
 };
 
@@ -35,6 +37,24 @@ extern bool hmt_ctl_flags[NUM_HMT_CTL_FLAGS];
 extern unsigned hmt_ctl_vars[NUM_HMT_CTL_VARS];
 
 extern uint32_t hmt_sthd_cores[];
+
+enum hmt_swapout_stat_type {
+	HMT_SWAPOUT_BACKEND_STORES,
+	HMT_SWAPOUT_BACKEND_STORE_ERRORS,
+	HMT_SWAPOUT_BACKEND_POLL_ERRORS,
+	HMT_SWAPOUT_NATIVE_FALLBACKS,
+	HMT_SWAPOUT_EXCLUSIVE_COMPLETIONS,
+	HMT_SWAPOUT_WRITETHROUGH_COMPLETIONS,
+	HMT_SWAPOUT_LARGE_FOLIO_FALLBACKS,
+	NUM_HMT_SWAPOUT_STATS
+};
+
+extern atomic_t hmt_swapout_stats[NUM_HMT_SWAPOUT_STATS];
+
+static inline void hmt_swapout_stat_inc(enum hmt_swapout_stat_type type)
+{
+	atomic_inc(&hmt_swapout_stats[type]);
+}
 
 static inline bool hmt_ctl_flag(enum hmt_ctl_flag_type type)
 {

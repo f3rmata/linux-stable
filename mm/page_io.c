@@ -28,6 +28,7 @@
 #include "swap.h"
 
 #ifdef CONFIG_HERMIT
+#include <linux/hermit.h>
 #include <linux/hermit_profile.h>
 #include <linux/swap_stats.h>
 #include <linux/hermit_backend.h>
@@ -240,8 +241,11 @@ static bool hermit_swap_writepage(struct page *page)
 	 * Keep the first DRAM backend bring-up conservative.  The backend API is
 	 * page-sized, while native swap can submit a whole large folio.
 	 */
-	if (folio_nr_pages(folio) != 1)
+	if (folio_nr_pages(folio) != 1) {
+		hmt_swapout_stat_inc(HMT_SWAPOUT_LARGE_FOLIO_FALLBACKS);
+		hmt_swapout_stat_inc(HMT_SWAPOUT_NATIVE_FALLBACKS);
 		return false;
+	}
 
 	entry = page_swap_entry(page);
 	cpu = raw_smp_processor_id();
@@ -250,15 +254,22 @@ static bool hermit_swap_writepage(struct page *page)
 	ret = hermit_backend_store(entry, page, cpu, false);
 	pf_end = pf_cycles_end();
 	adc_pf_breakdown_end(pf_breakdown, ADC_WRITE_PAGE, pf_end);
-	if (ret)
+	if (ret) {
+		hmt_swapout_stat_inc(HMT_SWAPOUT_BACKEND_STORE_ERRORS);
+		hmt_swapout_stat_inc(HMT_SWAPOUT_NATIVE_FALLBACKS);
 		return false;
+	}
+	hmt_swapout_stat_inc(HMT_SWAPOUT_BACKEND_STORES);
 
 	poll_ts = pf_cycles_start();
 	adc_pf_breakdown_stt(pf_breakdown, ADC_POLL_STORE, poll_ts);
 	ret = hermit_backend_poll_store(cpu);
 	adc_pf_breakdown_end(pf_breakdown, ADC_POLL_STORE, pf_cycles_end());
-	if (ret)
+	if (ret) {
+		hmt_swapout_stat_inc(HMT_SWAPOUT_BACKEND_POLL_ERRORS);
+		hmt_swapout_stat_inc(HMT_SWAPOUT_NATIVE_FALLBACKS);
 		return false;
+	}
 
 	// count_swpout_vm_event(folio);
 	adc_profile_counter_inc(ADC_SWAPOUT);
@@ -269,10 +280,17 @@ static bool hermit_swap_writepage(struct page *page)
 		set_adc_pf_bits(&ctx->adc_pf_bits, ADC_PF_SWAPOUT_BIT);
 		set_adc_pf_bits(&ctx->adc_pf_bits, ADC_PF_HERMIT_BIT);
 	}
-	// folio_start_writeback(folio);
-	// folio_unlock(folio);
-	// folio_end_writeback(folio);
-	return false;
+
+	if (!hmt_ctl_flag(HMT_EXCLUSIVE_SWAPOUT)) {
+		hmt_swapout_stat_inc(HMT_SWAPOUT_WRITETHROUGH_COMPLETIONS);
+		return false;
+	}
+
+	folio_start_writeback(folio);
+	folio_unlock(folio);
+	folio_end_writeback(folio);
+	hmt_swapout_stat_inc(HMT_SWAPOUT_EXCLUSIVE_COMPLETIONS);
+	return true;
 }
 
 static bool hermit_swap_readpage(struct page *page)

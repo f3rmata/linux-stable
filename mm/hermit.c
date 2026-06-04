@@ -27,13 +27,26 @@ const char *hmt_ctl_flag_names[NUM_HMT_CTL_FLAGS] = {
 	"bypass_swapcache", "batch_swapout",	"batch_tlb",
 	"batch_io",	    "batch_account",	"vaddr_swapout",
 	"speculative_io",   "speculative_lock", "lazy_poll",
-	"apt_reclaim",
+	"apt_reclaim",	    "exclusive_swapout",
 };
 
 unsigned hmt_ctl_vars[NUM_HMT_CTL_VARS];
 const char *hmt_ctl_var_names[NUM_HMT_CTL_VARS] = {
 	"sthd_cnt",
 	"reclaim_mode",
+};
+
+atomic_t hmt_swapout_stats[NUM_HMT_SWAPOUT_STATS];
+EXPORT_SYMBOL(hmt_swapout_stats);
+
+static const char * const hmt_swapout_stat_names[NUM_HMT_SWAPOUT_STATS] = {
+	"swapout_backend_stores",
+	"swapout_backend_store_errors",
+	"swapout_backend_poll_errors",
+	"swapout_native_fallbacks",
+	"swapout_exclusive_completions",
+	"swapout_writethrough_completions",
+	"swapout_large_folio_fallbacks",
 };
 
 // profile swap-in faults
@@ -99,6 +112,10 @@ static inline void hermit_debugfs_init(void)
 	for (i = 0; i < NUM_HMT_CTL_VARS; i++)
 		debugfs_create_u32(hmt_ctl_var_names[i], 0666, root,
 				   &hmt_ctl_vars[i]);
+
+	for (i = 0; i < NUM_HMT_SWAPOUT_STATS; i++)
+		debugfs_create_atomic_t(hmt_swapout_stat_names[i], 0666, root,
+					&hmt_swapout_stats[i]);
 }
 
 static int __init hermit_init(void)
@@ -106,6 +123,8 @@ static int __init hermit_init(void)
 	int i;
 	for (i = 0; i < NUM_HMT_CTL_FLAGS; i++)
 		hmt_ctl_flags[i] = false;
+	for (i = 0; i < NUM_HMT_SWAPOUT_STATS; i++)
+		atomic_set(&hmt_swapout_stats[i], 0);
 
 	hmt_ctl_vars[HMT_STHD_CNT] = 16;
 	hmt_ctl_vars[HMT_RECLAIM_MODE] = 0;
