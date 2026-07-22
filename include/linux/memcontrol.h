@@ -23,6 +23,9 @@
 #include <linux/writeback.h>
 #include <linux/page-flags.h>
 #include <linux/shrinker.h>
+#ifdef CONFIG_HERMIT
+#include <linux/hermit.h>
+#endif
 
 struct mem_cgroup;
 struct obj_cgroup;
@@ -207,6 +210,9 @@ struct mem_cgroup {
 
 	/* Range enforcement for interrupt charges */
 	struct work_struct high_work;
+#ifdef CONFIG_HERMIT
+	struct hmt_reclaim_work hermit_reclaim_work[HMT_MAX_NR_STHDS];
+#endif
 
 #ifdef CONFIG_ZSWAP
 	unsigned long zswap_max;

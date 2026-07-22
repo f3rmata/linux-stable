@@ -2015,6 +2015,9 @@ __latent_entropy struct task_struct *copy_process(
 	p = dup_task_struct(current, node);
 	if (!p)
 		goto fork_out;
+#ifdef CONFIG_HERMIT
+	p->hermit_pf_ctx = NULL;
+#endif
 	p->flags &= ~PF_KTHREAD;
 	if (args->kthread)
 		p->flags |= PF_KTHREAD;

@@ -193,6 +193,11 @@ static inline void swap_read_unplug(struct swap_iocb *plug)
 	if (unlikely(plug))
 		__swap_read_unplug(plug);
 }
+#ifdef CONFIG_HERMIT
+int hermit_swap_read_folio_async(struct folio *folio, int *cpu,
+				 u64 *start_ns);
+int hermit_swap_read_folio_poll(struct folio *folio, int cpu, u64 start_ns);
+#endif
 void swap_write_unplug(struct swap_iocb *sio);
 int swap_writeout(struct folio *folio, struct swap_iocb **swap_plug);
 void __swap_writepage(struct folio *folio, struct swap_iocb **swap_plug);

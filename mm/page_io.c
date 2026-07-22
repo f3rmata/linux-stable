@@ -24,6 +24,12 @@
 #include <linux/uio.h>
 #include <linux/sched/task.h>
 #include <linux/delayacct.h>
+#ifdef CONFIG_HERMIT
+#include <linux/hermit.h>
+#include <linux/hermit_backend.h>
+#include <linux/hermit_stats.h>
+#include <linux/ktime.h>
+#endif
 #include <linux/zswap.h>
 #include "swap.h"
 
@@ -254,6 +260,17 @@ int swap_writeout(struct folio *folio, struct swap_iocb **swap_plug)
 		goto out_unlock;
 	}
 
+#ifdef CONFIG_HERMIT
+	/* This writeout starts a new authoritative generation for every slot. */
+	{
+		unsigned int i;
+
+		for (i = 0; i < folio_nr_pages(folio); i++)
+			hermit_backend_invalidate(
+				page_swap_entry(folio_page(folio, i)));
+	}
+#endif
+
 	/*
 	 * Use a bitmap (zeromap) to avoid doing IO for zero-filled pages.
 	 * The bits in zeromap are protected by the locked swapcache folio
@@ -300,6 +317,117 @@ static inline void count_swpout_vm_event(struct folio *folio)
 	count_memcg_folio_events(folio, PSWPOUT, folio_nr_pages(folio));
 	count_vm_events(PSWPOUT, folio_nr_pages(folio));
 }
+
+#ifdef CONFIG_HERMIT
+static bool hermit_swap_write_folio(struct folio *folio)
+{
+	u64 start_ns;
+	u64 duration_ns;
+	int cpu, ret;
+
+	if (!hermit_backend_ready() || folio_order(folio) != 0)
+		return false;
+
+	cpu = get_cpu();
+	start_ns = ktime_get_mono_fast_ns();
+	ret = hermit_backend_store(folio->swap, &folio->page, cpu, false);
+	put_cpu();
+	if (ret) {
+		hermit_stat_inc(HMT_STAT_BACKEND_ERROR);
+		return false;
+	}
+	ret = hermit_backend_mark_remote(folio->swap);
+	if (ret) {
+		hermit_stat_inc(HMT_STAT_BACKEND_ERROR);
+		return false;
+	}
+
+	duration_ns = ktime_get_mono_fast_ns() - start_ns;
+	hermit_latency_add(HMT_LAT_BACKEND_WRITE, duration_ns);
+	hermit_latency_add(HMT_LAT_SWAPOUT, duration_ns);
+	hermit_stat_inc(HMT_STAT_BACKEND_STORE);
+	hermit_stat_inc(HMT_STAT_SWAPOUT);
+	count_swpout_vm_event(folio);
+	folio_start_writeback(folio);
+	folio_unlock(folio);
+	folio_end_writeback(folio);
+	return true;
+}
+
+static void hermit_swap_read_complete(struct folio *folio, u64 start_ns,
+				      int ret)
+{
+	if (ret) {
+		hermit_stat_inc(HMT_STAT_BACKEND_ERROR);
+		folio_unlock(folio);
+		return;
+	}
+
+	hermit_latency_add(HMT_LAT_BACKEND_READ,
+			   ktime_get_mono_fast_ns() - start_ns);
+	hermit_stat_inc(HMT_STAT_BACKEND_LOAD);
+	count_mthp_stat(0, MTHP_STAT_SWPIN);
+	count_memcg_folio_events(folio, PSWPIN, 1);
+	count_vm_event(PSWPIN);
+	if (!folio_test_uptodate(folio))
+		folio_mark_uptodate(folio);
+	folio_unlock(folio);
+}
+
+static bool hermit_swap_read_folio(struct folio *folio)
+{
+	u64 start_ns;
+	int cpu, ret;
+
+	if (folio_order(folio) != 0 ||
+	    !hermit_backend_entry_remote(folio->swap))
+		return false;
+	if (!hermit_backend_ready()) {
+		hermit_swap_read_complete(folio, ktime_get_mono_fast_ns(), -ENODEV);
+		return true;
+	}
+
+	cpu = get_cpu();
+	start_ns = ktime_get_mono_fast_ns();
+	ret = hermit_backend_load(folio->swap, &folio->page, cpu, false);
+	put_cpu();
+	hermit_swap_read_complete(folio, start_ns, ret);
+	return true;
+}
+
+int hermit_swap_read_folio_async(struct folio *folio, int *cpu, u64 *start_ns)
+{
+	int ret;
+
+	if (folio_order(folio) != 0 ||
+	    !hermit_backend_entry_remote(folio->swap))
+		return -ENOENT;
+	if (!hermit_backend_ready())
+		return -ENODEV;
+
+	*cpu = get_cpu();
+	*start_ns = ktime_get_mono_fast_ns();
+	ret = hermit_backend_load(folio->swap, &folio->page, *cpu, true);
+	put_cpu();
+	return ret;
+}
+
+int hermit_swap_read_folio_poll(struct folio *folio, int cpu, u64 start_ns)
+{
+	u64 poll_start = ktime_get_mono_fast_ns();
+	int ret;
+
+	if (hmt_ctl_flag(HMT_LAZY_POLL)) {
+		while (hermit_backend_peek_load(cpu) > 0)
+			cpu_relax();
+	}
+	ret = hermit_backend_poll_load(cpu);
+	hermit_latency_add(HMT_LAT_POLL_LOAD,
+			   ktime_get_mono_fast_ns() - poll_start);
+	hermit_swap_read_complete(folio, start_ns, ret);
+	return ret;
+}
+#endif
 
 #if defined(CONFIG_MEMCG) && defined(CONFIG_BLK_CGROUP)
 static void bio_associate_blkg_from_page(struct bio *bio, struct folio *folio)
@@ -449,6 +577,10 @@ void __swap_writepage(struct folio *folio, struct swap_iocb **swap_plug)
 	struct swap_info_struct *sis = __swap_entry_to_info(folio->swap);
 
 	VM_BUG_ON_FOLIO(!folio_test_swapcache(folio), folio);
+#ifdef CONFIG_HERMIT
+	if (hermit_swap_write_folio(folio))
+		return;
+#endif
 	/*
 	 * ->flags can be updated non-atomicially (scan_swap_map_slots),
 	 * but that will never affect SWP_FS_OPS, so the data_race
@@ -636,6 +768,11 @@ void swap_read_folio(struct folio *folio, struct swap_iocb **plug)
 
 	if (zswap_load(folio) != -ENOENT)
 		goto finish;
+
+#ifdef CONFIG_HERMIT
+	if (hermit_swap_read_folio(folio))
+		goto finish;
+#endif
 
 	/* We have to read from slower devices. Increase zswap protection. */
 	zswap_folio_swapin(folio);

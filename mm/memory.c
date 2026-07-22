@@ -69,6 +69,11 @@
 #include <linux/memory-tiers.h>
 #include <linux/debugfs.h>
 #include <linux/userfaultfd_k.h>
+#ifdef CONFIG_HERMIT
+#include <linux/hermit.h>
+#include <linux/hermit_backend.h>
+#include <linux/hermit_stats.h>
+#endif
 #include <linux/dax.h>
 #include <linux/oom.h>
 #include <linux/numa.h>
@@ -4471,6 +4476,19 @@ static bool can_swapin_thp(struct vm_fault *vmf, pte_t *ptep, int nr_pages)
 	if (unlikely(non_swapcache_batch(entry, nr_pages) != nr_pages))
 		return false;
 
+#ifdef CONFIG_HERMIT
+	/* Hermit stores base pages; never combine remote entries into a THP. */
+	{
+		int i;
+
+		for (i = 0; i < nr_pages; i++)
+			if (hermit_backend_entry_remote(
+					 swp_entry(swp_type(entry),
+						   swp_offset(entry) + i)))
+				return false;
+	}
+#endif
+
 	return true;
 }
 
@@ -4611,6 +4629,14 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	unsigned long page_idx;
 	unsigned long address;
 	pte_t *ptep;
+#ifdef CONFIG_HERMIT
+	int hermit_read_cpu = -1;
+	u64 hermit_read_start_ns = 0;
+	u64 hermit_fault_start_ns = ktime_get_mono_fast_ns();
+	bool hermit_read_failed = false;
+	bool hermit_swap_fault = false;
+	bool hermit_major_fault = false;
+#endif
 
 	if (!pte_unmap_same(vmf))
 		goto out;
@@ -4674,6 +4700,9 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	si = get_swap_device(entry);
 	if (unlikely(!si))
 		goto out;
+#ifdef CONFIG_HERMIT
+	hermit_swap_fault = true;
+#endif
 
 	folio = swap_cache_get_folio(entry);
 	if (folio)
@@ -4681,10 +4710,28 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	swapcache = folio;
 
 	if (!folio) {
-		if (data_race(si->flags & SWP_SYNCHRONOUS_IO) &&
+		bool synchronous_direct =
+			data_race(si->flags & SWP_SYNCHRONOUS_IO);
+#ifdef CONFIG_HERMIT
+		bool hermit_direct = hmt_ctl_flag(HMT_BPS_SCACHE) &&
+			hermit_backend_ready() &&
+			hermit_backend_entry_remote(entry);
+#endif
+
+		if ((synchronous_direct
+#ifdef CONFIG_HERMIT
+		     || hermit_direct
+#endif
+		    ) &&
 		    __swap_count(entry) == 1) {
 			/* skip swapcache */
+#ifdef CONFIG_HERMIT
+			/* Hermit backends currently transfer one base page. */
+			folio = hermit_direct ? __alloc_swap_folio(vmf) :
+				alloc_swap_folio(vmf);
+#else
 			folio = alloc_swap_folio(vmf);
+#endif
 			if (folio) {
 				__folio_set_locked(folio);
 				__folio_set_swapbacked(folio);
@@ -4712,6 +4759,23 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 				}
 				need_clear_cache = true;
 
+				/* Start remote I/O before swap-in metadata work. */
+				folio->swap = entry;
+#ifdef CONFIG_HERMIT
+				if (hermit_direct && hmt_ctl_flag(HMT_SPEC_IO)) {
+					int err;
+
+					err = hermit_swap_read_folio_async(
+						folio, &hermit_read_cpu,
+						&hermit_read_start_ns);
+					if (err) {
+						hermit_stat_inc(HMT_STAT_BACKEND_ERROR);
+						folio_unlock(folio);
+						hermit_read_cpu = -1;
+						hermit_read_failed = true;
+					}
+				}
+#endif
 				memcg1_swapin(entry, nr_pages);
 
 				shadow = swap_cache_get_shadow(entry);
@@ -4720,9 +4784,10 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 
 				folio_add_lru(folio);
 
-				/* To provide entry to swap_read_folio() */
-				folio->swap = entry;
-				swap_read_folio(folio, NULL);
+#ifdef CONFIG_HERMIT
+				if (hermit_read_cpu < 0 && !hermit_read_failed)
+#endif
+					swap_read_folio(folio, NULL);
 				folio->private = NULL;
 			}
 		} else {
@@ -4745,11 +4810,22 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 		}
 
 		/* Had to read the page from swap area: Major fault */
-		ret = VM_FAULT_MAJOR;
+			ret = VM_FAULT_MAJOR;
+		#ifdef CONFIG_HERMIT
+			hermit_major_fault = true;
+			hermit_stat_inc(HMT_STAT_ONDEMAND_SWAPIN);
+	#endif
 		count_vm_event(PGMAJFAULT);
 		count_memcg_event_mm(vma->vm_mm, PGMAJFAULT);
 	}
 
+#ifdef CONFIG_HERMIT
+	if (hermit_read_cpu >= 0) {
+		hermit_swap_read_folio_poll(folio, hermit_read_cpu,
+					    hermit_read_start_ns);
+		hermit_read_cpu = -1;
+	}
+#endif
 	ret |= folio_lock_or_retry(folio, vmf);
 	if (ret & VM_FAULT_RETRY)
 		goto out_release;
@@ -5022,6 +5098,13 @@ out:
 	}
 	if (si)
 		put_swap_device(si);
+#ifdef CONFIG_HERMIT
+	hermit_latency_add(hermit_swap_fault ?
+			   (hermit_major_fault ? HMT_LAT_SWAP_MAJOR :
+						 HMT_LAT_SWAP_MINOR) :
+			   HMT_LAT_NON_SWAP,
+			   ktime_get_mono_fast_ns() - hermit_fault_start_ns);
+#endif
 	return ret;
 out_nomap:
 	if (vmf->pte)
@@ -5041,6 +5124,13 @@ out_release:
 	}
 	if (si)
 		put_swap_device(si);
+#ifdef CONFIG_HERMIT
+	hermit_latency_add(hermit_swap_fault ?
+			   (hermit_major_fault ? HMT_LAT_SWAP_MAJOR :
+						 HMT_LAT_SWAP_MINOR) :
+			   HMT_LAT_NON_SWAP,
+			   ktime_get_mono_fast_ns() - hermit_fault_start_ns);
+#endif
 	return ret;
 }
 

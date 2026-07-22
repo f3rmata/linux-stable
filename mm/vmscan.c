@@ -58,6 +58,9 @@
 #include <linux/random.h>
 #include <linux/mmu_notifier.h>
 #include <linux/parser.h>
+#ifdef CONFIG_HERMIT
+#include <linux/hermit_stats.h>
+#endif
 
 #include <asm/tlbflush.h>
 #include <asm/div64.h>
@@ -1652,6 +1655,9 @@ keep:
 
 	if (plug)
 		swap_write_unplug(plug);
+#ifdef CONFIG_HERMIT
+	hermit_stat_add(HMT_STAT_RECLAIM, nr_reclaimed);
+#endif
 	return nr_reclaimed;
 }
 

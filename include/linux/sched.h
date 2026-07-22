@@ -76,6 +76,7 @@ struct pipe_inode_info;
 struct rcu_node;
 struct reclaim_state;
 struct robust_list_head;
+struct hermit_pf_profile_ctx;
 struct root_domain;
 struct rq;
 struct sched_attr;
@@ -841,6 +842,10 @@ struct task_struct {
 	/* Per task flags (PF_*), defined further below: */
 	unsigned int			flags;
 	unsigned int			ptrace;
+
+#ifdef CONFIG_HERMIT
+	struct hermit_pf_profile_ctx	*hermit_pf_ctx;
+#endif
 
 #ifdef CONFIG_MEM_ALLOC_PROFILING
 	struct alloc_tag		*alloc_tag;

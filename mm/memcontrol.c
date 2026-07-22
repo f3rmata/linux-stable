@@ -77,6 +77,11 @@
 
 #include <trace/events/vmscan.h>
 
+#ifdef CONFIG_HERMIT
+#include <linux/hermit.h>
+#include <linux/hermit_stats.h>
+#endif
+
 struct cgroup_subsys memory_cgrp_subsys __read_mostly;
 EXPORT_SYMBOL(memory_cgrp_subsys);
 
@@ -1326,6 +1331,56 @@ static unsigned long mem_cgroup_margin(struct mem_cgroup *memcg)
 	return margin;
 }
 
+#ifdef CONFIG_HERMIT
+#define HMT_RECLAIM_HEADROOM_PAGES 2048UL
+
+static void hermit_reclaim_workfn(struct work_struct *work)
+{
+	struct hmt_reclaim_work *hwork =
+		container_of(work, struct hmt_reclaim_work, work);
+	struct mem_cgroup *memcg = hwork->memcg;
+	unsigned int attempts = 0;
+
+	while (hmt_ctl_flag(HMT_APT_RECLAIM) &&
+	       mem_cgroup_margin(memcg) < HMT_RECLAIM_HEADROOM_PAGES &&
+	       attempts++ < MAX_RECLAIM_RETRIES) {
+		unsigned long margin = mem_cgroup_margin(memcg);
+		unsigned long nr_to_reclaim;
+		unsigned long nr_reclaimed;
+
+		nr_to_reclaim = max(HMT_RECLAIM_HEADROOM_PAGES - margin,
+				    (unsigned long)MEMCG_CHARGE_BATCH);
+		nr_reclaimed = try_to_free_mem_cgroup_pages(
+			memcg, nr_to_reclaim, GFP_KERNEL,
+			MEMCG_RECLAIM_MAY_SWAP, NULL);
+		if (!nr_reclaimed)
+			break;
+	}
+}
+
+static void hermit_schedule_reclaim(struct mem_cgroup *memcg)
+{
+	unsigned long max = READ_ONCE(memcg->memory.max);
+	u32 nr_workers, i;
+
+	if (!hmt_ctl_flag(HMT_APT_RECLAIM) || mem_cgroup_is_root(memcg) ||
+	    max == PAGE_COUNTER_MAX ||
+	    mem_cgroup_margin(memcg) >= HMT_RECLAIM_HEADROOM_PAGES)
+		return;
+
+	nr_workers = 1;
+	if (hmt_ctl_var(HMT_RECLAIM_MODE) == 1)
+		nr_workers = clamp_t(u32, hmt_ctl_var(HMT_STHD_CNT), 1,
+				     HMT_MAX_NR_STHDS);
+	for (i = 0; i < nr_workers; i++)
+		schedule_work(&memcg->hermit_reclaim_work[i].work);
+}
+#else
+static inline void hermit_schedule_reclaim(struct mem_cgroup *memcg)
+{
+}
+#endif
+
 struct memory_stat {
 	const char *name;
 	unsigned int idx;
@@ -2298,8 +2353,9 @@ out:
 }
 
 static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
-			    unsigned int nr_pages)
+				    unsigned int nr_pages)
 {
+	struct mem_cgroup *charged_memcg = memcg;
 	unsigned int batch = max(MEMCG_CHARGE_BATCH, nr_pages);
 	int nr_retries = MAX_RECLAIM_RETRIES;
 	struct mem_cgroup *mem_over_limit;
@@ -2313,8 +2369,10 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
 	bool allow_spinning = gfpflags_allow_spinning(gfp_mask);
 
 retry:
-	if (consume_stock(memcg, nr_pages))
+	if (consume_stock(memcg, nr_pages)) {
+		hermit_schedule_reclaim(charged_memcg);
 		return 0;
+	}
 
 	if (!allow_spinning)
 		/* Avoid the refill and flush of the older stock */
@@ -2430,6 +2488,7 @@ force:
 	if (do_memsw_account())
 		page_counter_charge(&memcg->memsw, nr_pages);
 
+	hermit_schedule_reclaim(charged_memcg);
 	return 0;
 
 done_restock:
@@ -2489,6 +2548,7 @@ done_restock:
 	    !(current->flags & PF_MEMALLOC) &&
 	    gfpflags_allow_blocking(gfp_mask))
 		__mem_cgroup_handle_over_high(gfp_mask);
+	hermit_schedule_reclaim(charged_memcg);
 	return 0;
 }
 
@@ -3752,6 +3812,13 @@ static struct mem_cgroup *mem_cgroup_alloc(struct mem_cgroup *parent)
 		goto fail;
 
 	INIT_WORK(&memcg->high_work, high_work_func);
+#ifdef CONFIG_HERMIT
+	for (i = 0; i < HMT_MAX_NR_STHDS; i++) {
+		INIT_WORK(&memcg->hermit_reclaim_work[i].work,
+			  hermit_reclaim_workfn);
+		memcg->hermit_reclaim_work[i].memcg = memcg;
+	}
+#endif
 	vmpressure_init(&memcg->vmpressure);
 	INIT_LIST_HEAD(&memcg->memory_peaks);
 	INIT_LIST_HEAD(&memcg->swap_peaks);
@@ -3927,6 +3994,10 @@ static void mem_cgroup_css_free(struct cgroup_subsys_state *css)
 		static_branch_dec(&memcg_bpf_enabled_key);
 
 	vmpressure_cleanup(&memcg->vmpressure);
+#ifdef CONFIG_HERMIT
+	for (i = 0; i < HMT_MAX_NR_STHDS; i++)
+		cancel_work_sync(&memcg->hermit_reclaim_work[i].work);
+#endif
 	cancel_work_sync(&memcg->high_work);
 	memcg1_remove_from_trees(memcg);
 	free_shrinker_info(memcg);

@@ -42,6 +42,9 @@
 #include <linux/suspend.h>
 #include <linux/zswap.h>
 #include <linux/plist.h>
+#ifdef CONFIG_HERMIT
+#include <linux/hermit_backend.h>
+#endif
 
 #include <asm/tlbflush.h>
 #include <linux/swapops.h>
@@ -1267,6 +1270,9 @@ static void swap_range_free(struct swap_info_struct *si, unsigned long offset,
 	for (i = 0; i < nr_entries; i++) {
 		clear_bit(offset + i, si->zeromap);
 		zswap_invalidate(swp_entry(si->type, offset + i));
+#ifdef CONFIG_HERMIT
+		hermit_backend_invalidate(swp_entry(si->type, offset + i));
+#endif
 	}
 
 	if (si->flags & SWP_BLKDEV)
