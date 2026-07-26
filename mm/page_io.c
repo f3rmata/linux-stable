@@ -321,32 +321,46 @@ static inline void count_swpout_vm_event(struct folio *folio)
 #ifdef CONFIG_HERMIT
 static bool hermit_swap_write_folio(struct folio *folio)
 {
+	struct hermit_io io = {
+		.entry = folio->swap,
+		.folio = folio,
+		.folio_order = folio_order(folio),
+	};
 	u64 start_ns;
 	u64 duration_ns;
 	int cpu, ret;
 
-	if (!hermit_backend_ready() || folio_order(folio) != 0)
+	if (!hermit_backend_ready() || folio_order(folio) > PMD_ORDER)
+		return false;
+	ret = hermit_backend_prepare_remote(folio->swap, folio_order(folio));
+	if (ret)
 		return false;
 
 	cpu = get_cpu();
+	io.cpu = cpu;
+	io.transfer_order = hermit_backend_transfer_order(io.folio_order);
 	start_ns = ktime_get_mono_fast_ns();
-	ret = hermit_backend_store(folio->swap, &folio->page, cpu, false);
+	ret = hermit_backend_store(&io);
 	put_cpu();
 	if (ret) {
+		hermit_backend_abort_remote(folio->swap, folio_order(folio));
+		hermit_backend_account(io.folio_order, true, io.fallback, ret);
 		hermit_stat_inc(HMT_STAT_BACKEND_ERROR);
 		return false;
 	}
-	ret = hermit_backend_mark_remote(folio->swap);
+	ret = hermit_backend_commit_remote(folio->swap, folio_order(folio));
 	if (ret) {
+		hermit_backend_account(io.folio_order, true, io.fallback, ret);
 		hermit_stat_inc(HMT_STAT_BACKEND_ERROR);
 		return false;
 	}
 
 	duration_ns = ktime_get_mono_fast_ns() - start_ns;
+	hermit_backend_account(io.folio_order, true, io.fallback, 0);
 	hermit_latency_add(HMT_LAT_BACKEND_WRITE, duration_ns);
 	hermit_latency_add(HMT_LAT_SWAPOUT, duration_ns);
-	hermit_stat_inc(HMT_STAT_BACKEND_STORE);
-	hermit_stat_inc(HMT_STAT_SWAPOUT);
+	hermit_stat_add(HMT_STAT_BACKEND_STORE, folio_nr_pages(folio));
+	hermit_stat_add(HMT_STAT_SWAPOUT, folio_nr_pages(folio));
 	count_swpout_vm_event(folio);
 	folio_start_writeback(folio);
 	folio_unlock(folio);
@@ -365,10 +379,10 @@ static void hermit_swap_read_complete(struct folio *folio, u64 start_ns,
 
 	hermit_latency_add(HMT_LAT_BACKEND_READ,
 			   ktime_get_mono_fast_ns() - start_ns);
-	hermit_stat_inc(HMT_STAT_BACKEND_LOAD);
-	count_mthp_stat(0, MTHP_STAT_SWPIN);
-	count_memcg_folio_events(folio, PSWPIN, 1);
-	count_vm_event(PSWPIN);
+	hermit_stat_add(HMT_STAT_BACKEND_LOAD, folio_nr_pages(folio));
+	count_mthp_stat(folio_order(folio), MTHP_STAT_SWPIN);
+	count_memcg_folio_events(folio, PSWPIN, folio_nr_pages(folio));
+	count_vm_events(PSWPIN, folio_nr_pages(folio));
 	if (!folio_test_uptodate(folio))
 		folio_mark_uptodate(folio);
 	folio_unlock(folio);
@@ -376,11 +390,15 @@ static void hermit_swap_read_complete(struct folio *folio, u64 start_ns,
 
 static bool hermit_swap_read_folio(struct folio *folio)
 {
+	struct hermit_io io = {
+		.entry = folio->swap,
+		.folio = folio,
+		.folio_order = folio_order(folio),
+	};
 	u64 start_ns;
 	int cpu, ret;
 
-	if (folio_order(folio) != 0 ||
-	    !hermit_backend_entry_remote(folio->swap))
+	if (!hermit_backend_range_remote(folio->swap, folio_order(folio)))
 		return false;
 	if (!hermit_backend_ready()) {
 		hermit_swap_read_complete(folio, ktime_get_mono_fast_ns(), -ENODEV);
@@ -388,40 +406,53 @@ static bool hermit_swap_read_folio(struct folio *folio)
 	}
 
 	cpu = get_cpu();
+	io.cpu = cpu;
+	io.transfer_order = hermit_backend_transfer_order(io.folio_order);
 	start_ns = ktime_get_mono_fast_ns();
-	ret = hermit_backend_load(folio->swap, &folio->page, cpu, false);
+	ret = hermit_backend_load(&io, false);
 	put_cpu();
+	hermit_backend_account(io.folio_order, false, io.fallback, ret);
 	hermit_swap_read_complete(folio, start_ns, ret);
 	return true;
 }
 
-int hermit_swap_read_folio_async(struct folio *folio, int *cpu, u64 *start_ns)
+int hermit_swap_read_folio_async(struct folio *folio, struct hermit_io *io,
+				 u64 *start_ns)
 {
 	int ret;
 
-	if (folio_order(folio) != 0 ||
-	    !hermit_backend_entry_remote(folio->swap))
+	if (!hermit_backend_range_remote(folio->swap, folio_order(folio)))
 		return -ENOENT;
 	if (!hermit_backend_ready())
 		return -ENODEV;
 
-	*cpu = get_cpu();
+	io->entry = folio->swap;
+	io->folio = folio;
+	io->folio_order = folio_order(folio);
+	io->transfer_order = hermit_backend_transfer_order(io->folio_order);
+	io->private = NULL;
+	io->cpu = get_cpu();
 	*start_ns = ktime_get_mono_fast_ns();
-	ret = hermit_backend_load(folio->swap, &folio->page, *cpu, true);
+	ret = hermit_backend_load(io, true);
 	put_cpu();
+	if (ret)
+		hermit_backend_account(io->folio_order, false, io->fallback, ret);
 	return ret;
 }
 
-int hermit_swap_read_folio_poll(struct folio *folio, int cpu, u64 start_ns)
+int hermit_swap_read_folio_poll(struct folio *folio, struct hermit_io *io,
+				u64 start_ns)
 {
 	u64 poll_start = ktime_get_mono_fast_ns();
 	int ret;
 
 	if (hmt_ctl_flag(HMT_LAZY_POLL)) {
-		while (hermit_backend_peek_load(cpu) > 0)
+		while ((ret = hermit_backend_poll(io, false)) == -EAGAIN)
 			cpu_relax();
+	} else {
+		ret = hermit_backend_poll(io, true);
 	}
-	ret = hermit_backend_poll_load(cpu);
+	hermit_backend_account(io->folio_order, false, io->fallback, ret);
 	hermit_latency_add(HMT_LAT_POLL_LOAD,
 			   ktime_get_mono_fast_ns() - poll_start);
 	hermit_swap_read_complete(folio, start_ns, ret);

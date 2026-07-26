@@ -1389,6 +1389,7 @@ config FIND_NORMAL_PAGE
 config HERMIT
 	bool "Hermit remote swap"
 	depends on X86_64 && MEMCG && SWAP && DEBUG_FS
+	select ARCH_WANTS_THP_SWAP
 	help
 	  Enable the Hermit remote-memory swap backend, reclaim controls and
 	  profiling ABI. Hermit backends are supplied by external modules.

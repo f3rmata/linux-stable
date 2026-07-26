@@ -1332,48 +1332,74 @@ static unsigned long mem_cgroup_margin(struct mem_cgroup *memcg)
 }
 
 #ifdef CONFIG_HERMIT
-#define HMT_RECLAIM_HEADROOM_PAGES 2048UL
+static unsigned long hermit_reclaim_headroom(void)
+{
+	return hmt_ctl_var(HMT_RECLAIM_HEADROOM_PAGES);
+}
+
+static u32 hermit_reclaim_nr_workers(void)
+{
+	if (hmt_ctl_var(HMT_RECLAIM_MODE) != 1)
+		return 1;
+
+	return clamp_t(u32, hmt_ctl_var(HMT_STHD_CNT), 1,
+			       HMT_MAX_NR_STHDS);
+}
 
 static void hermit_reclaim_workfn(struct work_struct *work)
 {
 	struct hmt_reclaim_work *hwork =
 		container_of(work, struct hmt_reclaim_work, work);
 	struct mem_cgroup *memcg = hwork->memcg;
+	unsigned long headroom;
 	unsigned int attempts = 0;
+	bool made_progress = false;
 
-	while (hmt_ctl_flag(HMT_APT_RECLAIM) &&
-	       mem_cgroup_margin(memcg) < HMT_RECLAIM_HEADROOM_PAGES &&
-	       attempts++ < MAX_RECLAIM_RETRIES) {
+	while (hmt_ctl_flag(HMT_APT_RECLAIM) && attempts++ < MAX_RECLAIM_RETRIES) {
 		unsigned long margin = mem_cgroup_margin(memcg);
 		unsigned long nr_to_reclaim;
 		unsigned long nr_reclaimed;
+		u32 nr_workers;
 
-		nr_to_reclaim = max(HMT_RECLAIM_HEADROOM_PAGES - margin,
-				    (unsigned long)MEMCG_CHARGE_BATCH);
+		headroom = hermit_reclaim_headroom();
+		if (!headroom || margin >= headroom)
+			break;
+
+		/* Split the current deficit across the active workers. */
+		nr_workers = hermit_reclaim_nr_workers();
+		nr_to_reclaim = DIV_ROUND_UP(headroom - margin, nr_workers);
+		nr_to_reclaim = max_t(unsigned long, nr_to_reclaim,
+				      MEMCG_CHARGE_BATCH);
 		nr_reclaimed = try_to_free_mem_cgroup_pages(
 			memcg, nr_to_reclaim, GFP_KERNEL,
 			MEMCG_RECLAIM_MAY_SWAP, NULL);
 		if (!nr_reclaimed)
 			break;
+		made_progress = true;
 	}
+
+	/* Continue a productive reclaim round without waiting for a new charge. */
+	headroom = hermit_reclaim_headroom();
+	if (made_progress && hmt_ctl_flag(HMT_APT_RECLAIM) && headroom &&
+	    mem_cgroup_margin(memcg) < headroom)
+		queue_work(system_unbound_wq, &hwork->work);
 }
 
 static void hermit_schedule_reclaim(struct mem_cgroup *memcg)
 {
 	unsigned long max = READ_ONCE(memcg->memory.max);
+	unsigned long headroom = hermit_reclaim_headroom();
 	u32 nr_workers, i;
 
 	if (!hmt_ctl_flag(HMT_APT_RECLAIM) || mem_cgroup_is_root(memcg) ||
-	    max == PAGE_COUNTER_MAX ||
-	    mem_cgroup_margin(memcg) >= HMT_RECLAIM_HEADROOM_PAGES)
+	    max == PAGE_COUNTER_MAX || !headroom ||
+	    mem_cgroup_margin(memcg) >= headroom)
 		return;
 
-	nr_workers = 1;
-	if (hmt_ctl_var(HMT_RECLAIM_MODE) == 1)
-		nr_workers = clamp_t(u32, hmt_ctl_var(HMT_STHD_CNT), 1,
-				     HMT_MAX_NR_STHDS);
+	nr_workers = hermit_reclaim_nr_workers();
 	for (i = 0; i < nr_workers; i++)
-		schedule_work(&memcg->hermit_reclaim_work[i].work);
+		queue_work(system_unbound_wq,
+			   &memcg->hermit_reclaim_work[i].work);
 }
 #else
 static inline void hermit_schedule_reclaim(struct mem_cgroup *memcg)

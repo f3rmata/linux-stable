@@ -9,6 +9,7 @@
 struct mem_cgroup;
 
 #define HMT_MAX_NR_STHDS 16
+#define HMT_DEFAULT_RECLAIM_HEADROOM_PAGES 65536U
 
 struct hmt_reclaim_work {
 	struct work_struct work;
@@ -32,6 +33,7 @@ enum hmt_ctl_flag_type {
 enum hmt_ctl_var_type {
 	HMT_STHD_CNT,
 	HMT_RECLAIM_MODE,
+	HMT_RECLAIM_HEADROOM_PAGES,
 	NUM_HMT_CTL_VARS,
 };
 

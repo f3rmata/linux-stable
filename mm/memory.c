@@ -4477,15 +4477,21 @@ static bool can_swapin_thp(struct vm_fault *vmf, pte_t *ptep, int nr_pages)
 		return false;
 
 #ifdef CONFIG_HERMIT
-	/* Hermit stores base pages; never combine remote entries into a THP. */
+	/* A large remote read must be covered by one committed extent. */
 	{
+		bool any_remote = false;
 		int i;
 
 		for (i = 0; i < nr_pages; i++)
 			if (hermit_backend_entry_remote(
 					 swp_entry(swp_type(entry),
-						   swp_offset(entry) + i)))
-				return false;
+						   swp_offset(entry) + i))) {
+				any_remote = true;
+				break;
+			}
+		if (any_remote &&
+		    !hermit_backend_range_remote(entry, ilog2(nr_pages)))
+			return false;
 	}
 #endif
 
@@ -4630,9 +4636,10 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	unsigned long address;
 	pte_t *ptep;
 #ifdef CONFIG_HERMIT
-	int hermit_read_cpu = -1;
+	struct hermit_io hermit_io = {};
 	u64 hermit_read_start_ns = 0;
 	u64 hermit_fault_start_ns = ktime_get_mono_fast_ns();
+	bool hermit_read_pending = false;
 	bool hermit_read_failed = false;
 	bool hermit_swap_fault = false;
 	bool hermit_major_fault = false;
@@ -4725,13 +4732,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 		    ) &&
 		    __swap_count(entry) == 1) {
 			/* skip swapcache */
-#ifdef CONFIG_HERMIT
-			/* Hermit backends currently transfer one base page. */
-			folio = hermit_direct ? __alloc_swap_folio(vmf) :
-				alloc_swap_folio(vmf);
-#else
 			folio = alloc_swap_folio(vmf);
-#endif
 			if (folio) {
 				__folio_set_locked(folio);
 				__folio_set_swapbacked(folio);
@@ -4766,13 +4767,15 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 					int err;
 
 					err = hermit_swap_read_folio_async(
-						folio, &hermit_read_cpu,
+						folio, &hermit_io,
 						&hermit_read_start_ns);
 					if (err) {
 						hermit_stat_inc(HMT_STAT_BACKEND_ERROR);
 						folio_unlock(folio);
-						hermit_read_cpu = -1;
+						hermit_read_pending = false;
 						hermit_read_failed = true;
+					} else {
+						hermit_read_pending = true;
 					}
 				}
 #endif
@@ -4785,7 +4788,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 				folio_add_lru(folio);
 
 #ifdef CONFIG_HERMIT
-				if (hermit_read_cpu < 0 && !hermit_read_failed)
+				if (!hermit_read_pending && !hermit_read_failed)
 #endif
 					swap_read_folio(folio, NULL);
 				folio->private = NULL;
@@ -4820,10 +4823,10 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	}
 
 #ifdef CONFIG_HERMIT
-	if (hermit_read_cpu >= 0) {
-		hermit_swap_read_folio_poll(folio, hermit_read_cpu,
+	if (hermit_read_pending) {
+		hermit_swap_read_folio_poll(folio, &hermit_io,
 					    hermit_read_start_ns);
-		hermit_read_cpu = -1;
+		hermit_read_pending = false;
 	}
 #endif
 	ret |= folio_lock_or_retry(folio, vmf);

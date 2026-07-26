@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/debugfs.h>
 #include <linux/hermit.h>
+#include <linux/hermit_backend.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
 
@@ -13,7 +14,7 @@ static const char * const hmt_ctl_flag_names[NUM_HMT_CTL_FLAGS] = {
 	"speculative_lock", "lazy_poll", "apt_reclaim",
 };
 static const char * const hmt_ctl_var_names[NUM_HMT_CTL_VARS] = {
-	"sthd_cnt", "reclaim_mode",
+	"sthd_cnt", "reclaim_mode", "reclaim_headroom_pages",
 };
 
 static int __init hermit_init(void)
@@ -31,6 +32,9 @@ static int __init hermit_init(void)
 		debugfs_create_u32(hmt_ctl_var_names[i], 0600, root,
 				   &hmt_ctl_vars[i]);
 	hmt_ctl_vars[HMT_STHD_CNT] = min_t(u32, num_online_cpus(), 4);
+	hmt_ctl_vars[HMT_RECLAIM_HEADROOM_PAGES] =
+		HMT_DEFAULT_RECLAIM_HEADROOM_PAGES;
+	hermit_backend_debugfs_init(root);
 	return 0;
 }
 subsys_initcall(hermit_init);

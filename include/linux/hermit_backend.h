@@ -4,26 +4,43 @@
 
 #include <linux/swap.h>
 
-struct page;
+struct folio;
+struct dentry;
+
+struct hermit_io {
+	swp_entry_t entry;
+	struct folio *folio;
+	unsigned int folio_order;
+	unsigned int transfer_order;
+	int cpu;
+	bool fallback;
+	void *private;
+};
 
 struct hermit_backend_ops {
-	int (*load)(swp_entry_t entry, struct page *page, int cpu, bool async);
-	int (*store)(swp_entry_t entry, struct page *page, int cpu, bool async);
-	int (*poll_load)(int cpu);
-	int (*peek_load)(int cpu);
+	unsigned long supported_order_mask;
+	int (*load)(struct hermit_io *io, bool async);
+	int (*store)(struct hermit_io *io);
+	int (*poll)(struct hermit_io *io, bool wait);
 };
 
 int hermit_register_backend(const struct hermit_backend_ops *ops);
 void hermit_unregister_backend(const struct hermit_backend_ops *ops);
 bool hermit_backend_ready(void);
-int hermit_backend_load(swp_entry_t entry, struct page *page, int cpu,
-			bool async);
-int hermit_backend_store(swp_entry_t entry, struct page *page, int cpu,
-			 bool async);
-int hermit_backend_poll_load(int cpu);
-int hermit_backend_peek_load(int cpu);
-int hermit_backend_mark_remote(swp_entry_t entry);
+int hermit_backend_load(struct hermit_io *io, bool async);
+int hermit_backend_store(struct hermit_io *io);
+int hermit_backend_poll(struct hermit_io *io, bool wait);
+unsigned long hermit_backend_effective_order_mask(void);
+unsigned int hermit_backend_transfer_order(unsigned int folio_order);
+int hermit_backend_prepare_remote(swp_entry_t entry, unsigned int order);
+int hermit_backend_commit_remote(swp_entry_t entry, unsigned int order);
+void hermit_backend_abort_remote(swp_entry_t entry, unsigned int order);
 bool hermit_backend_entry_remote(swp_entry_t entry);
+bool hermit_backend_range_remote(swp_entry_t entry, unsigned int order);
+int hermit_backend_entry_order(swp_entry_t entry);
 void hermit_backend_invalidate(swp_entry_t entry);
+void hermit_backend_account(unsigned int order, bool store, bool fallback,
+			    int error);
+int hermit_backend_debugfs_init(struct dentry *root);
 
 #endif
