@@ -9,11 +9,13 @@
 #include <linux/mutex.h>
 #include <linux/rcupdate.h>
 #include <linux/seq_file.h>
+#include <linux/srcu.h>
 #include <linux/swapops.h>
 #include <linux/xarray.h>
 
 static const struct hermit_backend_ops __rcu *hermit_backend_ops;
 static DEFINE_MUTEX(hermit_backend_lock);
+DEFINE_STATIC_SRCU(hermit_backend_srcu);
 static DEFINE_XARRAY(hermit_remote_entries);
 static unsigned long hermit_remote_order_mask = BIT(0);
 static atomic_long_t hermit_order_stores[PMD_ORDER + 1];
@@ -46,7 +48,7 @@ void hermit_unregister_backend(const struct hermit_backend_ops *ops)
 	if (rcu_access_pointer(hermit_backend_ops) == ops)
 		RCU_INIT_POINTER(hermit_backend_ops, NULL);
 	mutex_unlock(&hermit_backend_lock);
-	synchronize_rcu();
+	synchronize_srcu(&hermit_backend_srcu);
 }
 EXPORT_SYMBOL_GPL(hermit_unregister_backend);
 
@@ -54,11 +56,12 @@ bool hermit_backend_ready(void)
 {
 	const struct hermit_backend_ops *ops;
 	bool ready;
+	int idx;
 
-	rcu_read_lock();
-	ops = rcu_dereference(hermit_backend_ops);
+	idx = srcu_read_lock(&hermit_backend_srcu);
+	ops = srcu_dereference(hermit_backend_ops, &hermit_backend_srcu);
 	ready = ops && ops->load && ops->store;
-	rcu_read_unlock();
+	srcu_read_unlock(&hermit_backend_srcu, idx);
 	return ready;
 }
 EXPORT_SYMBOL_GPL(hermit_backend_ready);
@@ -66,11 +69,11 @@ EXPORT_SYMBOL_GPL(hermit_backend_ready);
 #define HERMIT_BACKEND_CALL(_member, _fallback, ...) ({ \
 	const struct hermit_backend_ops *_ops; \
 	int _ret = (_fallback); \
-	rcu_read_lock(); \
-	_ops = rcu_dereference(hermit_backend_ops); \
+	int _idx = srcu_read_lock(&hermit_backend_srcu); \
+	_ops = srcu_dereference(hermit_backend_ops, &hermit_backend_srcu); \
 	if (_ops && _ops->_member) \
 		_ret = _ops->_member(__VA_ARGS__); \
-	rcu_read_unlock(); \
+	srcu_read_unlock(&hermit_backend_srcu, _idx); \
 	_ret; \
 })
 
@@ -96,13 +99,14 @@ unsigned long hermit_backend_effective_order_mask(void)
 {
 	const struct hermit_backend_ops *ops;
 	unsigned long mask = BIT(0);
+	int idx;
 
-	rcu_read_lock();
-	ops = rcu_dereference(hermit_backend_ops);
+	idx = srcu_read_lock(&hermit_backend_srcu);
+	ops = srcu_dereference(hermit_backend_ops, &hermit_backend_srcu);
 	if (ops)
 		mask = READ_ONCE(hermit_remote_order_mask) &
 			ops->supported_order_mask;
-	rcu_read_unlock();
+	srcu_read_unlock(&hermit_backend_srcu, idx);
 	return mask | BIT(0);
 }
 EXPORT_SYMBOL_GPL(hermit_backend_effective_order_mask);

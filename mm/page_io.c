@@ -328,7 +328,7 @@ static bool hermit_swap_write_folio(struct folio *folio)
 	};
 	u64 start_ns;
 	u64 duration_ns;
-	int cpu, ret;
+	int ret;
 
 	if (!hermit_backend_ready() || folio_order(folio) > PMD_ORDER)
 		return false;
@@ -336,12 +336,11 @@ static bool hermit_swap_write_folio(struct folio *folio)
 	if (ret)
 		return false;
 
-	cpu = get_cpu();
-	io.cpu = cpu;
+	io.cpu = get_cpu();
+	put_cpu();
 	io.transfer_order = hermit_backend_transfer_order(io.folio_order);
 	start_ns = ktime_get_mono_fast_ns();
 	ret = hermit_backend_store(&io);
-	put_cpu();
 	if (ret) {
 		hermit_backend_abort_remote(folio->swap, folio_order(folio));
 		hermit_backend_account(io.folio_order, true, io.fallback, ret);
@@ -396,7 +395,7 @@ static bool hermit_swap_read_folio(struct folio *folio)
 		.folio_order = folio_order(folio),
 	};
 	u64 start_ns;
-	int cpu, ret;
+	int ret;
 
 	if (!hermit_backend_range_remote(folio->swap, folio_order(folio)))
 		return false;
@@ -405,12 +404,11 @@ static bool hermit_swap_read_folio(struct folio *folio)
 		return true;
 	}
 
-	cpu = get_cpu();
-	io.cpu = cpu;
+	io.cpu = get_cpu();
+	put_cpu();
 	io.transfer_order = hermit_backend_transfer_order(io.folio_order);
 	start_ns = ktime_get_mono_fast_ns();
 	ret = hermit_backend_load(&io, false);
-	put_cpu();
 	hermit_backend_account(io.folio_order, false, io.fallback, ret);
 	hermit_swap_read_complete(folio, start_ns, ret);
 	return true;
@@ -432,9 +430,9 @@ int hermit_swap_read_folio_async(struct folio *folio, struct hermit_io *io,
 	io->transfer_order = hermit_backend_transfer_order(io->folio_order);
 	io->private = NULL;
 	io->cpu = get_cpu();
+	put_cpu();
 	*start_ns = ktime_get_mono_fast_ns();
 	ret = hermit_backend_load(io, true);
-	put_cpu();
 	if (ret)
 		hermit_backend_account(io->folio_order, false, io->fallback, ret);
 	return ret;

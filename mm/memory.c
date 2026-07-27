@@ -4640,7 +4640,6 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	u64 hermit_read_start_ns = 0;
 	u64 hermit_fault_start_ns = ktime_get_mono_fast_ns();
 	bool hermit_read_pending = false;
-	bool hermit_read_failed = false;
 	bool hermit_swap_fault = false;
 	bool hermit_major_fault = false;
 #endif
@@ -4771,9 +4770,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 						&hermit_read_start_ns);
 					if (err) {
 						hermit_stat_inc(HMT_STAT_BACKEND_ERROR);
-						folio_unlock(folio);
 						hermit_read_pending = false;
-						hermit_read_failed = true;
 					} else {
 						hermit_read_pending = true;
 					}
@@ -4788,7 +4785,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 				folio_add_lru(folio);
 
 #ifdef CONFIG_HERMIT
-				if (!hermit_read_pending && !hermit_read_failed)
+				if (!hermit_read_pending)
 #endif
 					swap_read_folio(folio, NULL);
 				folio->private = NULL;

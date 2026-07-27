@@ -9,7 +9,7 @@
 struct mem_cgroup;
 
 #define HMT_MAX_NR_STHDS 16
-#define HMT_DEFAULT_RECLAIM_HEADROOM_PAGES 65536U
+#define HMT_DEFAULT_RECLAIM_HEADROOM_PAGES 2048U
 
 struct hmt_reclaim_work {
 	struct work_struct work;
