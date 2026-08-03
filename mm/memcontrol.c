@@ -1378,11 +1378,24 @@ static void hermit_reclaim_workfn(struct work_struct *work)
 		made_progress = true;
 	}
 
-	/* Continue a productive reclaim round without waiting for a new charge. */
+	/*
+	 * Continue a productive reclaim round without waiting for a new
+	 * charge, but only within the requeue budget: an unbounded chain
+	 * would burn CPU forever on a cgroup that keeps allocating just
+	 * inside its headroom.  When the chain ends, release the css
+	 * reference taken at schedule time so mem_cgroup_css_free can run.
+	 */
 	headroom = hermit_reclaim_headroom();
 	if (made_progress && hmt_ctl_flag(HMT_APT_RECLAIM) && headroom &&
-	    mem_cgroup_margin(memcg) < headroom)
+	    mem_cgroup_margin(memcg) < headroom &&
+	    hwork->requeues < HMT_MAX_RECLAIM_REQUEUES) {
+		hwork->requeues++;
 		queue_work(system_unbound_wq, &hwork->work);
+	} else if (hwork->css_ref) {
+		hwork->css_ref = false;
+		hwork->requeues = 0;
+		css_put(&memcg->css);
+	}
 }
 
 static void hermit_schedule_reclaim(struct mem_cgroup *memcg)
@@ -1397,9 +1410,23 @@ static void hermit_schedule_reclaim(struct mem_cgroup *memcg)
 		return;
 
 	nr_workers = hermit_reclaim_nr_workers();
-	for (i = 0; i < nr_workers; i++)
-		queue_work(system_unbound_wq,
-			   &memcg->hermit_reclaim_work[i].work);
+	for (i = 0; i < nr_workers; i++) {
+		struct hmt_reclaim_work *hwork =
+			&memcg->hermit_reclaim_work[i];
+
+		/*
+		 * Keep the cgroup alive for the whole work chain: the workfn
+		 * dereferences memcg and may re-queue itself, and css_free's
+		 * cancel_work_sync must never race a live chain.  The ref is
+		 * released by the workfn when the chain stops.
+		 */
+		if (!hwork->css_ref) {
+			hwork->css_ref = true;
+			hwork->requeues = 0;
+			css_get(&memcg->css);
+		}
+		queue_work(system_unbound_wq, &hwork->work);
+	}
 }
 #else
 static inline void hermit_schedule_reclaim(struct mem_cgroup *memcg)

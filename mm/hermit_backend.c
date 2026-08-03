@@ -29,7 +29,13 @@ int hermit_register_backend(const struct hermit_backend_ops *ops)
 {
 	int ret = 0;
 
-	if (!ops || !ops->load || !ops->store ||
+	/*
+	 * ->poll is required: the speculative swapin path
+	 * (hermit_swap_read_folio_poll) always polls an async load, and
+	 * silently succeeding without ->poll would mark an in-flight folio
+	 * uptodate.
+	 */
+	if (!ops || !ops->load || !ops->store || !ops->poll ||
 	    !(ops->supported_order_mask & BIT(0)))
 		return -EINVAL;
 	mutex_lock(&hermit_backend_lock);
@@ -91,7 +97,12 @@ EXPORT_SYMBOL_GPL(hermit_backend_store);
 
 int hermit_backend_poll(struct hermit_io *io, bool wait)
 {
-	return HERMIT_BACKEND_CALL(poll, 0, io, wait);
+	/*
+	 * Never fall back to "success" when the backend is gone or lacks a
+	 * poll op: the caller treats a non-error return as "the transfer
+	 * completed", which would let it mark an in-flight folio uptodate.
+	 */
+	return HERMIT_BACKEND_CALL(poll, -EOPNOTSUPP, io, wait);
 }
 EXPORT_SYMBOL_GPL(hermit_backend_poll);
 
@@ -151,6 +162,13 @@ int hermit_backend_commit_remote(swp_entry_t entry, unsigned int order)
 	unsigned int i, nr_pages = 1U << order;
 	void *old;
 
+	/*
+	 * The slots are reserved by prepare_remote() and the committing folio
+	 * is held under its swapcache writeback lock, so a concurrent free and
+	 * re-commit of the same entries cannot interleave with this loop.  On a
+	 * mid-loop store failure abort_remote() releases exactly the extent
+	 * this transaction reserved, which is safe for that same reason.
+	 */
 	for (i = 0; i < nr_pages; i++) {
 		old = xa_store(&hermit_remote_entries,
 			       hermit_entry_offset(entry, i).val,

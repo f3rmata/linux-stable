@@ -4711,15 +4711,29 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 #endif
 
 	folio = swap_cache_get_folio(entry);
-	if (folio)
+	if (folio) {
 		swap_update_readahead(folio, vma, vmf->address);
+#ifdef CONFIG_HERMIT
+		hermit_stat_inc(HMT_STAT_HIT_ON_SWAPCACHE);
+#endif
+	}
 	swapcache = folio;
 
 	if (!folio) {
 		bool synchronous_direct =
 			data_race(si->flags & SWP_SYNCHRONOUS_IO);
 #ifdef CONFIG_HERMIT
+		/*
+		 * bypass_swapcache hands a locked, non-swapcache folio to
+		 * swap_read_folio(), which is only legal on a synchronous
+		 * swap device (see the VM_BUG_ON in swap_read_folio()).
+		 * Gate hermit_direct on synchronous_direct so non-synchronous
+		 * devices (swap files, loop-backed devices) take the normal
+		 * swap cache path, where remote reads are still served by
+		 * hermit_swap_read_folio().
+		 */
 		bool hermit_direct = hmt_ctl_flag(HMT_BPS_SCACHE) &&
+			synchronous_direct &&
 			hermit_backend_ready() &&
 			hermit_backend_entry_remote(entry);
 #endif
@@ -4768,12 +4782,13 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 					err = hermit_swap_read_folio_async(
 						folio, &hermit_io,
 						&hermit_read_start_ns);
-					if (err) {
-						hermit_stat_inc(HMT_STAT_BACKEND_ERROR);
-						hermit_read_pending = false;
-					} else {
-						hermit_read_pending = true;
-					}
+					/*
+					 * On failure the final outcome is reported by the
+					 * synchronous retry below
+					 * (hermit_swap_read_folio_sync), so do not bump
+					 * BACKEND_ERROR here.
+					 */
+					hermit_read_pending = !err;
 				}
 #endif
 				memcg1_swapin(entry, nr_pages);
@@ -4785,7 +4800,18 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 				folio_add_lru(folio);
 
 #ifdef CONFIG_HERMIT
-				if (!hermit_read_pending)
+				if (hermit_read_pending) {
+					/* Async remote load in flight; polled below. */
+				} else if (hermit_direct && hmt_ctl_flag(HMT_SPEC_IO)) {
+					/*
+					 * The speculative async load failed.  Retry the
+					 * remote read synchronously once instead of
+					 * re-entering swap_read_folio(), which would
+					 * issue a second remote load of the same entry.
+					 */
+					if (hermit_swap_read_folio_sync(folio))
+						swap_read_folio(folio, NULL);
+				} else
 #endif
 					swap_read_folio(folio, NULL);
 				folio->private = NULL;
@@ -4793,6 +4819,9 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 		} else {
 			folio = swapin_readahead(entry, GFP_HIGHUSER_MOVABLE,
 						vmf);
+#ifdef CONFIG_HERMIT
+			hermit_stat_inc(HMT_STAT_PREFETCH_SWAPIN);
+#endif
 			swapcache = folio;
 		}
 

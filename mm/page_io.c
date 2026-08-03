@@ -319,6 +319,13 @@ static inline void count_swpout_vm_event(struct folio *folio)
 }
 
 #ifdef CONFIG_HERMIT
+/*
+ * Upper bound on the HMT_LAZY_POLL busy-wait before falling back to a
+ * blocking poll.  A stuck backend must not pin a CPU forever while the
+ * faulting thread holds the folio lock.
+ */
+#define HERMIT_LAZY_POLL_DEADLINE_NS (100ULL * NSEC_PER_MSEC)
+
 static bool hermit_swap_write_folio(struct folio *folio)
 {
 	struct hermit_io io = {
@@ -399,10 +406,14 @@ static bool hermit_swap_read_folio(struct folio *folio)
 
 	if (!hermit_backend_range_remote(folio->swap, folio_order(folio)))
 		return false;
-	if (!hermit_backend_ready()) {
-		hermit_swap_read_complete(folio, ktime_get_mono_fast_ns(), -ENODEV);
-		return true;
-	}
+	/*
+	 * The backend went away while this swap entry still carries remote
+	 * markers.  Do not claim the read was handled: falling through to the
+	 * native swap device gives the caller a real result instead of a
+	 * silently unlocked, non-uptodate folio that poisons the swap cache.
+	 */
+	if (!hermit_backend_ready())
+		return false;
 
 	io.cpu = get_cpu();
 	put_cpu();
@@ -412,6 +423,39 @@ static bool hermit_swap_read_folio(struct folio *folio)
 	hermit_backend_account(io.folio_order, false, io.fallback, ret);
 	hermit_swap_read_complete(folio, start_ns, ret);
 	return true;
+}
+
+/*
+ * Synchronous remote retry used by the swapcache-skip direct path after a
+ * speculative async load failed.  Re-running swap_read_folio() there would
+ * re-enter hermit_swap_read_folio() and issue a second remote load of the
+ * same entry, so do the single synchronous retry here instead.  Returns 0
+ * when the read was handled (the folio has been unlocked by
+ * hermit_swap_read_complete), or -ENOENT when the entry is no longer served
+ * by the backend and the caller must fall back to the native swap device.
+ */
+int hermit_swap_read_folio_sync(struct folio *folio)
+{
+	struct hermit_io io = {
+		.entry = folio->swap,
+		.folio = folio,
+		.folio_order = folio_order(folio),
+	};
+	u64 start_ns;
+	int ret;
+
+	if (!hermit_backend_range_remote(folio->swap, folio_order(folio)) ||
+	    !hermit_backend_ready())
+		return -ENOENT;
+
+	io.cpu = get_cpu();
+	put_cpu();
+	io.transfer_order = hermit_backend_transfer_order(io.folio_order);
+	start_ns = ktime_get_mono_fast_ns();
+	ret = hermit_backend_load(&io, false);
+	hermit_backend_account(io.folio_order, false, io.fallback, ret);
+	hermit_swap_read_complete(folio, start_ns, ret);
+	return 0;
 }
 
 int hermit_swap_read_folio_async(struct folio *folio, struct hermit_io *io,
@@ -445,8 +489,17 @@ int hermit_swap_read_folio_poll(struct folio *folio, struct hermit_io *io,
 	int ret;
 
 	if (hmt_ctl_flag(HMT_LAZY_POLL)) {
-		while ((ret = hermit_backend_poll(io, false)) == -EAGAIN)
+		u64 deadline = ktime_get_ns() + HERMIT_LAZY_POLL_DEADLINE_NS;
+
+		while ((ret = hermit_backend_poll(io, false)) == -EAGAIN) {
+			if (ktime_get_ns() >= deadline) {
+				/* Bound the busy-wait; block for the
+				 * completion instead of pinning a CPU. */
+				ret = hermit_backend_poll(io, true);
+				break;
+			}
 			cpu_relax();
+		}
 	} else {
 		ret = hermit_backend_poll(io, true);
 	}

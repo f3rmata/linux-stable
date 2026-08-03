@@ -20,6 +20,14 @@ struct hermit_io {
 struct hermit_backend_ops {
 	unsigned long supported_order_mask;
 	int (*load)(struct hermit_io *io, bool async);
+	/*
+	 * store() must make every page of io->folio durably remote before
+	 * returning 0.  io->fallback only reports transfer granularity (the
+	 * folio was sent as base-page WRs instead of one large WR), never
+	 * partial success; a store that cannot transfer the whole folio must
+	 * return an error.  The kernel aborts the whole remote extent on any
+	 * error and falls back to the native swap device.
+	 */
 	int (*store)(struct hermit_io *io);
 	int (*poll)(struct hermit_io *io, bool wait);
 };

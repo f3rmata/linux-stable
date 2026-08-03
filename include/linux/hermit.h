@@ -11,9 +11,21 @@ struct mem_cgroup;
 #define HMT_MAX_NR_STHDS 16
 #define HMT_DEFAULT_RECLAIM_HEADROOM_PAGES 2048U
 
+/*
+ * Upper bound on how many times one hermit_reclaim_work chain may re-queue
+ * itself before parking and waiting for the next charge to re-arm it.  This
+ * caps the CPU the adaptive reclaim chain can burn on a cgroup whose usage
+ * stays within headroom of memory.max.
+ */
+#define HMT_MAX_RECLAIM_REQUEUES 8
+
 struct hmt_reclaim_work {
 	struct work_struct work;
 	struct mem_cgroup *memcg;
+	/* Self-requeues performed in the current chain. */
+	unsigned int requeues;
+	/* Whether this work currently holds a css reference on memcg->css. */
+	bool css_ref;
 };
 
 enum hmt_ctl_flag_type {

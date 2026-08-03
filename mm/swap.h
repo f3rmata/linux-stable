@@ -199,6 +199,7 @@ int hermit_swap_read_folio_async(struct folio *folio, struct hermit_io *io,
 				 u64 *start_ns);
 int hermit_swap_read_folio_poll(struct folio *folio, struct hermit_io *io,
 				u64 start_ns);
+int hermit_swap_read_folio_sync(struct folio *folio);
 #endif
 void swap_write_unplug(struct swap_iocb *sio);
 int swap_writeout(struct folio *folio, struct swap_iocb **swap_plug);

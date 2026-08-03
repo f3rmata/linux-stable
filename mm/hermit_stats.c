@@ -81,17 +81,20 @@ SYSCALL_DEFINE0(reset_swap_stats)
 	return 0;
 }
 
-SYSCALL_DEFINE3(get_swap_stats, int __user *, ondemand,
-		int __user *, prefetch, int __user *, hit_on_cache)
+SYSCALL_DEFINE3(get_swap_stats, long __user *, ondemand,
+		long __user *, prefetch, long __user *, hit_on_cache)
 {
 	int ret = 0;
 
-	hermit_stats_report();
-	if (put_user((int)hermit_stat_read(HMT_STAT_ONDEMAND_SWAPIN), ondemand))
+	/*
+	 * No per-call hermit_stats_report(): dumping 15 pr_info lines on every
+	 * invocation lets an unprivileged caller flood the kernel log.
+	 */
+	if (put_user(hermit_stat_read(HMT_STAT_ONDEMAND_SWAPIN), ondemand))
 		ret = -EFAULT;
-	if (put_user((int)hermit_stat_read(HMT_STAT_PREFETCH_SWAPIN), prefetch))
+	if (put_user(hermit_stat_read(HMT_STAT_PREFETCH_SWAPIN), prefetch))
 		ret = -EFAULT;
-	if (put_user((int)hermit_stat_read(HMT_STAT_HIT_ON_SWAPCACHE), hit_on_cache))
+	if (put_user(hermit_stat_read(HMT_STAT_HIT_ON_SWAPCACHE), hit_on_cache))
 		ret = -EFAULT;
 	return ret;
 }
