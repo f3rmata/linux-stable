@@ -426,13 +426,15 @@ static bool hermit_swap_read_folio(struct folio *folio)
 }
 
 /*
- * Synchronous remote retry used by the swapcache-skip direct path after a
- * speculative async load failed.  Re-running swap_read_folio() there would
- * re-enter hermit_swap_read_folio() and issue a second remote load of the
- * same entry, so do the single synchronous retry here instead.  Returns 0
- * when the read was handled (the folio has been unlocked by
+ * Synchronous remote load used by the swapcache-skip direct path, either as
+ * the primary non-speculative operation or after a speculative async submit
+ * failed.  Calling swap_read_folio() for this non-swapcache folio is illegal
+ * when the native swap device lacks SWP_SYNCHRONOUS_IO, and after an async
+ * submit failure it could also issue a second remote load of the same entry.
+ *
+ * Returns 0 when the read was handled (the folio has been unlocked by
  * hermit_swap_read_complete), or -ENOENT when the entry is no longer served
- * by the backend and the caller must fall back to the native swap device.
+ * by the backend and the caller must retry through the native swapcache path.
  */
 int hermit_swap_read_folio_sync(struct folio *folio)
 {

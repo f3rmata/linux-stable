@@ -4609,6 +4609,24 @@ static struct folio *alloc_swap_folio(struct vm_fault *vmf)
 
 static DECLARE_WAIT_QUEUE_HEAD(swapcache_wq);
 
+#ifdef CONFIG_HERMIT
+static int hermit_direct_swapin(struct folio *folio, struct hermit_io *io,
+				bool *pending, u64 *start_ns)
+{
+	int err;
+
+	if (hmt_ctl_flag(HMT_SPEC_IO)) {
+		err = hermit_swap_read_folio_async(folio, io, start_ns);
+		if (!err) {
+			*pending = true;
+			return 0;
+		}
+	}
+
+	return hermit_swap_read_folio_sync(folio);
+}
+#endif
+
 /*
  * We enter with non-exclusive mmap_lock (to exclude vma changes,
  * but allow concurrent faults), and pte mapped but not yet locked.
@@ -4637,6 +4655,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	pte_t *ptep;
 #ifdef CONFIG_HERMIT
 	struct hermit_io hermit_io = {};
+	swp_entry_t hermit_fault_entry;
 	u64 hermit_read_start_ns = 0;
 	u64 hermit_fault_start_ns = ktime_get_mono_fast_ns();
 	bool hermit_read_pending = false;
@@ -4648,6 +4667,9 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 		goto out;
 
 	entry = pte_to_swp_entry(vmf->orig_pte);
+#ifdef CONFIG_HERMIT
+	hermit_fault_entry = entry;
+#endif
 	if (unlikely(non_swap_entry(entry))) {
 		if (is_migration_entry(entry)) {
 			migration_entry_wait(vma->vm_mm, vmf->pmd,
@@ -4724,16 +4746,17 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 			data_race(si->flags & SWP_SYNCHRONOUS_IO);
 #ifdef CONFIG_HERMIT
 		/*
-		 * bypass_swapcache hands a locked, non-swapcache folio to
-		 * swap_read_folio(), which is only legal on a synchronous
-		 * swap device (see the VM_BUG_ON in swap_read_folio()).
-		 * Gate hermit_direct on synchronous_direct so non-synchronous
-		 * devices (swap files, loop-backed devices) take the normal
-		 * swap cache path, where remote reads are still served by
-		 * hermit_swap_read_folio().
+		 * Hermit direct swap-in does not access the native swap device:
+		 * the locked, non-swapcache folio is submitted only through the
+		 * Hermit backend below.  Therefore a committed remote entry can
+		 * bypass swapcache even when its native backing device does not
+		 * advertise SWP_SYNCHRONOUS_IO.
+		 *
+		 * If the remote entry or backend disappears before submission, we
+		 * discard the direct folio and retry through swapin_readahead(),
+		 * where asynchronous native swap I/O is legal.
 		 */
 		bool hermit_direct = hmt_ctl_flag(HMT_BPS_SCACHE) &&
-			synchronous_direct &&
 			hermit_backend_ready() &&
 			hermit_backend_entry_remote(entry);
 #endif
@@ -4776,19 +4799,30 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 				/* Start remote I/O before swap-in metadata work. */
 				folio->swap = entry;
 #ifdef CONFIG_HERMIT
-				if (hermit_direct && hmt_ctl_flag(HMT_SPEC_IO)) {
-					int err;
-
-					err = hermit_swap_read_folio_async(
-						folio, &hermit_io,
+				if (hermit_direct) {
+					int err = hermit_direct_swapin(folio,
+						&hermit_io, &hermit_read_pending,
 						&hermit_read_start_ns);
-					/*
-					 * On failure the final outcome is reported by the
-					 * synchronous retry below
-					 * (hermit_swap_read_folio_sync), so do not bump
-					 * BACKEND_ERROR here.
-					 */
-					hermit_read_pending = !err;
+
+					if (err) {
+						/*
+						 * No remote I/O was submitted and the folio
+						 * is still locked and private.  Undo the
+						 * direct-path reservation before using the
+						 * native swapcache path.
+						 */
+						swapcache_clear(si, entry, nr_pages);
+						need_clear_cache = false;
+						folio_unlock(folio);
+						folio_put(folio);
+						entry = hermit_fault_entry;
+						folio = swapin_readahead(entry,
+							GFP_HIGHUSER_MOVABLE, vmf);
+						swapcache = folio;
+						hermit_stat_inc(
+							HMT_STAT_PREFETCH_SWAPIN);
+						goto swapin_allocated;
+					}
 				}
 #endif
 				memcg1_swapin(entry, nr_pages);
@@ -4802,16 +4836,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 #ifdef CONFIG_HERMIT
 				if (hermit_read_pending) {
 					/* Async remote load in flight; polled below. */
-				} else if (hermit_direct && hmt_ctl_flag(HMT_SPEC_IO)) {
-					/*
-					 * The speculative async load failed.  Retry the
-					 * remote read synchronously once instead of
-					 * re-entering swap_read_folio(), which would
-					 * issue a second remote load of the same entry.
-					 */
-					if (hermit_swap_read_folio_sync(folio))
-						swap_read_folio(folio, NULL);
-				} else
+				} else if (!hermit_direct)
 #endif
 					swap_read_folio(folio, NULL);
 				folio->private = NULL;
@@ -4825,6 +4850,9 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 			swapcache = folio;
 		}
 
+#ifdef CONFIG_HERMIT
+swapin_allocated:
+#endif
 		if (!folio) {
 			/*
 			 * Back out if somebody else faulted in this pte
@@ -4924,7 +4952,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 		goto out_nomap;
 	}
 
-	/* allocated large folios for SWP_SYNCHRONOUS_IO */
+	/* Large folios allocated by synchronous or Hermit direct swap-in. */
 	if (folio_test_large(folio) && !folio_test_swapcache(folio)) {
 		unsigned long nr = folio_nr_pages(folio);
 		unsigned long folio_start = ALIGN_DOWN(vmf->address, nr * PAGE_SIZE);
