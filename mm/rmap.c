@@ -1521,11 +1521,12 @@ void folio_add_anon_rmap_pmd(struct folio *folio, struct page *page,
 }
 
 /**
- * folio_add_new_anon_rmap - Add mapping to a new anonymous folio.
+ * __folio_add_new_anon_rmap - Add mapping to a new anonymous folio.
  * @folio:	The folio to add the mapping to.
  * @vma:	the vm area in which the mapping is added
  * @address:	the user virtual address mapped
  * @flags:	The rmap flags
+ * @pte_mapped:	Whether every base page is mapped by a PTE
  *
  * Like folio_add_anon_rmap_*() but must only be called on *new* folios.
  * This means the inc-and-test can be bypassed.
@@ -1533,10 +1534,11 @@ void folio_add_anon_rmap_pmd(struct folio *folio, struct page *page,
  * unless two threads map it concurrently. However, the folio must be
  * locked if it's shared.
  *
- * If the folio is pmd-mappable, it is accounted as a THP.
+ * A pmd-mappable folio is accounted as a THP only when it is not PTE-mapped.
  */
-void folio_add_new_anon_rmap(struct folio *folio, struct vm_area_struct *vma,
-		unsigned long address, rmap_t flags)
+static void __folio_add_new_anon_rmap(struct folio *folio,
+		struct vm_area_struct *vma, unsigned long address, rmap_t flags,
+		bool pte_mapped)
 {
 	const bool exclusive = flags & RMAP_EXCLUSIVE;
 	int nr = 1, nr_pmdmapped = 0;
@@ -1557,7 +1559,7 @@ void folio_add_new_anon_rmap(struct folio *folio, struct vm_area_struct *vma,
 		atomic_set(&folio->_mapcount, 0);
 		if (exclusive)
 			SetPageAnonExclusive(&folio->page);
-	} else if (!folio_test_pmd_mappable(folio)) {
+	} else if (pte_mapped || !folio_test_pmd_mappable(folio)) {
 		int i;
 
 		nr = folio_large_nr_pages(folio);
@@ -1591,6 +1593,36 @@ void folio_add_new_anon_rmap(struct folio *folio, struct vm_area_struct *vma,
 
 	__folio_mod_stat(folio, nr, nr_pmdmapped);
 	mod_mthp_stat(folio_order(folio), MTHP_STAT_NR_ANON, 1);
+}
+
+/**
+ * folio_add_new_anon_rmap - Add a native-level mapping to a new anon folio.
+ * @folio: The folio to add the mapping to.
+ * @vma: The vm area in which the mapping is added.
+ * @address: The user virtual address mapped.
+ * @flags: The rmap flags.
+ */
+void folio_add_new_anon_rmap(struct folio *folio, struct vm_area_struct *vma,
+		unsigned long address, rmap_t flags)
+{
+	__folio_add_new_anon_rmap(folio, vma, address, flags, false);
+}
+
+/**
+ * folio_add_new_anon_rmap_ptes - Add PTE mappings to a new anon folio.
+ * @folio: The folio to add the mappings to.
+ * @vma: The vm area in which the mappings are added.
+ * @address: The first user virtual address mapped.
+ * @flags: The rmap flags.
+ *
+ * Unlike folio_add_new_anon_rmap(), this initializes per-page mapcounts even
+ * when @folio is PMD-mappable. This is required when an order-PMD folio is
+ * installed into an existing PTE page instead of replacing it with a huge PMD.
+ */
+void folio_add_new_anon_rmap_ptes(struct folio *folio,
+		struct vm_area_struct *vma, unsigned long address, rmap_t flags)
+{
+	__folio_add_new_anon_rmap(folio, vma, address, flags, true);
 }
 
 static __always_inline void __folio_add_file_rmap(struct folio *folio,

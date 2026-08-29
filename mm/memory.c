@@ -4524,6 +4524,7 @@ static inline unsigned long thp_swap_suitable_orders(pgoff_t swp_offset,
 static struct folio *alloc_swap_folio(struct vm_fault *vmf)
 {
 	struct vm_area_struct *vma = vmf->vma;
+	unsigned long candidate_orders = BIT(PMD_ORDER) - 1;
 	unsigned long orders;
 	struct folio *folio;
 	unsigned long addr;
@@ -4549,12 +4550,25 @@ static struct folio *alloc_swap_folio(struct vm_fault *vmf)
 		goto fallback;
 
 	entry = pte_to_swp_entry(vmf->orig_pte);
+
+#ifdef CONFIG_HERMIT
 	/*
-	 * Get a list of all the (large) orders below PMD_ORDER that are enabled
-	 * and suitable for swapping THP.
+	 * Generic PTE swap-in deliberately excludes PMD_ORDER. Hermit can
+	 * recover an order-PMD remote extent into one physically contiguous
+	 * folio and install its base pages into the existing PTE page. Only
+	 * expose that candidate when the extent and transport mask both agree
+	 * on PMD_ORDER; native swap-in keeps the upstream allocation policy.
+	 */
+	if (hermit_backend_entry_order(entry) == PMD_ORDER &&
+	    (hermit_backend_effective_order_mask() & BIT(PMD_ORDER)))
+		candidate_orders |= BIT(PMD_ORDER);
+#endif
+	/*
+	 * Get a list of enabled large orders suitable for swapping in a THP.
+	 * Hermit may additionally admit the PMD order selected above.
 	 */
 	orders = thp_vma_allowable_orders(vma, vma->vm_flags, TVA_PAGEFAULT,
-					  BIT(PMD_ORDER) - 1);
+					  candidate_orders);
 	orders = thp_vma_suitable_orders(vma, vmf->address, orders);
 	orders = thp_swap_suitable_orders(swp_offset(entry),
 					  vmf->address, orders);
@@ -4967,6 +4981,7 @@ swapin_allocated:
 		page_idx = idx;
 		address = folio_start;
 		ptep = folio_ptep;
+		nr_pages = nr;
 		goto check_folio;
 	}
 
@@ -5108,7 +5123,11 @@ check_folio:
 		 */
 		VM_WARN_ON_ONCE(folio_test_large(folio) && folio_test_swapcache(folio));
 		VM_WARN_ON_FOLIO(!folio_test_locked(folio), folio);
-		folio_add_new_anon_rmap(folio, vma, address, rmap_flags);
+		if (folio_order(folio) == PMD_ORDER)
+			folio_add_new_anon_rmap_ptes(folio, vma, address,
+						       rmap_flags);
+		else
+			folio_add_new_anon_rmap(folio, vma, address, rmap_flags);
 	} else {
 		folio_add_anon_rmap_ptes(folio, page, nr_pages, vma, address,
 					rmap_flags);
