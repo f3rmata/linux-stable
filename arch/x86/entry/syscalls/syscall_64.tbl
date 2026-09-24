@@ -396,6 +396,8 @@
 469	common	file_setattr		sys_file_setattr
 471	common	reset_swap_stats	sys_reset_swap_stats
 472	common	get_swap_stats		sys_get_swap_stats
+473	common	hermit_pebs_start	sys_hermit_pebs_start
+474	common	hermit_pebs_end		sys_hermit_pebs_end
 
 #
 # Due to a historical design error, certain syscalls are numbered differently

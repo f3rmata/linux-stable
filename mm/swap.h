@@ -194,14 +194,19 @@ static inline void swap_read_unplug(struct swap_iocb *plug)
 		__swap_read_unplug(plug);
 }
 #ifdef CONFIG_HERMIT
+int hermit_swapout_order(struct folio *folio);
 struct hermit_io;
 int hermit_swap_read_folio_async(struct folio *folio, struct hermit_io *io,
 				 u64 *start_ns);
 int hermit_swap_read_folio_poll(struct folio *folio, struct hermit_io *io,
 				u64 start_ns);
 int hermit_swap_read_folio_sync(struct folio *folio);
+#else
+static inline int hermit_swapout_order(struct folio *folio) { return -1; }
 #endif
 void swap_write_unplug(struct swap_iocb *sio);
+int swap_writeout_order(struct folio *folio, struct swap_iocb **swap_plug,
+		       int transfer_order);
 int swap_writeout(struct folio *folio, struct swap_iocb **swap_plug);
 void __swap_writepage(struct folio *folio, struct swap_iocb **swap_plug);
 
@@ -397,6 +402,14 @@ static inline struct folio *swapin_readahead(swp_entry_t swp, gfp_t gfp_mask,
 static inline void swap_update_readahead(struct folio *folio,
 		struct vm_area_struct *vma, unsigned long addr)
 {
+}
+
+static inline int hermit_swapout_order(struct folio *folio) { return -1; }
+
+static inline int swap_writeout_order(struct folio *folio,
+		struct swap_iocb **swap_plug, int transfer_order)
+{
+	return 0;
 }
 
 static inline int swap_writeout(struct folio *folio,

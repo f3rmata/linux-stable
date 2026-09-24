@@ -73,6 +73,8 @@
 #include <linux/hermit.h>
 #include <linux/hermit_backend.h>
 #include <linux/hermit_stats.h>
+#include <linux/hermit_pebs.h>
+#include <linux/memcontrol.h>
 #endif
 #include <linux/dax.h>
 #include <linux/oom.h>
@@ -4562,6 +4564,32 @@ static struct folio *alloc_swap_folio(struct vm_fault *vmf)
 	if (hermit_backend_entry_order(entry) == PMD_ORDER &&
 	    (hermit_backend_effective_order_mask() & BIT(PMD_ORDER)))
 		candidate_orders |= BIT(PMD_ORDER);
+	/*
+	 * PEBS policy: cap the swap-in folio size at the transfer order the
+	 * policy chose for this region (or the forced order), so that the
+	 * read amplification of a single fault stays within the model.
+	 */
+	if (hermit_backend_entry_remote(entry) && hermit_pebs_enabled &&
+	    (hermit_pebs_mode == HERMIT_PEBS_MODE_POLICY ||
+	     hermit_pebs_force_order)) {
+		struct mem_cgroup *memcg = get_mem_cgroup_from_mm(vma->vm_mm);
+		unsigned int extent_order =
+			max(0, hermit_backend_entry_order(entry));
+		int o = -1;
+
+		if (memcg) {
+			if (hermit_pebs_force_order)
+				o = min_t(unsigned int, hermit_pebs_force_order,
+					  extent_order);
+			else
+				o = hermit_order_policy(memcg, vma->vm_mm,
+					vmf->address, extent_order, extent_order,
+					hermit_backend_effective_order_mask());
+			css_put(&memcg->css);
+		}
+		if (o >= 0 && (unsigned int)o < PMD_ORDER)
+			candidate_orders &= (1UL << (o + 1)) - 1;
+	}
 #endif
 	/*
 	 * Get a list of enabled large orders suitable for swapping in a THP.

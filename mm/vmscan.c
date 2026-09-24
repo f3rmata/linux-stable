@@ -650,7 +650,8 @@ typedef enum {
 } pageout_t;
 
 static pageout_t writeout(struct folio *folio, struct address_space *mapping,
-		struct swap_iocb **plug, struct list_head *folio_list)
+		struct swap_iocb **plug, struct list_head *folio_list,
+		int transfer_order)
 {
 	int res;
 
@@ -664,7 +665,7 @@ static pageout_t writeout(struct folio *folio, struct address_space *mapping,
 	if (shmem_mapping(mapping))
 		res = shmem_writeout(folio, plug, folio_list);
 	else
-		res = swap_writeout(folio, plug);
+		res = swap_writeout_order(folio, plug, transfer_order);
 
 	if (res < 0)
 		handle_write_error(mapping, folio, res);
@@ -686,7 +687,8 @@ static pageout_t writeout(struct folio *folio, struct address_space *mapping,
  * pageout is called by shrink_folio_list() for each dirty folio.
  */
 static pageout_t pageout(struct folio *folio, struct address_space *mapping,
-			 struct swap_iocb **plug, struct list_head *folio_list)
+			 struct swap_iocb **plug, struct list_head *folio_list,
+		int transfer_order)
 {
 	/*
 	 * We no longer attempt to writeback filesystem folios here, other
@@ -723,7 +725,7 @@ static pageout_t pageout(struct folio *folio, struct address_space *mapping,
 		return PAGE_ACTIVATE;
 	if (!folio_clear_dirty_for_io(folio))
 		return PAGE_CLEAN;
-	return writeout(folio, mapping, plug, folio_list);
+	return writeout(folio, mapping, plug, folio_list, transfer_order);
 }
 
 /*
@@ -1134,6 +1136,7 @@ retry:
 		enum folio_references references = FOLIOREF_RECLAIM;
 		bool dirty, writeback;
 		unsigned int nr_pages;
+		int transfer_order = -1;
 
 		cond_resched();
 
@@ -1400,6 +1403,7 @@ retry:
 			if (folio_test_large(folio))
 				flags |= TTU_SYNC;
 
+			transfer_order = hermit_swapout_order(folio);
 			try_to_unmap(folio, flags);
 			if (folio_mapped(folio)) {
 				stat->nr_unmap_fail += nr_pages;
@@ -1463,7 +1467,7 @@ retry:
 			 * starts and then write it out here.
 			 */
 			try_to_unmap_flush_dirty();
-			switch (pageout(folio, mapping, &plug, folio_list)) {
+			switch (pageout(folio, mapping, &plug, folio_list, transfer_order)) {
 			case PAGE_KEEP:
 				goto keep_locked;
 			case PAGE_ACTIVATE:

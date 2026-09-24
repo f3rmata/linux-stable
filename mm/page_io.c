@@ -28,6 +28,10 @@
 #include <linux/hermit.h>
 #include <linux/hermit_backend.h>
 #include <linux/hermit_stats.h>
+#include <linux/hermit_pebs.h>
+#include <linux/interval_tree.h>
+#include <linux/memcontrol.h>
+#include <linux/rmap.h>
 #include <linux/ktime.h>
 #endif
 #include <linux/zswap.h>
@@ -243,7 +247,16 @@ static void swap_zeromap_folio_clear(struct folio *folio)
  * We may have stale swap cache pages in memory: notice
  * them here and get rid of the unnecessary final write.
  */
+static void swap_writepage_order(struct folio *folio,
+		struct swap_iocb **swap_plug, int transfer_order);
+
 int swap_writeout(struct folio *folio, struct swap_iocb **swap_plug)
+{
+	return swap_writeout_order(folio, swap_plug, -1);
+}
+
+int swap_writeout_order(struct folio *folio, struct swap_iocb **swap_plug,
+		       int transfer_order)
 {
 	int ret = 0;
 
@@ -298,7 +311,7 @@ int swap_writeout(struct folio *folio, struct swap_iocb **swap_plug)
 		return AOP_WRITEPAGE_ACTIVATE;
 	}
 
-	__swap_writepage(folio, swap_plug);
+	swap_writepage_order(folio, swap_plug, transfer_order);
 	return 0;
 out_unlock:
 	folio_unlock(folio);
@@ -326,7 +339,47 @@ static inline void count_swpout_vm_event(struct folio *folio)
  */
 #define HERMIT_LAZY_POLL_DEADLINE_NS (100ULL * NSEC_PER_MSEC)
 
-static bool hermit_swap_write_folio(struct folio *folio)
+/* Evaluate while the folio is still mapped and its anon_vma is locked. */
+int hermit_swapout_order(struct folio *folio)
+{
+	struct mem_cgroup *memcg;
+	struct anon_vma *av;
+	struct anon_vma_chain *chain;
+	unsigned long addr;
+	int order = -1;
+
+	if (!READ_ONCE(hermit_pebs_enabled) || !folio_test_anon(folio))
+		return -1;
+	if (READ_ONCE(hermit_pebs_force_order))
+		return min_t(unsigned int, READ_ONCE(hermit_pebs_force_order),
+			     folio_order(folio));
+	if (READ_ONCE(hermit_pebs_mode) != HERMIT_PEBS_MODE_POLICY)
+		return -1;
+	memcg = get_mem_cgroup_from_folio(folio);
+	if (!memcg)
+		return -1;
+	av = folio_lock_anon_vma_read(folio, NULL);
+	if (av) {
+		anon_vma_interval_tree_foreach(chain, &av->rb_root,
+					     folio->index, folio->index) {
+			struct vm_area_struct *vma = chain->vma;
+
+			addr = vma->vm_start +
+				((folio->index - vma->vm_pgoff) << PAGE_SHIFT);
+			order = hermit_order_policy(memcg, vma->vm_mm, addr,
+				folio_order(folio),
+				hermit_backend_transfer_order(folio_order(folio)),
+				hermit_backend_effective_order_mask());
+			if (order >= 0)
+				break;
+		}
+		anon_vma_unlock_read(av);
+	}
+	css_put(&memcg->css);
+	return order;
+}
+
+static bool hermit_swap_write_folio(struct folio *folio, int transfer_order)
 {
 	struct hermit_io io = {
 		.entry = folio->swap,
@@ -345,7 +398,13 @@ static bool hermit_swap_write_folio(struct folio *folio)
 
 	io.cpu = get_cpu();
 	put_cpu();
-	io.transfer_order = hermit_backend_transfer_order(io.folio_order);
+	if (transfer_order < 0)
+		transfer_order = hermit_swapout_order(folio);
+	if (transfer_order < 0)
+		transfer_order = hermit_backend_transfer_order(folio_order(folio));
+	io.transfer_order = min_t(unsigned int, transfer_order, io.folio_order);
+	while (!(hermit_backend_effective_order_mask() & BIT(io.transfer_order)))
+		io.transfer_order--;
 	start_ns = ktime_get_mono_fast_ns();
 	ret = hermit_backend_store(&io);
 	if (ret) {
@@ -406,14 +465,12 @@ static bool hermit_swap_read_folio(struct folio *folio)
 
 	if (!hermit_backend_range_remote(folio->swap, folio_order(folio)))
 		return false;
-	/*
-	 * The backend went away while this swap entry still carries remote
-	 * markers.  Do not claim the read was handled: falling through to the
-	 * native swap device gives the caller a real result instead of a
-	 * silently unlocked, non-uptodate folio that poisons the swap cache.
-	 */
-	if (!hermit_backend_ready())
-		return false;
+	/* Remote-only slots have no valid local copy. Fail closed. */
+	if (!hermit_backend_ready()) {
+		hermit_backend_account(io.folio_order, false, false, -EIO);
+		hermit_swap_read_complete(folio, ktime_get_mono_fast_ns(), -EIO);
+		return true;
+	}
 
 	io.cpu = get_cpu();
 	put_cpu();
@@ -658,11 +715,17 @@ static void swap_writepage_bdev_async(struct folio *folio,
 
 void __swap_writepage(struct folio *folio, struct swap_iocb **swap_plug)
 {
+	swap_writepage_order(folio, swap_plug, -1);
+}
+
+static void swap_writepage_order(struct folio *folio,
+		struct swap_iocb **swap_plug, int transfer_order)
+{
 	struct swap_info_struct *sis = __swap_entry_to_info(folio->swap);
 
 	VM_BUG_ON_FOLIO(!folio_test_swapcache(folio), folio);
 #ifdef CONFIG_HERMIT
-	if (hermit_swap_write_folio(folio))
+	if (hermit_swap_write_folio(folio, transfer_order))
 		return;
 #endif
 	/*

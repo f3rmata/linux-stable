@@ -189,6 +189,8 @@ struct obj_cgroup {
  * statistics based on the statistics developed by Rik Van Riel for clock-pro,
  * to help the administrator determine what knobs to tune.
  */
+struct hermit_pebs_state;
+
 struct mem_cgroup {
 	struct cgroup_subsys_state css;
 
@@ -212,6 +214,8 @@ struct mem_cgroup {
 	struct work_struct high_work;
 #ifdef CONFIG_HERMIT
 	struct hmt_reclaim_work hermit_reclaim_work[HMT_MAX_NR_STHDS];
+	bool hermit_pebs_enabled;
+	struct hermit_pebs_state *hermit_pebs;
 #endif
 
 #ifdef CONFIG_ZSWAP

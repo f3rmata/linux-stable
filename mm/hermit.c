@@ -2,6 +2,7 @@
 #include <linux/debugfs.h>
 #include <linux/hermit.h>
 #include <linux/hermit_backend.h>
+#include <linux/hermit_pebs.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
 
@@ -35,6 +36,7 @@ static int __init hermit_init(void)
 	hmt_ctl_vars[HMT_RECLAIM_HEADROOM_PAGES] =
 		HMT_DEFAULT_RECLAIM_HEADROOM_PAGES;
 	hermit_backend_debugfs_init(root);
+	hermit_pebs_debugfs_init(root);
 	return 0;
 }
 subsys_initcall(hermit_init);

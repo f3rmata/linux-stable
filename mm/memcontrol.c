@@ -80,6 +80,7 @@
 #ifdef CONFIG_HERMIT
 #include <linux/hermit.h>
 #include <linux/hermit_stats.h>
+#include <linux/hermit_pebs.h>
 #endif
 
 struct cgroup_subsys memory_cgrp_subsys __read_mostly;
@@ -3807,6 +3808,9 @@ static void __mem_cgroup_free(struct mem_cgroup *memcg)
 	memcg1_free_events(memcg);
 	kfree(memcg->vmstats);
 	free_percpu(memcg->vmstats_percpu);
+#ifdef CONFIG_HERMIT
+	hermit_pebs_memcg_exit(memcg);
+#endif
 	kfree(memcg);
 }
 
@@ -3871,6 +3875,7 @@ static struct mem_cgroup *mem_cgroup_alloc(struct mem_cgroup *parent)
 			  hermit_reclaim_workfn);
 		memcg->hermit_reclaim_work[i].memcg = memcg;
 	}
+	hermit_pebs_memcg_init(memcg);
 #endif
 	vmpressure_init(&memcg->vmpressure);
 	INIT_LIST_HEAD(&memcg->memory_peaks);
@@ -4737,6 +4742,14 @@ static struct cftype memory_files[] = {
 		.seq_show = memory_low_show,
 		.write = memory_low_write,
 	},
+#ifdef CONFIG_HERMIT
+	{
+		.name = "hermit_pebs",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.seq_show = hermit_pebs_memcg_show,
+		.write = hermit_pebs_memcg_write,
+	},
+#endif
 	{
 		.name = "high",
 		.flags = CFTYPE_NOT_ON_ROOT,

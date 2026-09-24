@@ -15012,3 +15012,70 @@ struct cgroup_subsys perf_event_cgrp_subsys = {
 #endif /* CONFIG_CGROUP_PERF */
 
 DEFINE_STATIC_CALL_RET0(perf_snapshot_branch_stack, perf_snapshot_branch_stack_t);
+
+#ifdef CONFIG_HERMIT
+#include <linux/hermit_pebs.h>
+
+/*
+ * Attach a ring buffer to a kernel-internal perf event so an in-kernel
+ * consumer (mm/hermit_pebs.c) can drain PEBS samples. ring_buffer_attach()
+ * and perf_event_init_userpage() are private to this file; this mirrors
+ * the MEMTIS (SOSP'23) htmm__perf_event_init() helper.
+ */
+int hermit_perf_event_init(struct perf_event *event, unsigned int nr_pages)
+{
+	struct perf_buffer *rb;
+	int ret = 0;
+
+	if (!nr_pages || !is_power_of_2(nr_pages))
+		return -EINVAL;
+
+	mutex_lock(&event->mmap_mutex);
+	if (event->rb) {
+		ret = -EBUSY;
+		goto out;
+	}
+	rb = rb_alloc(nr_pages, 0, event->cpu, RING_BUFFER_WRITABLE);
+	if (!rb) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	refcount_set(&rb->mmap_count, 1);
+	ring_buffer_attach(event, rb);
+	perf_event_init_userpage(event);
+	perf_event_update_userpage(event);
+	refcount_set(&event->mmap_count, 1);
+out:
+	mutex_unlock(&event->mmap_mutex);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(hermit_perf_event_init);
+
+int hermit_perf_event_set_period(struct perf_event *event, u64 period)
+{
+	return perf_event_period(event, period);
+}
+EXPORT_SYMBOL_GPL(hermit_perf_event_set_period);
+
+/*
+ * Release a kernel event whose ring buffer was attached with
+ * hermit_perf_event_init(): there is no vma, so perf_mmap_close() never
+ * runs and the rb reference must be dropped here.
+ */
+void hermit_perf_event_release(struct perf_event *event)
+{
+	if (!event)
+		return;
+	perf_event_disable(event);
+	mutex_lock(&event->mmap_mutex);
+	refcount_set(&event->mmap_count, 0);
+	if (event->rb) {
+		refcount_set(&event->rb->mmap_count, 0);
+		/* Detach drops the attachment reference itself. */
+		ring_buffer_attach(event, NULL);
+	}
+	mutex_unlock(&event->mmap_mutex);
+	perf_event_release_kernel(event);
+}
+EXPORT_SYMBOL_GPL(hermit_perf_event_release);
+#endif /* CONFIG_HERMIT */
