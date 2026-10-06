@@ -34,6 +34,10 @@
 
 /* ---------- tunables (debugfs) ---------- */
 u32 hermit_pebs_enabled;
+/* Zero selects the existing adaptive period table. Configure while stopped. */
+u32 hermit_pebs_load_period;
+u32 hermit_pebs_store_period;
+u32 hermit_pebs_adaptive = 1;
 u32 hermit_pebs_mode = HERMIT_PEBS_MODE_STATIC;
 u32 hermit_pebs_force_order;
 u32 hermit_pebs_fixed_cost_ns = 7000;
@@ -287,8 +291,8 @@ static void hermit_pebs_update_periods(void)
 	int cpu, e;
 	u64 period, inst_period;
 
-	period = hermit_period_list[hermit_period_idx];
-	inst_period = hermit_inst_period_list[hermit_inst_period_idx];
+	period = READ_ONCE(hermit_pebs_load_period) ?: hermit_period_list[hermit_period_idx];
+	inst_period = READ_ONCE(hermit_pebs_store_period) ?: hermit_inst_period_list[hermit_inst_period_idx];
 
 	for (e = 0; e < HERMIT_PEBS_NR_EVENTS; e++) {
 		if (!hermit_pebs_events[e])
@@ -306,6 +310,8 @@ static void hermit_pebs_update_periods(void)
 
 static void hermit_pebs_adapt(unsigned long window_samples)
 {
+	if (!READ_ONCE(hermit_pebs_adaptive))
+		return;
 	if (window_samples > 50000 &&
 	    hermit_period_idx < HERMIT_PCOUNT - 1) {
 		hermit_period_idx++;
@@ -393,7 +399,7 @@ static int hermit_pebs_open_events(void)
 	}
 
 	attr.config = HERMIT_PEBS_L3_MISS;
-	attr.sample_period = hermit_period_list[0];
+	attr.sample_period = READ_ONCE(hermit_pebs_load_period) ?: hermit_period_list[0];
 	for_each_online_cpu(cpu) {
 		struct perf_event *event;
 
@@ -412,7 +418,7 @@ static int hermit_pebs_open_events(void)
 	}
 
 	attr.config = HERMIT_PEBS_ALL_STORES;
-	attr.sample_period = hermit_inst_period_list[0];
+	attr.sample_period = READ_ONCE(hermit_pebs_store_period) ?: hermit_inst_period_list[0];
 	for_each_online_cpu(cpu) {
 		struct perf_event *event;
 
@@ -713,6 +719,10 @@ static int hermit_pebs_stats_show(struct seq_file *m, void *v)
 	seq_printf(m, "lost: %ld\n", atomic_long_read(&hermit_nr_lost));
 	seq_printf(m, "period_idx: %u inst_period_idx: %u\n",
 		   hermit_period_idx, hermit_inst_period_idx);
+	seq_printf(m, "adaptive: %u load_period: %u store_period: %u\n",
+		   READ_ONCE(hermit_pebs_adaptive),
+		   READ_ONCE(hermit_pebs_load_period) ?: hermit_period_list[hermit_period_idx],
+		   READ_ONCE(hermit_pebs_store_period) ?: hermit_inst_period_list[hermit_inst_period_idx]);
 	return 0;
 }
 
@@ -853,6 +863,9 @@ void hermit_pebs_debugfs_init(struct dentry *root)
 {
 	debugfs_create_file("pebs_ring_test", 0400, root, NULL,
 			    &hermit_ring_test_fops);
+	debugfs_create_u32("pebs_load_period", 0600, root, &hermit_pebs_load_period);
+	debugfs_create_u32("pebs_store_period", 0600, root, &hermit_pebs_store_period);
+	debugfs_create_u32("pebs_adaptive", 0600, root, &hermit_pebs_adaptive);
 	debugfs_create_u32("pebs_enabled", 0600, root, &hermit_pebs_enabled);
 	debugfs_create_u32("pebs_mode", 0600, root, &hermit_pebs_mode);
 	debugfs_create_u32("pebs_force_order", 0600, root,
