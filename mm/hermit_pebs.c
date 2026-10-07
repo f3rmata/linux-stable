@@ -377,6 +377,7 @@ static int hermit_pebs_open_events(void)
 		.exclude_callchain_kernel = 1,
 		.exclude_callchain_user = 1,
 		.precise_ip = 1,
+		.disabled = 1,
 	};
 	struct task_struct *task = NULL;
 	int cpu, e, err = 0;
@@ -385,7 +386,6 @@ static int hermit_pebs_open_events(void)
 		task = find_get_task_by_vpid(hermit_pebs_pid);
 		if (!task)
 			return -ESRCH;
-		attr.enable_on_exec = 1;
 	}
 
 	for (e = 0; e < HERMIT_PEBS_NR_EVENTS; e++) {
@@ -435,6 +435,10 @@ static int hermit_pebs_open_events(void)
 		}
 		hermit_pebs_events[1][cpu] = event;
 	}
+	/* Start only after every event has a fully initialized output ring. */
+	for (e = 0; e < HERMIT_PEBS_NR_EVENTS; e++)
+		for_each_online_cpu(cpu)
+			perf_event_enable(hermit_pebs_events[e][cpu]);
 out:
 	if (task)
 		put_task_struct(task);
@@ -806,6 +810,8 @@ static int hermit_ring_test_show(struct seq_file *m, void *unused)
 		.size = sizeof(attr),
 		.config = PERF_COUNT_SW_CPU_CLOCK,
 		.disabled = 1,
+		.sample_period = 100003,
+		.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_ADDR,
 	};
 	u8 result[32];
 	unsigned int i, j;
@@ -852,6 +858,11 @@ static int hermit_ring_test_show(struct seq_file *m, void *unused)
 			perf_event_release_kernel(event);
 			return ret;
 		}
+		/* The production parser requires a complete 32-byte sample. */
+		if (sizeof(struct perf_event_header) + event->header_size +
+		    event->id_header_size != sizeof(struct hermit_pebs_sample) ||
+		    READ_ONCE(event->state) != PERF_EVENT_STATE_OFF)
+			pass = false;
 		hermit_perf_event_release(event);
 	}
 	seq_printf(m, "%s\n", pass ? "pass" : "fail");

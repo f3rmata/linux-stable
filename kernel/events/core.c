@@ -15027,7 +15027,8 @@ int hermit_perf_event_init(struct perf_event *event, unsigned int nr_pages)
 	struct perf_buffer *rb;
 	int ret = 0;
 
-	if (!nr_pages || !is_power_of_2(nr_pages))
+	if (!nr_pages || !is_power_of_2(nr_pages) ||
+	    READ_ONCE(event->state) != PERF_EVENT_STATE_OFF)
 		return -EINVAL;
 
 	mutex_lock(&event->mmap_mutex);
@@ -15040,6 +15041,12 @@ int hermit_perf_event_init(struct perf_event *event, unsigned int nr_pages)
 		ret = -ENOMEM;
 		goto out;
 	}
+	/* Kernel counters bypass the sample-size setup in perf_event_open().
+	 * Keep the event disabled until both sizes and the ring are ready;
+	 * otherwise output reserves only the header, not IP/TID/ADDR payload.
+	 */
+	perf_event__header_size(event);
+	perf_event__id_header_size(event);
 	refcount_set(&rb->mmap_count, 1);
 	ring_buffer_attach(event, rb);
 	perf_event_init_userpage(event);

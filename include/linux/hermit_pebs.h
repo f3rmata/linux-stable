@@ -73,7 +73,7 @@ extern u32 hermit_pebs_hysteresis;	/* permille, default 900 */
 extern u32 hermit_pebs_cooling_period;	/* samples per cooling tick */
 extern u32 hermit_pebs_region_max;
 
-/* kernel/events/core.c: attach a ring buffer to a kernel event. */
+/* Attach a ring to a disabled kernel event; enable only after success. */
 int hermit_perf_event_init(struct perf_event *event, unsigned int nr_pages);
 int hermit_perf_event_set_period(struct perf_event *event, u64 period);
 void hermit_perf_event_release(struct perf_event *event);
