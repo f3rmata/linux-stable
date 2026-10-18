@@ -23,6 +23,7 @@
 #include <linux/psi.h>
 #include <linux/uio.h>
 #include <linux/sched/task.h>
+#include <linux/sched/mm.h>
 #include <linux/delayacct.h>
 #ifdef CONFIG_HERMIT
 #include <linux/hermit.h>
@@ -51,9 +52,10 @@ static void __end_swap_bio_write(struct bio *bio)
 		 * Also clear PG_reclaim to avoid folio_rotate_reclaimable()
 		 */
 		folio_mark_dirty(folio);
-		pr_alert_ratelimited("Write-error on swap-device (%u:%u:%llu)\n",
-				     MAJOR(bio_dev(bio)), MINOR(bio_dev(bio)),
-				     (unsigned long long)bio->bi_iter.bi_sector);
+		pr_alert_ratelimited(
+			"Write-error on swap-device (%u:%u:%llu)\n",
+			MAJOR(bio_dev(bio)), MINOR(bio_dev(bio)),
+			(unsigned long long)bio->bi_iter.bi_sector);
 		folio_clear_reclaim(folio);
 	}
 	folio_end_writeback(folio);
@@ -70,9 +72,10 @@ static void __end_swap_bio_read(struct bio *bio)
 	struct folio *folio = bio_first_folio_all(bio);
 
 	if (bio->bi_status) {
-		pr_alert_ratelimited("Read-error on swap-device (%u:%u:%llu)\n",
-				     MAJOR(bio_dev(bio)), MINOR(bio_dev(bio)),
-				     (unsigned long long)bio->bi_iter.bi_sector);
+		pr_alert_ratelimited(
+			"Read-error on swap-device (%u:%u:%llu)\n",
+			MAJOR(bio_dev(bio)), MINOR(bio_dev(bio)),
+			(unsigned long long)bio->bi_iter.bi_sector);
 	} else {
 		folio_mark_uptodate(folio);
 	}
@@ -86,8 +89,7 @@ static void end_swap_bio_read(struct bio *bio)
 }
 
 int generic_swapfile_activate(struct swap_info_struct *sis,
-				struct file *swap_file,
-				sector_t *span)
+			      struct file *swap_file, sector_t *span)
 {
 	struct address_space *mapping = swap_file->f_mapping;
 	struct inode *inode = mapping->host;
@@ -112,7 +114,7 @@ int generic_swapfile_activate(struct swap_info_struct *sis,
 	page_no = 0;
 	last_block = i_size_read(inode) >> blkbits;
 	while ((probe_block + blocks_per_page) <= last_block &&
-			page_no < sis->max) {
+	       page_no < sis->max) {
 		unsigned block_in_page;
 		sector_t first_block;
 
@@ -132,7 +134,7 @@ int generic_swapfile_activate(struct swap_info_struct *sis,
 		}
 
 		for (block_in_page = 1; block_in_page < blocks_per_page;
-					block_in_page++) {
+		     block_in_page++) {
 			sector_t block;
 
 			block = probe_block + block_in_page;
@@ -148,7 +150,7 @@ int generic_swapfile_activate(struct swap_info_struct *sis,
 		}
 
 		first_block >>= (PAGE_SHIFT - blkbits);
-		if (page_no) {	/* exclude the header page */
+		if (page_no) { /* exclude the header page */
 			if (first_block < lowest_block)
 				lowest_block = first_block;
 			if (first_block > highest_block)
@@ -170,7 +172,7 @@ reprobe:
 	ret = nr_extents;
 	*span = 1 + highest_block - lowest_block;
 	if (page_no == 0)
-		page_no = 1;	/* force Empty message */
+		page_no = 1; /* force Empty message */
 	sis->max = page_no;
 	sis->pages = page_no - 1;
 out:
@@ -248,7 +250,8 @@ static void swap_zeromap_folio_clear(struct folio *folio)
  * them here and get rid of the unnecessary final write.
  */
 static void swap_writepage_order(struct folio *folio,
-		struct swap_iocb **swap_plug, int transfer_order);
+				 struct swap_iocb **swap_plug,
+				 int transfer_order);
 
 int swap_writeout(struct folio *folio, struct swap_iocb **swap_plug)
 {
@@ -256,7 +259,7 @@ int swap_writeout(struct folio *folio, struct swap_iocb **swap_plug)
 }
 
 int swap_writeout_order(struct folio *folio, struct swap_iocb **swap_plug,
-		       int transfer_order)
+			int transfer_order)
 {
 	int ret = 0;
 
@@ -342,7 +345,6 @@ static inline void count_swpout_vm_event(struct folio *folio)
 /* Evaluate while the folio is still mapped and its anon_vma is locked. */
 int hermit_swapout_order(struct folio *folio)
 {
-	struct mem_cgroup *memcg;
 	struct anon_vma *av;
 	struct anon_vma_chain *chain;
 	unsigned long addr;
@@ -355,27 +357,29 @@ int hermit_swapout_order(struct folio *folio)
 			     folio_order(folio));
 	if (READ_ONCE(hermit_pebs_mode) != HERMIT_PEBS_MODE_POLICY)
 		return -1;
-	memcg = get_mem_cgroup_from_folio(folio);
-	if (!memcg)
-		return -1;
 	av = folio_lock_anon_vma_read(folio, NULL);
 	if (av) {
 		anon_vma_interval_tree_foreach(chain, &av->rb_root,
-					     folio->index, folio->index) {
+					       folio->index, folio->index)
+		{
 			struct vm_area_struct *vma = chain->vma;
+			struct mm_struct *mm = vma->vm_mm;
 
 			addr = vma->vm_start +
-				((folio->index - vma->vm_pgoff) << PAGE_SHIFT);
-			order = hermit_order_policy(memcg, vma->vm_mm, addr,
-				folio_order(folio),
-				hermit_backend_transfer_order(folio_order(folio)),
+			       ((folio->index - vma->vm_pgoff) << PAGE_SHIFT);
+			/* Pin the mm while pebs_mm_exit() may run. */
+			mmgrab(mm);
+			order = hermit_order_policy(
+				mm, addr, folio_order(folio),
+				hermit_backend_transfer_order(
+					folio_order(folio)),
 				hermit_backend_effective_order_mask());
+			mmdrop(mm);
 			if (order >= 0)
 				break;
 		}
 		anon_vma_unlock_read(av);
 	}
-	css_put(&memcg->css);
 	return order;
 }
 
@@ -401,9 +405,11 @@ static bool hermit_swap_write_folio(struct folio *folio, int transfer_order)
 	if (transfer_order < 0)
 		transfer_order = hermit_swapout_order(folio);
 	if (transfer_order < 0)
-		transfer_order = hermit_backend_transfer_order(folio_order(folio));
+		transfer_order =
+			hermit_backend_transfer_order(folio_order(folio));
 	io.transfer_order = min_t(unsigned int, transfer_order, io.folio_order);
-	while (!(hermit_backend_effective_order_mask() & BIT(io.transfer_order)))
+	while (!(hermit_backend_effective_order_mask() &
+		 BIT(io.transfer_order)))
 		io.transfer_order--;
 	start_ns = ktime_get_mono_fast_ns();
 	ret = hermit_backend_store(&io);
@@ -468,7 +474,8 @@ static bool hermit_swap_read_folio(struct folio *folio)
 	/* Remote-only slots have no valid local copy. Fail closed. */
 	if (!hermit_backend_ready()) {
 		hermit_backend_account(io.folio_order, false, false, -EIO);
-		hermit_swap_read_complete(folio, ktime_get_mono_fast_ns(), -EIO);
+		hermit_swap_read_complete(folio, ktime_get_mono_fast_ns(),
+					  -EIO);
 		return true;
 	}
 
@@ -537,7 +544,8 @@ int hermit_swap_read_folio_async(struct folio *folio, struct hermit_io *io,
 	*start_ns = ktime_get_mono_fast_ns();
 	ret = hermit_backend_load(io, true);
 	if (ret)
-		hermit_backend_account(io->folio_order, false, io->fallback, ret);
+		hermit_backend_account(io->folio_order, false, io->fallback,
+				       ret);
 	return ret;
 }
 
@@ -586,14 +594,16 @@ static void bio_associate_blkg_from_page(struct bio *bio, struct folio *folio)
 	rcu_read_unlock();
 }
 #else
-#define bio_associate_blkg_from_page(bio, folio)		do { } while (0)
+#define bio_associate_blkg_from_page(bio, folio) \
+	do {                                     \
+	} while (0)
 #endif /* CONFIG_MEMCG && CONFIG_BLK_CGROUP */
 
 struct swap_iocb {
-	struct kiocb		iocb;
-	struct bio_vec		bvec[SWAP_CLUSTER_MAX];
-	int			pages;
-	int			len;
+	struct kiocb iocb;
+	struct bio_vec bvec[SWAP_CLUSTER_MAX];
+	int pages;
+	int len;
 };
 static mempool_t *sio_pool;
 
@@ -677,7 +687,7 @@ static void swap_writepage_fs(struct folio *folio, struct swap_iocb **swap_plug)
 }
 
 static void swap_writepage_bdev_sync(struct folio *folio,
-		struct swap_info_struct *sis)
+				     struct swap_info_struct *sis)
 {
 	struct bio_vec bv;
 	struct bio bio;
@@ -697,7 +707,7 @@ static void swap_writepage_bdev_sync(struct folio *folio,
 }
 
 static void swap_writepage_bdev_async(struct folio *folio,
-		struct swap_info_struct *sis)
+				      struct swap_info_struct *sis)
 {
 	struct bio *bio;
 
@@ -719,7 +729,8 @@ void __swap_writepage(struct folio *folio, struct swap_iocb **swap_plug)
 }
 
 static void swap_writepage_order(struct folio *folio,
-		struct swap_iocb **swap_plug, int transfer_order)
+				 struct swap_iocb **swap_plug,
+				 int transfer_order)
 {
 	struct swap_info_struct *sis = __swap_entry_to_info(folio->swap);
 
@@ -768,7 +779,8 @@ static void sio_read_complete(struct kiocb *iocb, long ret)
 			struct folio *folio = page_folio(sio->bvec[p].bv_page);
 
 			count_mthp_stat(folio_order(folio), MTHP_STAT_SWPIN);
-			count_memcg_folio_events(folio, PSWPIN, folio_nr_pages(folio));
+			count_memcg_folio_events(folio, PSWPIN,
+						 folio_nr_pages(folio));
 			folio_mark_uptodate(folio);
 			folio_unlock(folio);
 		}
@@ -796,7 +808,7 @@ static bool swap_read_folio_zeromap(struct folio *folio)
 	 * that an IO error is emitted (e.g. do_swap_page() will sigbus).
 	 */
 	if (WARN_ON_ONCE(swap_zeromap_batch(folio->swap, nr_pages,
-			&is_zeromap) != nr_pages))
+					    &is_zeromap) != nr_pages))
 		return true;
 
 	if (!is_zeromap)
@@ -849,7 +861,7 @@ static void swap_read_folio_fs(struct folio *folio, struct swap_iocb **plug)
 }
 
 static void swap_read_folio_bdev_sync(struct folio *folio,
-		struct swap_info_struct *sis)
+				      struct swap_info_struct *sis)
 {
 	struct bio_vec bv;
 	struct bio bio;
@@ -871,7 +883,7 @@ static void swap_read_folio_bdev_sync(struct folio *folio,
 }
 
 static void swap_read_folio_bdev_async(struct folio *folio,
-		struct swap_info_struct *sis)
+				       struct swap_info_struct *sis)
 {
 	struct bio *bio;
 
