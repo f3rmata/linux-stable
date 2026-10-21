@@ -3,17 +3,16 @@
 #define _LINUX_HERMIT_PEBS_H
 
 #include <linux/types.h>
-#include <linux/list.h>
-#include <linux/spinlock.h>
 #include <asm/page.h>
 
 struct mm_struct;
+struct vm_fault;
 struct perf_event;
 struct dentry;
 
 /*
  * PEBS events (Intel, Intel SDM Vol.3B):
- *  0x1d3  MEM_LOAD_RETIRED.L3_MISS    (PEBS-LL: DLA + latency + data source)
+ *  0x1d3  MEM_LOAD_L3_MISS_RETIRED.LOCAL_DRAM (Cascade Lake encoding)
  *  0x82d0 MEM_INST_RETIRED.ALL_STORES (DLA)
  */
 #define HERMIT_PEBS_L3_MISS 0x1d3
@@ -32,42 +31,28 @@ struct dentry;
 
 enum hermit_pebs_mode {
 	HERMIT_PEBS_MODE_STATIC = 0, /* keep remote_order_mask behaviour */
-	HERMIT_PEBS_MODE_POLICY = 1, /* per-folio transfer order policy */
-};
-
-/* Two cooling-clock periods without a touch: the region bitmap is reset. */
-#define HERMIT_PEBS_STALE_CLOCKS 2
-
-struct hermit_region {
-	struct hlist_node hnode;
-	struct list_head lru;
-	unsigned long vaddr; /* region aligned */
-	u32 cooling_clock; /* state cooling_clock at last touch */
-	u64 touched[HERMIT_REGION_WORDS];
+	HERMIT_PEBS_MODE_POLICY = 1, /* fault-PC swap-in folio policy */
 };
 
 #define HERMIT_PEBS_BUCKETS 256
 #define HERMIT_PEBS_MAX_REGIONS 32768
 
-struct hermit_pebs_state {
-	spinlock_t lock;
-	struct hlist_head buckets[HERMIT_PEBS_BUCKETS];
-	struct list_head lru;
-	unsigned int nr_regions;
-	u32 cooling_clock;
-	unsigned long nr_samples;
+/* Snapshot interface reserved for future cold-page/swap-out policies. */
+struct hermit_pebs_observation {
+	u64 start_ns, end_ns;
+	u64 load[HERMIT_REGION_WORDS], store[HERMIT_REGION_WORDS];
 };
 
 /* Tunables (debugfs), defaults from Hermit measurements. */
 extern u32 hermit_pebs_enabled; /* master switch */
 extern u32 hermit_pebs_all; /* track every mm, no cgroup required */
 extern u32 hermit_pebs_mode; /* enum hermit_pebs_mode */
-extern u32 hermit_pebs_force_order; /* 0 = off, else forced transfer order */
-extern u32 hermit_pebs_fixed_cost_ns; /* per-WR fixed cost, default 7000 */
+extern u32 hermit_pebs_force_order; /* 0 = off, else forced swap-in folio order */
+extern u32 hermit_pebs_fixed_cost_ns; /* per-read fixed cost, default 7000 */
 extern u32 hermit_pebs_bw_mibps; /* link bandwidth MiB/s, default 12288 */
-extern u32 hermit_pebs_min_f; /* min f in permille, default 50 */
+extern u32 hermit_pebs_min_f; /* deprecated; ignored */
 extern u32 hermit_pebs_hysteresis; /* permille, default 900 */
-extern u32 hermit_pebs_cooling_period; /* samples per cooling tick */
+extern u32 hermit_pebs_cooling_period; /* deprecated; ignored */
 extern u32 hermit_pebs_region_max;
 
 /* Attach a ring to a disabled kernel event; enable only after success. */
@@ -84,15 +69,13 @@ void hermit_pebs_debugfs_init(struct dentry *root);
 void hermit_pebs_mm_exit(struct mm_struct *mm);
 void hermit_pebs_mm_enable(struct mm_struct *mm, bool enable);
 
-/*
- * Pick the transfer order for a folio covering
- * [addr, addr + 2^folio_order * PAGE_SIZE).
- * Returns the order (0..folio_order) or -1 when no sampled data is
- * available / policy disabled; the caller then falls back to the
- * static remote_order_mask behaviour.
- */
-int hermit_order_policy(struct mm_struct *mm, unsigned long addr,
-			unsigned int folio_order, unsigned int cur_order,
-			unsigned long allowed_mask);
+/* -1 means policy disabled for this mm; unknown evidence selects order 0. */
+int hermit_swapin_order(struct mm_struct *mm, unsigned long addr,
+		       unsigned long pc, unsigned long candidates);
+void hermit_pebs_fault(struct mm_struct *mm, unsigned long addr,
+		       unsigned long pc, u64 time);
+void hermit_pebs_swapin_result(struct vm_fault *vmf, unsigned int order);
+bool hermit_pebs_snapshot(struct mm_struct *mm, unsigned long addr,
+			  struct hermit_pebs_observation *out);
 
 #endif /* _LINUX_HERMIT_PEBS_H */

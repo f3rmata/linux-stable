@@ -342,45 +342,16 @@ static inline void count_swpout_vm_event(struct folio *folio)
  */
 #define HERMIT_LAZY_POLL_DEADLINE_NS (100ULL * NSEC_PER_MSEC)
 
-/* Evaluate while the folio is still mapped and its anon_vma is locked. */
+/* Preserve the entire folio; use the largest supported write segment.
+ * Future cold-page merging can consult hermit_pebs_snapshot() before unmap.
+ * The swap-in predictor and force-order override never affect write sizing.
+ */
 int hermit_swapout_order(struct folio *folio)
 {
-	struct anon_vma *av;
-	struct anon_vma_chain *chain;
-	unsigned long addr;
-	int order = -1;
+	unsigned int order = min_t(unsigned int, folio_order(folio), PMD_ORDER);
+	unsigned long mask = hermit_backend_effective_order_mask() & ~BIT(1);
 
-	if (!READ_ONCE(hermit_pebs_enabled) || !folio_test_anon(folio))
-		return -1;
-	if (READ_ONCE(hermit_pebs_force_order))
-		return min_t(unsigned int, READ_ONCE(hermit_pebs_force_order),
-			     folio_order(folio));
-	if (READ_ONCE(hermit_pebs_mode) != HERMIT_PEBS_MODE_POLICY)
-		return -1;
-	av = folio_lock_anon_vma_read(folio, NULL);
-	if (av) {
-		anon_vma_interval_tree_foreach(chain, &av->rb_root,
-					       folio->index, folio->index)
-		{
-			struct vm_area_struct *vma = chain->vma;
-			struct mm_struct *mm = vma->vm_mm;
-
-			addr = vma->vm_start +
-			       ((folio->index - vma->vm_pgoff) << PAGE_SHIFT);
-			/* Pin the mm while pebs_mm_exit() may run. */
-			mmgrab(mm);
-			order = hermit_order_policy(
-				mm, addr, folio_order(folio),
-				hermit_backend_transfer_order(
-					folio_order(folio)),
-				hermit_backend_effective_order_mask());
-			mmdrop(mm);
-			if (order >= 0)
-				break;
-		}
-		anon_vma_unlock_read(av);
-	}
-	return order;
+	return fls_long((mask | BIT(0)) & (BIT(order + 1) - 1)) - 1;
 }
 
 static bool hermit_swap_write_folio(struct folio *folio, int transfer_order)

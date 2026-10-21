@@ -74,6 +74,7 @@
 #include <linux/hermit_backend.h>
 #include <linux/hermit_stats.h>
 #include <linux/hermit_pebs.h>
+#include <linux/ptrace.h>
 #include <linux/memcontrol.h>
 #endif
 #include <linux/dax.h>
@@ -4602,29 +4603,6 @@ static struct folio *alloc_swap_folio(struct vm_fault *vmf)
 	if (hermit_backend_entry_order(entry) == PMD_ORDER &&
 	    (hermit_backend_effective_order_mask() & BIT(PMD_ORDER)))
 		candidate_orders |= BIT(PMD_ORDER);
-	/*
-	 * PEBS policy: cap the swap-in folio size at the transfer order the
-	 * policy chose for this region (or the forced order), so that the
-	 * read amplification of a single fault stays within the model.
-	 */
-	if (hermit_backend_entry_remote(entry) && hermit_pebs_enabled &&
-	    (hermit_pebs_mode == HERMIT_PEBS_MODE_POLICY ||
-	     hermit_pebs_force_order)) {
-		unsigned int extent_order =
-			max(0, hermit_backend_entry_order(entry));
-		int o = -1;
-
-		if (hermit_pebs_force_order)
-			o = min_t(unsigned int, hermit_pebs_force_order,
-				  extent_order);
-		else
-			o = hermit_order_policy(
-				vma->vm_mm, vmf->address, extent_order,
-				extent_order,
-				hermit_backend_effective_order_mask());
-		if (o >= 0 && (unsigned int)o < PMD_ORDER)
-			candidate_orders &= (1UL << (o + 1)) - 1;
-	}
 #endif
 	/*
 	 * Get a list of enabled large orders suitable for swapping in a THP.
@@ -4644,9 +4622,8 @@ static struct folio *alloc_swap_folio(struct vm_fault *vmf)
 	if (unlikely(!pte))
 		goto fallback;
 
-	/*
-	 * For do_swap_page, find the highest order where the aligned range is
-	 * completely swap entries with contiguous swap offsets.
+	/* The first valid aligned range also validates all smaller remaining
+	 * candidates: each is a subset with the same contiguous swap offsets.
 	 */
 	order = highest_order(orders);
 	while (orders) {
@@ -4657,6 +4634,21 @@ static struct folio *alloc_swap_folio(struct vm_fault *vmf)
 	}
 
 	pte_unmap_unlock(pte, ptl);
+
+#ifdef CONFIG_HERMIT
+	/* PEBS policy: choose the folio, leaving read-side WR splitting alone. */
+	if (hermit_backend_entry_remote(entry)) {
+		int selected = hermit_swapin_order(vma->vm_mm, vmf->address,
+						  vmf->hermit_fault_pc, orders);
+
+		if (selected >= 0) {
+			vmf->hermit_policy_used = true;
+			vmf->hermit_policy_order = selected;
+			orders &= (BIT(selected + 1) - 1) & ~BIT(0);
+		}
+	}
+#endif
+	order = highest_order(orders);
 
 	/* Try allocating the highest of the remaining orders. */
 	gfp = vma_thp_gfp_mask(vma);
@@ -4738,6 +4730,9 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	bool hermit_read_pending = false;
 	bool hermit_swap_fault = false;
 	bool hermit_major_fault = false;
+	bool hermit_remote_fault = false;
+	u64 hermit_observe_start_ns = READ_ONCE(hermit_pebs_enabled) &&
+		vmf->hermit_fault_pc ? ktime_get_ns() : 0;
 #endif
 
 	if (!pte_unmap_same(vmf))
@@ -4806,6 +4801,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 		goto out;
 #ifdef CONFIG_HERMIT
 	hermit_swap_fault = true;
+	hermit_remote_fault = hermit_backend_entry_remote(entry);
 #endif
 
 	folio = swap_cache_get_folio(entry);
@@ -5210,6 +5206,13 @@ check_folio:
 	VM_BUG_ON(!folio_test_anon(folio) ||
 		  (pte_write(pte) && !PageAnonExclusive(page)));
 	set_ptes(vma->vm_mm, address, ptep, pte, nr_pages);
+#ifdef CONFIG_HERMIT
+	if (hermit_remote_fault) {
+		hermit_pebs_fault(vma->vm_mm, vmf->address, vmf->hermit_fault_pc,
+				  hermit_observe_start_ns);
+		hermit_pebs_swapin_result(vmf, folio_order(folio));
+	}
+#endif
 	arch_do_swap_page_nr(vma->vm_mm, vma, address, pte, pte, nr_pages);
 
 	folio_unlock(folio);
@@ -6504,9 +6507,16 @@ unlock:
  * and __folio_lock_or_retry().
  */
 static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
-				    unsigned long address, unsigned int flags)
+				    unsigned long address, unsigned int flags,
+				    struct pt_regs *regs)
 {
 	struct vm_fault vmf = {
+#ifdef CONFIG_HERMIT
+		.hermit_fault_pc = regs && (flags & FAULT_FLAG_USER) &&
+			!(flags & (FAULT_FLAG_REMOTE | FAULT_FLAG_INSTRUCTION)) &&
+			current->mm == vma->vm_mm && user_mode(regs) ?
+			instruction_pointer(regs) : 0,
+#endif
 		.vma = vma,
 		.address = address & PAGE_MASK,
 		.real_address = address,
@@ -6764,7 +6774,7 @@ vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
 	if (unlikely(is_vm_hugetlb_page(vma)))
 		ret = hugetlb_fault(vma->vm_mm, vma, address, flags);
 	else
-		ret = __handle_mm_fault(vma, address, flags);
+		ret = __handle_mm_fault(vma, address, flags, regs);
 
 	/*
 	 * Warning: It is no longer safe to dereference vma-> after this point,
