@@ -539,7 +539,7 @@ struct folio *read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
 	return folio;
 }
 
-static unsigned int __swapin_nr_pages(unsigned long prev_offset,
+unsigned int swapin_readahead_pages(unsigned long prev_offset,
 				      unsigned long offset,
 				      int hits,
 				      int max_pages,
@@ -590,7 +590,7 @@ static unsigned long swapin_nr_pages(unsigned long offset)
 		return 1;
 
 	hits = atomic_xchg(&swapin_readahead_hits, 0);
-	pages = __swapin_nr_pages(READ_ONCE(prev_offset), offset, hits,
+	pages = swapin_readahead_pages(READ_ONCE(prev_offset), offset, hits,
 				  max_pages,
 				  atomic_read(&last_readahead_pages));
 	if (!hits)
@@ -689,7 +689,7 @@ static int swap_vma_ra_win(struct vm_fault *vmf, unsigned long *start,
 	prev_faddr = SWAP_RA_ADDR(ra_val);
 	prev_win = SWAP_RA_WIN(ra_val);
 	hits = SWAP_RA_HITS(ra_val);
-	win = __swapin_nr_pages(PFN_DOWN(prev_faddr), PFN_DOWN(faddr), hits,
+	win = swapin_readahead_pages(PFN_DOWN(prev_faddr), PFN_DOWN(faddr), hits,
 				max_win, prev_win);
 	atomic_long_set(&vma->swap_readahead_info, SWAP_RA_VAL(faddr, win, 0));
 	if (win == 1)

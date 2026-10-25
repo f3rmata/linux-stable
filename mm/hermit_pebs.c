@@ -112,6 +112,7 @@ struct hermit_pc_entry {
 	u16 offset;
 	u64 epoch;
 	struct hermit_pc_history history;
+	struct hermit_readahead readahead;
 };
 
 struct hermit_pebs_state {
@@ -126,7 +127,8 @@ struct hermit_pebs_state {
 
 enum hermit_policy_counter {
 	HPC_COMPLETED, HPC_EXPIRED, HPC_LATE, HPC_PC_HIT, HPC_EVIDENCE,
-	HPC_ALLOC_FAIL, HPC_EVICT, HPC_FALLBACK, HPC_FORCED, HPC_NR,
+	HPC_ALLOC_FAIL, HPC_EVICT, HPC_FALLBACK, HPC_FORCED,
+	HPC_PEBS, HPC_READAHEAD, HPC_RA_FEEDBACK, HPC_RA_HITS, HPC_NR,
 };
 static atomic_long_t hermit_policy_counters[HPC_NR];
 static atomic_long_t hermit_actual_orders[HERMIT_PEBS_MAX_ORDER + 1];
@@ -134,6 +136,7 @@ static const char * const hermit_policy_names[HPC_NR] = {
 	"windows_completed", "history_expired", "samples_late_or_untracked",
 	"pc_hit", "insufficient_evidence", "metadata_alloc_failed",
 	"table_evictions", "allocation_fallback", "forced",
+	"pebs_selected", "readahead_selected", "readahead_feedback", "readahead_hits",
 };
 
 static bool hermit_pebs_tracks(struct mm_struct *mm)
@@ -195,6 +198,7 @@ static struct hermit_pc_entry *hermit_pc_get(struct hermit_pebs_state *st,
 			continue;
 		if (p->epoch != hermit_state_epoch(st)) {
 			memset(&p->history, 0, sizeof(p->history));
+			memset(&p->readahead, 0, sizeof(p->readahead));
 			p->history.last_order = -1;
 			p->epoch = hermit_state_epoch(st);
 		}
@@ -830,9 +834,85 @@ static struct hermit_cost_params hermit_cost_params_read(void)
 	};
 }
 
-int hermit_swapin_order(struct mm_struct *mm, unsigned long addr,
-		       unsigned long pc, unsigned long candidates)
+/* Called without the state lock or a PTL. The fault holds its VMA stable.
+ * Inspect at most one previously installed, PMD-contained PTE range. Check
+ * PFNs to reject reclaimed/remapped ranges; never clear live accessed bits.
+ */
+static bool hermit_readahead_hits(struct vm_area_struct *vma,
+		const struct hermit_readahead *ra, unsigned int *hits)
 {
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *ptes;
+	spinlock_t *ptl;
+	unsigned int i;
+	bool valid = false;
+
+	*hits = 0;
+	if (!ra->nr_pages || ra->nr_pages > HERMIT_REGION_NR_SUBPAGES ||
+	    ra->vma_start != vma->vm_start || ra->vma_end != vma->vm_end ||
+	    ra->start < vma->vm_start || ra->start >= vma->vm_end ||
+	    ra->nr_pages > (vma->vm_end - ra->start) / PAGE_SIZE ||
+	    pte_index(ra->start) + ra->nr_pages > PTRS_PER_PTE)
+		return false;
+	pgd = pgd_offset(vma->vm_mm, ra->start);
+	if (pgd_none(*pgd) || pgd_bad(*pgd))
+		return false;
+	p4d = p4d_offset(pgd, ra->start);
+	if (p4d_none(*p4d) || p4d_bad(*p4d))
+		return false;
+	pud = pud_offset(p4d, ra->start);
+	if (pud_none(*pud) || pud_leaf(*pud) || pud_bad(*pud))
+		return false;
+	pmd = pmd_offset(pud, ra->start);
+	ptes = pte_offset_map_lock(vma->vm_mm, pmd, ra->start, &ptl);
+	if (!ptes)
+		return false;
+	for (i = 0; i < ra->nr_pages; i++) {
+		pte_t pte = ptep_get(ptes + i);
+
+		if (!pte_present(pte) || pte_pfn(pte) != ra->pfn + i)
+			goto out;
+		if (ra->start + i * PAGE_SIZE != ra->fault_addr && pte_young(pte))
+			(*hits)++;
+	}
+	valid = true;
+out:
+	pte_unmap_unlock(ptes, ptl);
+	return valid;
+}
+
+static int hermit_readahead_order(struct vm_fault *vmf,
+		struct hermit_pebs_state *st, unsigned long candidates,
+		unsigned long wr_mask, u64 now, u64 ttl)
+{
+	struct hermit_readahead ra = {};
+	struct hermit_pc_entry *p;
+	unsigned int hits = 0;
+
+	spin_lock(&st->lock);
+	p = hermit_pc_get(st, vmf->hermit_fault_pc, HERMIT_PC_RA_OFFSET, false);
+	if (p)
+		ra = p->readahead;
+	spin_unlock(&st->lock);
+	if (ra.nr_pages && now >= ra.time_ns && now - ra.time_ns < ttl &&
+	    hermit_readahead_hits(vmf->vma, &ra, &hits)) {
+		atomic_long_inc(&hermit_policy_counters[HPC_RA_FEEDBACK]);
+		atomic_long_add(hits, &hermit_policy_counters[HPC_RA_HITS]);
+	} else {
+		memset(&ra, 0, sizeof(ra));
+		hits = 0;
+	}
+	atomic_long_inc(&hermit_policy_counters[HPC_READAHEAD]);
+	return hermit_readahead_choose(&ra, vmf->address, hits, candidates, wr_mask);
+}
+
+int hermit_swapin_order(struct vm_fault *vmf, unsigned long candidates)
+{
+	struct mm_struct *mm = vmf->vma->vm_mm;
+	unsigned long addr = vmf->address, pc = vmf->hermit_fault_pc;
 	struct hermit_pebs_state *st;
 	struct hermit_pc_entry *p;
 	struct hermit_cost_params params;
@@ -842,6 +922,7 @@ int hermit_swapin_order(struct mm_struct *mm, unsigned long addr,
 	bool confident = false;
 	int best = 0;
 
+	vmf->hermit_policy_time = 0;
 	if (!READ_ONCE(hermit_pebs_enabled))
 		return -1;
 	force = READ_ONCE(hermit_pebs_force_order);
@@ -855,11 +936,16 @@ int hermit_swapin_order(struct mm_struct *mm, unsigned long addr,
 	}
 	if (!hermit_pebs_tracks(mm) || READ_ONCE(hermit_pebs_mode) != HERMIT_PEBS_MODE_POLICY)
 		return -1;
-	st = READ_ONCE(mm->hermit_pebs);
-	if (!pc || !st || !READ_ONCE(hermit_pebs_window_ms))
+	if (!pc || !READ_ONCE(hermit_pebs_window_ms))
 		goto unknown;
 	params = hermit_cost_params_read();
+	if (!params.ttl_ns)
+		goto unknown;
+	st = hermit_pebs_state_get(mm);
+	if (!st)
+		goto unknown;
 	now = ktime_get_ns();
+	vmf->hermit_policy_time = now;
 	wr_mask = hermit_backend_effective_order_mask();
 	spin_lock(&st->lock);
 	hermit_windows_finish(st, now);
@@ -882,6 +968,10 @@ int hermit_swapin_order(struct mm_struct *mm, unsigned long addr,
 		p->history.last_order = confident ? best : -1;
 	}
 	spin_unlock(&st->lock);
+	if (confident)
+		atomic_long_inc(&hermit_policy_counters[HPC_PEBS]);
+	else
+		best = hermit_readahead_order(vmf, st, candidates, wr_mask, now, params.ttl_ns);
 unknown:
 	if (!confident) {
 		atomic_long_inc(&hermit_order_unknown);
@@ -892,8 +982,12 @@ account:
 	return best;
 }
 
-void hermit_pebs_swapin_result(struct vm_fault *vmf, unsigned int order)
+void hermit_pebs_swapin_result(struct vm_fault *vmf, unsigned int order,
+		unsigned long start, unsigned long pfn, unsigned int nr_pages)
 {
+	struct hermit_pebs_state *st;
+	struct hermit_pc_entry *p;
+
 	if (order > HERMIT_PEBS_MAX_ORDER ||
 	    (!hermit_pebs_tracks(vmf->vma->vm_mm) &&
 	     !(READ_ONCE(hermit_pebs_enabled) && READ_ONCE(hermit_pebs_force_order))))
@@ -901,6 +995,28 @@ void hermit_pebs_swapin_result(struct vm_fault *vmf, unsigned int order)
 	atomic_long_inc(&hermit_actual_orders[order]);
 	if (vmf->hermit_policy_used && order != vmf->hermit_policy_order)
 		atomic_long_inc(&hermit_policy_counters[HPC_FALLBACK]);
+	/* Train only after successful PTE installation, using actual allocation
+	 * size. Failed/retried faults and force/static/off do not train this path.
+	 */
+	if (!vmf->hermit_policy_time ||
+	    READ_ONCE(hermit_pebs_mode) != HERMIT_PEBS_MODE_POLICY)
+		return;
+	st = READ_ONCE(vmf->vma->vm_mm->hermit_pebs);
+	if (!st)
+		return;
+	spin_lock(&st->lock);
+	if (vmf->hermit_policy_time < hermit_state_epoch(st))
+		goto out;
+	p = hermit_pc_get(st, vmf->hermit_fault_pc, HERMIT_PC_RA_OFFSET, true);
+	if (p && vmf->hermit_policy_time >= p->readahead.time_ns)
+		p->readahead = (struct hermit_readahead) {
+			.time_ns = vmf->hermit_policy_time,
+			.start = start, .pfn = pfn, .nr_pages = nr_pages,
+			.fault_addr = vmf->address,
+			.vma_start = vmf->vma->vm_start, .vma_end = vmf->vma->vm_end,
+		};
+out:
+	spin_unlock(&st->lock);
 }
 
 /* ---------- syscalls ---------- */

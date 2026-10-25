@@ -69,12 +69,12 @@ void hermit_pebs_debugfs_init(struct dentry *root);
 void hermit_pebs_mm_exit(struct mm_struct *mm);
 void hermit_pebs_mm_enable(struct mm_struct *mm, bool enable);
 
-/* -1 means policy disabled for this mm; unknown evidence selects order 0. */
-int hermit_swapin_order(struct mm_struct *mm, unsigned long addr,
-		       unsigned long pc, unsigned long candidates);
+/* -1 means disabled; sparse PEBS evidence uses swap readahead feedback. */
+int hermit_swapin_order(struct vm_fault *vmf, unsigned long candidates);
 void hermit_pebs_fault(struct mm_struct *mm, unsigned long addr,
 		       unsigned long pc, u64 time);
-void hermit_pebs_swapin_result(struct vm_fault *vmf, unsigned int order);
+void hermit_pebs_swapin_result(struct vm_fault *vmf, unsigned int order,
+		unsigned long start, unsigned long pfn, unsigned int nr_pages);
 bool hermit_pebs_snapshot(struct mm_struct *mm, unsigned long addr,
 			  struct hermit_pebs_observation *out);
 

@@ -8,6 +8,9 @@ struct swap_iocb;
 
 extern int page_cluster;
 
+unsigned int swapin_readahead_pages(unsigned long prev_offset,
+		unsigned long offset, int hits, int max_pages, int prev_win);
+
 #ifdef CONFIG_THP_SWAP
 #define SWAPFILE_CLUSTER	HPAGE_PMD_NR
 #define swap_entry_order(order)	(order)

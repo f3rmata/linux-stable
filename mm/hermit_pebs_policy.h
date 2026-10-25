@@ -5,8 +5,46 @@
 #include <linux/hermit_pebs.h>
 #include <linux/math64.h>
 #include <linux/string.h>
+#include "swap.h"
 
 #define HERMIT_PC_HISTORY 8
+
+/* Separate PC-table key: readahead must span different fault offsets. */
+#define HERMIT_PC_RA_OFFSET HERMIT_REGION_NR_SUBPAGES
+
+struct hermit_readahead {
+	u64 time_ns;
+	unsigned long start, pfn, fault_addr, vma_start, vma_end;
+	unsigned int nr_pages;
+};
+
+/* Native hits+2, power-of-two growth and half-window decay. The legal folio
+ * sizes replace page-cluster's limit; the native swap path keeps its limit.
+ * Only measured young non-demand PTEs count as hits, never an assumed scan.
+ */
+static inline int hermit_readahead_choose(const struct hermit_readahead *ra,
+		unsigned long addr, unsigned int hits, unsigned long candidates,
+		unsigned long wr_mask)
+{
+	unsigned long legal = (candidates & wr_mask &
+		(BIT(HERMIT_PEBS_MAX_ORDER + 1) - 1) & ~BIT(1)) | BIT(0);
+	unsigned long prev = ra->fault_addr >> PAGE_SHIFT;
+	unsigned long fault_pfn = addr >> PAGE_SHIFT;
+	unsigned int max_pages = 1U << (fls_long(legal) - 1);
+	unsigned int pages;
+
+	pages = swapin_readahead_pages(prev, fault_pfn,
+			ra->nr_pages ? hits : 4, max_pages, ra->nr_pages);
+	/* The native half-window floor can exceed a newly reduced ceiling. */
+	pages = min(pages, max_pages);
+	/* There is no anonymous order-1 THP. Let adjacent base-page faults
+	 * probe the smallest large folio; otherwise floor the prediction.
+	 */
+	if (pages == 2 && ra->nr_pages == 1 &&
+	    (fault_pfn == prev + 1 || prev == fault_pfn + 1) && (legal & BIT(2)))
+		pages = 4;
+	return fls_long(legal & (BIT(fls(pages)) - 1)) - 1;
+}
 
 /* Half-open event-time window; collection may continue until close_ns. */
 struct hermit_footprint_window {

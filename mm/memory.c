@@ -4638,8 +4638,7 @@ static struct folio *alloc_swap_folio(struct vm_fault *vmf)
 #ifdef CONFIG_HERMIT
 	/* PEBS policy: choose the folio, leaving read-side WR splitting alone. */
 	if (hermit_backend_entry_remote(entry)) {
-		int selected = hermit_swapin_order(vma->vm_mm, vmf->address,
-						  vmf->hermit_fault_pc, orders);
+		int selected = hermit_swapin_order(vmf, orders);
 
 		if (selected >= 0) {
 			vmf->hermit_policy_used = true;
@@ -4679,6 +4678,28 @@ static struct folio *alloc_swap_folio(struct vm_fault *vmf)
 static DECLARE_WAIT_QUEUE_HEAD(swapcache_wq);
 
 #ifdef CONFIG_HERMIT
+static void hermit_set_swapin_ptes(struct vm_fault *vmf, unsigned long addr,
+		pte_t *ptep, pte_t pte, unsigned int nr)
+{
+	struct mm_struct *mm = vmf->vma->vm_mm;
+	unsigned int demand = (vmf->address - addr) >> PAGE_SHIFT;
+
+	if (!vmf->hermit_policy_time || nr == 1) {
+		set_ptes(mm, addr, ptep, pte, nr);
+		return;
+	}
+	/* Prefetched PTEs start old so hardware accesses supply real feedback.
+	 * Install each PTE once: rewriting it could lose a concurrent dirty bit.
+	 */
+	if (demand)
+		set_ptes(mm, addr, ptep, pte_mkold(pte), demand);
+	set_ptes(mm, vmf->address, ptep + demand,
+		 pte_mkyoung(pte_advance_pfn(pte, demand)), 1);
+	if (demand + 1 < nr)
+		set_ptes(mm, vmf->address + PAGE_SIZE, ptep + demand + 1,
+			 pte_mkold(pte_advance_pfn(pte, demand + 1)), nr - demand - 1);
+}
+
 static int hermit_direct_swapin(struct folio *folio, struct hermit_io *io,
 				bool *pending, u64 *start_ns)
 {
@@ -5205,13 +5226,16 @@ check_folio:
 
 	VM_BUG_ON(!folio_test_anon(folio) ||
 		  (pte_write(pte) && !PageAnonExclusive(page)));
-	set_ptes(vma->vm_mm, address, ptep, pte, nr_pages);
 #ifdef CONFIG_HERMIT
+	hermit_set_swapin_ptes(vmf, address, ptep, pte, nr_pages);
 	if (hermit_remote_fault) {
 		hermit_pebs_fault(vma->vm_mm, vmf->address, vmf->hermit_fault_pc,
 				  hermit_observe_start_ns);
-		hermit_pebs_swapin_result(vmf, folio_order(folio));
+		hermit_pebs_swapin_result(vmf, folio_order(folio),
+					 address, pte_pfn(pte), nr_pages);
 	}
+#else
+	set_ptes(vma->vm_mm, address, ptep, pte, nr_pages);
 #endif
 	arch_do_swap_page_nr(vma->vm_mm, vma, address, pte, pte, nr_pages);
 

@@ -625,6 +625,7 @@ static inline bool fault_flag_allow_retry_first(enum fault_flag flags)
 struct vm_fault {
 #ifdef CONFIG_HERMIT
 	unsigned long hermit_fault_pc;
+	u64 hermit_policy_time;
 	unsigned int hermit_policy_order;
 	bool hermit_policy_used;
 #endif
