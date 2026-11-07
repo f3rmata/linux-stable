@@ -53,6 +53,7 @@
  */
 
 #include <linux/mm.h>
+#include <linux/hermit_policy.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/task.h>
 #include <linux/pagemap.h>
@@ -723,6 +724,32 @@ static bool should_defer_flush(struct mm_struct *mm, enum ttu_flags flags)
 	return arch_tlbbatch_should_defer(mm);
 }
 
+#ifdef CONFIG_HERMIT
+/* A cleared accessed bit only needs to reach other CPUs before the observation
+ * interval ends, so join reclaim's unmap batch; shrink_folio_list() flushes it
+ * once per pass. Writable state is unchanged: no try_to_unmap_flush_dirty().
+ */
+void hermit_policy_defer_flush(struct vm_area_struct *vma, unsigned long addr)
+{
+	struct tlbflush_unmap_batch *tlb_ubc = &current->tlb_ubc;
+
+	/* Only reclaim (PF_MEMALLOC) is guaranteed to flush the batch soon. */
+	if (!(current->flags & PF_MEMALLOC)) {
+		flush_tlb_page(vma, addr);
+		return;
+	}
+	arch_tlbbatch_add_pending(&tlb_ubc->arch, vma->vm_mm, addr, addr + PAGE_SIZE);
+	tlb_ubc->flush_required = true;
+}
+#endif
+#elif defined(CONFIG_HERMIT)
+void hermit_policy_defer_flush(struct vm_area_struct *vma, unsigned long addr)
+{
+	flush_tlb_page(vma, addr);
+}
+#endif
+#ifdef CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
+
 /*
  * Reclaim unmaps pages under the PTL but do not flush the TLB prior to
  * releasing the PTL if TLB flushes are batched. It's possible for a parallel
@@ -895,11 +922,13 @@ static bool folio_referenced_one(struct folio *folio,
 		}
 
 		if (lru_gen_enabled() && pvmw.pte) {
+			hermit_policy_observe(folio, vma, address, false, false);
 			if (lru_gen_look_around(&pvmw))
 				referenced++;
 		} else if (pvmw.pte) {
-			if (ptep_clear_flush_young_notify(vma, address,
-						pvmw.pte))
+			bool young = ptep_clear_flush_young_notify(vma, address, pvmw.pte);
+
+			if (young)
 				referenced++;
 		} else if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE)) {
 			if (pmdp_clear_flush_young_notify(vma, address,

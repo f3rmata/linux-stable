@@ -6,12 +6,36 @@
 
 struct folio;
 struct dentry;
+struct hermit_backend_ops;
+
+#define HERMIT_BATCH_MAX 16
+/* Base pages one fault may predict; split into HERMIT_BATCH_MAX SG batches
+ * that are all in flight before the fault polls the first one.
+ */
+#define HERMIT_SWAPIN_MAX 64
+
+/* Each member owns one locked, charged base page until poll completes. */
+struct hermit_batch {
+	struct folio *folios[HERMIT_BATCH_MAX];
+	swp_entry_t entries[HERMIT_BATCH_MAX];
+	unsigned long offsets[HERMIT_BATCH_MAX];
+	unsigned long addresses[HERMIT_BATCH_MAX];
+	int status[HERMIT_BATCH_MAX];
+	unsigned int nr;
+	int cpu, srcu_idx;
+	bool write;
+	void *private;
+	const struct hermit_backend_ops *backend;
+};
 
 struct hermit_io {
 	swp_entry_t entry;
 	struct folio *folio;
 	unsigned int folio_order;
 	unsigned int transfer_order;
+	unsigned long remote_offset;
+	const struct hermit_backend_ops *backend;
+	int srcu_idx;
 	int cpu;
 	bool fallback;
 	void *private;
@@ -19,6 +43,9 @@ struct hermit_io {
 
 struct hermit_backend_ops {
 	unsigned long supported_order_mask;
+	unsigned long capacity_pages;
+	/* Maximum physically contiguous remote range (power of two). */
+	unsigned long boundary_pages;
 	int (*load)(struct hermit_io *io, bool async);
 	/*
 	 * store() must make every page of io->folio durably remote before
@@ -30,7 +57,14 @@ struct hermit_backend_ops {
 	 */
 	int (*store)(struct hermit_io *io);
 	int (*poll)(struct hermit_io *io, bool wait);
+	int (*submit_batch)(struct hermit_batch *batch);
+	int (*poll_batch)(struct hermit_batch *batch, bool wait);
 };
+
+int hermit_backend_prepare_batch(struct hermit_batch *batch);
+int hermit_backend_submit_batch(struct hermit_batch *batch);
+int hermit_backend_poll_batch(struct hermit_batch *batch, bool wait);
+int hermit_backend_offset(swp_entry_t entry, unsigned long *offset);
 
 int hermit_register_backend(const struct hermit_backend_ops *ops);
 void hermit_unregister_backend(const struct hermit_backend_ops *ops);

@@ -197,6 +197,9 @@ static inline void swap_read_unplug(struct swap_iocb *plug)
 		__swap_read_unplug(plug);
 }
 #ifdef CONFIG_HERMIT
+struct hermit_batch;
+void hermit_swap_write_batch(struct hermit_batch *batch);
+struct folio *hermit_swapin_pages(swp_entry_t entry, gfp_t gfp, struct vm_fault *vmf);
 int hermit_swapout_order(struct folio *folio);
 struct hermit_io;
 int hermit_swap_read_folio_async(struct folio *folio, struct hermit_io *io,

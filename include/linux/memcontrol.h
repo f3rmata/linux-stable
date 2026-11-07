@@ -213,6 +213,8 @@ struct mem_cgroup {
 #ifdef CONFIG_HERMIT
 	/* Optional memory.max-driven proactive reclaim; MEMCG-only file. */
 	struct hmt_reclaim_work hermit_reclaim_work[HMT_MAX_NR_STHDS];
+	atomic64_t hermit_stream_until;
+	atomic_t hermit_refault;
 #endif
 
 #ifdef CONFIG_ZSWAP

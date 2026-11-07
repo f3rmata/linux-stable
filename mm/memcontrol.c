@@ -79,6 +79,9 @@
 
 #ifdef CONFIG_HERMIT
 #include <linux/hermit.h>
+#include <linux/hermit_policy.h>
+#include <linux/hermit_pebs.h>
+#include <linux/hermit_reclaim.h>
 #include <linux/hermit_stats.h>
 #endif
 
@@ -1335,9 +1338,23 @@ static unsigned long mem_cgroup_margin(struct mem_cgroup *memcg)
 }
 
 #ifdef CONFIG_HERMIT
-static unsigned long hermit_reclaim_headroom(void)
+static struct hmt_reclaim_watermarks
+hermit_reclaim_watermarks(struct mem_cgroup *memcg)
 {
-	return hmt_ctl_var(HMT_RECLAIM_HEADROOM_PAGES);
+	/* Opt-in only (policy_features RESERVE): replacing the configured
+	 * headroom silently changed the reclaim experiment under policy.
+	 */
+	if (hermit_policy_reserve_mode()) {
+		unsigned long reserve = hermit_policy_reserve(memcg);
+
+		return (struct hmt_reclaim_watermarks) {
+			.low = reserve / 2, .high = reserve,
+		};
+	}
+	return hmt_reclaim_watermarks(
+		hmt_ctl_var(HMT_RECLAIM_HEADROOM_PAGES),
+		hmt_ctl_var(HMT_RECLAIM_STOP_HEADROOM_PAGES),
+		READ_ONCE(memcg->memory.max));
 }
 
 static u32 hermit_reclaim_nr_workers(void)
@@ -1356,6 +1373,8 @@ static void hermit_reclaim_workfn(struct work_struct *work)
 	unsigned long headroom;
 	unsigned int attempts = 0;
 	bool made_progress = false;
+	unsigned long flags;
+	bool put = false;
 
 	while (hmt_ctl_flag(HMT_APT_RECLAIM) &&
 	       attempts++ < MAX_RECLAIM_RETRIES) {
@@ -1364,7 +1383,7 @@ static void hermit_reclaim_workfn(struct work_struct *work)
 		unsigned long nr_reclaimed;
 		u32 nr_workers;
 
-		headroom = hermit_reclaim_headroom();
+		headroom = hermit_reclaim_watermarks(memcg).high;
 		if (!headroom || margin >= headroom)
 			break;
 
@@ -1388,23 +1407,28 @@ static void hermit_reclaim_workfn(struct work_struct *work)
 	 * inside its headroom.  When the chain ends, release the css
 	 * reference taken at schedule time so mem_cgroup_css_free can run.
 	 */
-	headroom = hermit_reclaim_headroom();
+	headroom = hermit_reclaim_watermarks(memcg).high;
+	spin_lock_irqsave(&hwork->lock, flags);
 	if (made_progress && hmt_ctl_flag(HMT_APT_RECLAIM) && headroom &&
+	    !css_is_dying(&memcg->css) &&
 	    mem_cgroup_margin(memcg) < headroom &&
-	    hwork->requeues < HMT_MAX_RECLAIM_REQUEUES) {
+	    hwork->requeues < HMT_MAX_RECLAIM_REQUEUES &&
+	    queue_work(system_unbound_wq, &hwork->work)) {
 		hwork->requeues++;
-		queue_work(system_unbound_wq, &hwork->work);
-	} else if (hwork->css_ref) {
+	} else {
+		put = hwork->css_ref;
 		hwork->css_ref = false;
 		hwork->requeues = 0;
-		css_put(&memcg->css);
 	}
+	spin_unlock_irqrestore(&hwork->lock, flags);
+	if (put)
+		css_put(&memcg->css);
 }
 
 static void hermit_schedule_reclaim(struct mem_cgroup *memcg)
 {
 	unsigned long max = READ_ONCE(memcg->memory.max);
-	unsigned long headroom = hermit_reclaim_headroom();
+	unsigned long headroom = hermit_reclaim_watermarks(memcg).low;
 	u32 nr_workers, i;
 
 	if (!hmt_ctl_flag(HMT_APT_RECLAIM) || mem_cgroup_is_root(memcg) ||
@@ -1413,21 +1437,28 @@ static void hermit_schedule_reclaim(struct mem_cgroup *memcg)
 		return;
 
 	nr_workers = hermit_reclaim_nr_workers();
+	/* A small reserve must not launch one minimum-size scan per CPU. */
+	if (hermit_policy_reserve_mode())
+		nr_workers = 1;
 	for (i = 0; i < nr_workers; i++) {
 		struct hmt_reclaim_work *hwork = &memcg->hermit_reclaim_work[i];
 
-		/*
-		 * Keep the cgroup alive for the whole work chain: the workfn
-		 * dereferences memcg and may re-queue itself, and css_free's
-		 * cancel_work_sync must never race a live chain.  The ref is
-		 * released by the workfn when the chain stops.
-		 */
-		if (!hwork->css_ref) {
+		unsigned long flags;
+		bool put = false;
+
+		/* One reference per entire work chain, serialized with termination. */
+		spin_lock_irqsave(&hwork->lock, flags);
+		if (!hwork->css_ref && css_tryget_online(&memcg->css)) {
 			hwork->css_ref = true;
 			hwork->requeues = 0;
-			css_get(&memcg->css);
+			if (!queue_work(system_unbound_wq, &hwork->work)) {
+				hwork->css_ref = false;
+				put = true;
+			}
 		}
-		queue_work(system_unbound_wq, &hwork->work);
+		spin_unlock_irqrestore(&hwork->lock, flags);
+		if (put)
+			css_put(&memcg->css);
 	}
 }
 #else
@@ -3877,6 +3908,7 @@ static struct mem_cgroup *mem_cgroup_alloc(struct mem_cgroup *parent)
 	INIT_WORK(&memcg->high_work, high_work_func);
 #ifdef CONFIG_HERMIT
 	for (i = 0; i < HMT_MAX_NR_STHDS; i++) {
+		spin_lock_init(&memcg->hermit_reclaim_work[i].lock);
 		INIT_WORK(&memcg->hermit_reclaim_work[i].work,
 			  hermit_reclaim_workfn);
 		memcg->hermit_reclaim_work[i].memcg = memcg;

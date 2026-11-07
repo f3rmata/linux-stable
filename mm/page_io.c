@@ -410,6 +410,63 @@ static bool hermit_swap_write_folio(struct folio *folio, int transfer_order)
 	return true;
 }
 
+/* All members are unmapped, isolated, locked order-0 swapcache folios.
+ * Keep their locks and isolation references until DMA and publication finish.
+ * Failures retain dirty resident data; the next pass can use native writeout.
+ */
+void hermit_swap_write_batch(struct hermit_batch *batch)
+{
+	unsigned int i;
+	int ret = 0;
+	u64 start = ktime_get_ns();
+
+	batch->cpu = raw_smp_processor_id();
+	batch->write = true;
+	for (i = 0; i < batch->nr; i++) {
+		struct folio *f = batch->folios[i];
+
+		if (arch_prepare_to_swap(f)) {
+			ret = -EIO;
+			break;
+		}
+	}
+	if (!ret) {
+		for (i = 0; i < batch->nr; i++) {
+			hermit_backend_invalidate(batch->entries[i]);
+			zswap_invalidate(batch->entries[i]);
+			swap_zeromap_folio_clear(batch->folios[i]);
+			folio_start_writeback(batch->folios[i]);
+		}
+		ret = hermit_backend_prepare_batch(batch);
+		if (!ret)
+			ret = hermit_backend_submit_batch(batch);
+		if (!ret)
+			ret = hermit_backend_poll_batch(batch, true);
+	}
+	for (i = 0; i < batch->nr; i++) {
+		struct folio *f = batch->folios[i];
+		int err = ret ?: batch->status[i];
+
+		if (!err)
+			err = hermit_backend_commit_remote(batch->entries[i], 0);
+		if (err) {
+			hermit_backend_abort_remote(batch->entries[i], 0);
+			folio_mark_dirty(f);
+			hermit_stat_inc(HMT_STAT_BACKEND_ERROR);
+		} else {
+			count_swpout_vm_event(f);
+			hermit_stat_inc(HMT_STAT_BACKEND_STORE);
+			hermit_stat_inc(HMT_STAT_SWAPOUT);
+		}
+		batch->status[i] = err;
+		hermit_backend_account(0, true, false, err);
+		folio_clear_reclaim(f);
+		if (folio_test_writeback(f))
+			folio_end_writeback(f);
+	}
+	hermit_latency_add(HMT_LAT_BACKEND_WRITE, ktime_get_ns() - start);
+}
+
 static void hermit_swap_read_complete(struct folio *folio, u64 start_ns,
 				      int ret)
 {

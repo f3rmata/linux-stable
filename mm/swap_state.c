@@ -8,6 +8,10 @@
  *  Rewritten to use page cache, (C) 1998 Stephen Tweedie
  */
 #include <linux/mm.h>
+#include <linux/hermit_backend.h>
+#include <linux/hermit_policy.h>
+#include <linux/hermit_stats.h>
+#include <linux/ktime.h>
 #include <linux/gfp.h>
 #include <linux/kernel_stat.h>
 #include <linux/mempolicy.h>
@@ -799,6 +803,177 @@ skip:
 		swap_read_folio(folio, NULL);
 	return folio;
 }
+
+#ifdef CONFIG_HERMIT
+/* Snapshot (or recheck) a forward run of swap PTEs under one PTE lock while
+ * the fault keeps its VMA alive. The run is PMD-contained, so one PTE page
+ * covers it. Returns the length of the leading run of valid swap PTEs.
+ */
+static unsigned int hermit_swap_ptes(struct vm_fault *vmf, unsigned long start,
+		unsigned int nr, pte_t *values)
+{
+	spinlock_t *ptl;
+	pte_t *pte;
+	unsigned int i;
+
+	unsigned int valid;
+
+	/* Slots past the valid run never compare pte_same() with a swap PTE. */
+	for (i = 0; i < nr; i++)
+		values[i] = __pte(0);
+	pte = pte_offset_map_lock(vmf->vma->vm_mm, vmf->pmd, start, &ptl);
+	if (!pte)
+		return 0;
+	for (i = 0; i < nr; i++) {
+		values[i] = ptep_get(pte + i);
+		if (!is_swap_pte(values[i]) || non_swap_entry(pte_to_swp_entry(values[i])))
+			break;
+	}
+	valid = i;
+	for (; i < nr; i++)
+		values[i] = __pte(0);
+	pte_unmap_unlock(pte, ptl);
+	return valid;
+}
+
+/* Complete one polled batch. Page 0 of batch 0 is the demand page. */
+static void hermit_swapin_finish(struct hermit_batch *batch, int ret,
+		const bool *stale, bool first)
+{
+	unsigned int i;
+
+	for (i = 0; i < batch->nr; i++) {
+		struct folio *f = batch->folios[i];
+		bool demand = first && !i;
+		int err = ret ?: batch->status[i];
+
+		if (!demand && stale[i]) {
+			/* No PTE was installed; remove the unused speculative charge. */
+			swap_cache_del_folio(f);
+			folio_unlock(f);
+		} else if (err) {
+			/* Also handles partial submission failures at base-page granularity.
+			 * The remote mapping remains authoritative, never read stale disk.
+			 */
+			swap_read_folio(f, NULL);
+		} else {
+			folio_mark_uptodate(f);
+			count_vm_event(PSWPIN);
+			count_memcg_folio_events(f, PSWPIN, 1);
+			hermit_stat_inc(HMT_STAT_BACKEND_LOAD);
+			hermit_backend_account(0, false, false, 0);
+			if (!demand) {
+				folio_set_readahead(f);
+				count_vm_event(SWAP_RA);
+			}
+			folio_unlock(f);
+		}
+		if (!demand)
+			folio_put(f);
+	}
+}
+
+#define HERMIT_SWAPIN_BATCHES (HERMIT_SWAPIN_MAX / HERMIT_BATCH_MAX)
+
+struct hermit_swapin_work {
+	struct hermit_batch batches[HERMIT_SWAPIN_BATCHES];
+	pte_t snapshots[HERMIT_SWAPIN_MAX], now[HERMIT_SWAPIN_MAX];
+};
+
+struct folio *hermit_swapin_pages(swp_entry_t entry, gfp_t gfp, struct vm_fault *vmf)
+{
+	struct hermit_swapin_work *w;
+	struct hermit_batch *batch, one;
+	struct folio *demand = NULL;
+	struct mempolicy *mpol;
+	pte_t *snapshots, *now, demand_pte[2];
+	bool stale[HERMIT_BATCH_MAX];
+	int ret[HERMIT_SWAPIN_BATCHES];
+	unsigned long start = vmf->address & PAGE_MASK, end;
+	unsigned int i, b, nr = hermit_policy_predict(vmf), count = 0, nr_batches;
+	pgoff_t ilx;
+	bool allocated;
+	u64 time;
+
+	/* Batches and PTE snapshots are ~5 KiB: keep them off the fault stack.
+	 * Without memory, still read the demand page through one batch.
+	 */
+	w = kmalloc(sizeof(*w), GFP_NOIO | __GFP_NOWARN);
+	if (w) {
+		batch = w->batches;
+		snapshots = w->snapshots;
+		now = w->now;
+	} else {
+		batch = &one;
+		snapshots = &demand_pte[0];
+		now = &demand_pte[1];
+		nr = 1;
+	}
+	/* Clip to the VMA and the PMD before touching any PTE. */
+	end = min3(vmf->vma->vm_end, (start | (PMD_SIZE - 1)) + 1,
+		   start + (unsigned long)clamp_t(unsigned int, nr, 1, HERMIT_SWAPIN_MAX) * PAGE_SIZE);
+	nr = hermit_swap_ptes(vmf, start, (end - start) >> PAGE_SHIFT, snapshots);
+	/* Demand PTE changed under us: let do_swap_page() retry the fault. */
+	if (!nr || pte_to_swp_entry(snapshots[0]).val != entry.val)
+		goto out;
+	memset(batch, 0, DIV_ROUND_UP(nr, HERMIT_BATCH_MAX) * sizeof(*batch));
+
+	for (i = 0; i < nr; i++) {
+		unsigned long addr = start + i * PAGE_SIZE;
+		struct hermit_batch *cur = &batch[count / HERMIT_BATCH_MAX];
+		struct folio *f;
+		swp_entry_t next = pte_to_swp_entry(snapshots[i]);
+		gfp_t flags = i ? (gfp & ~__GFP_DIRECT_RECLAIM) | __GFP_NORETRY | __GFP_NOWARN : gfp;
+
+		if (swp_type(next) != swp_type(entry) || !hermit_backend_entry_remote(next))
+			break;
+		mpol = get_vma_policy(vmf->vma, addr, 0, &ilx);
+		f = __read_swap_cache_async(next, flags, mpol, ilx, &allocated, i != 0);
+		mpol_cond_put(mpol);
+		if (!f)
+			break;
+		if (!i)
+			demand = f;
+		if (!allocated) {
+			if (i)
+				folio_put(f);
+			break;
+		}
+		cur->folios[cur->nr] = f;
+		cur->entries[cur->nr] = next;
+		cur->addresses[cur->nr++] = addr;
+		count++;
+	}
+	if (!count)
+		goto out;
+	nr_batches = DIV_ROUND_UP(count, HERMIT_BATCH_MAX);
+	time = ktime_get_ns();
+	/* Every batch is in flight before the fault waits on the first. */
+	for (b = 0; b < nr_batches; b++) {
+		batch[b].cpu = raw_smp_processor_id();
+		ret[b] = hermit_backend_submit_batch(&batch[b]);
+	}
+	for (b = 0; b < nr_batches; b++)
+		if (!ret[b])
+			ret[b] = hermit_backend_poll_batch(&batch[b], true);
+	/* One PTE-lock pass after completion decides which speculative pages
+	 * became stale while their reads were in flight.
+	 */
+	hermit_swap_ptes(vmf, start, count, now);
+	for (b = 0; b < nr_batches; b++) {
+		for (i = 0; i < batch[b].nr; i++) {
+			unsigned int k = b * HERMIT_BATCH_MAX + i;
+
+			stale[i] = !pte_same(now[k], snapshots[k]);
+		}
+		hermit_swapin_finish(&batch[b], ret[b], stale, !b);
+	}
+	hermit_latency_add(HMT_LAT_BACKEND_READ, ktime_get_ns() - time);
+out:
+	kfree(w);
+	return demand;
+}
+#endif
 
 /**
  * swapin_readahead - swap in pages in hope we need them soon

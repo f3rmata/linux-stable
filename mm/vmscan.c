@@ -60,6 +60,8 @@
 #include <linux/parser.h>
 #ifdef CONFIG_HERMIT
 #include <linux/hermit_stats.h>
+#include <linux/hermit_backend.h>
+#include <linux/hermit_policy.h>
 #endif
 
 #include <asm/tlbflush.h>
@@ -1108,13 +1110,60 @@ static bool may_enter_fs(struct folio *folio, gfp_t gfp_mask)
 	return !data_race(folio_swap_flags(folio) & SWP_FS_OPS);
 }
 
+#ifdef CONFIG_HERMIT
+static unsigned int hermit_reclaim_batch_finish(struct hermit_batch *batch,
+		struct scan_control *sc, struct reclaim_stat *stat,
+		struct list_head *ret_folios, struct folio_batch *free_folios)
+{
+	unsigned int i, reclaimed = 0;
+
+	if (!batch->nr)
+		return 0;
+	/* Assign the new remote extent in virtual-address order so subsequent
+	 * sequential reads can combine adjacent selected pages without padding.
+	 */
+	for (i = 1; i < batch->nr; i++) {
+		unsigned int j = i;
+
+		while (j && batch->addresses[j] < batch->addresses[j - 1]) {
+			swap(batch->addresses[j], batch->addresses[j - 1]);
+			swap(batch->entries[j], batch->entries[j - 1]);
+			swap(batch->folios[j], batch->folios[j - 1]);
+			j--;
+		}
+	}
+	hermit_swap_write_batch(batch);
+	for (i = 0; i < batch->nr; i++) {
+		struct folio *f = batch->folios[i];
+
+		if (!batch->status[i])
+			stat->nr_pageout++;
+		if (!folio_test_dirty(f) &&
+		    __remove_mapping(folio_mapping(f), f, true, sc->target_mem_cgroup)) {
+			folio_unlock(f);
+			reclaimed++;
+			if (!folio_batch_add(free_folios, f)) {
+				mem_cgroup_uncharge_folios(free_folios);
+				try_to_unmap_flush();
+				free_unref_folios(free_folios);
+			}
+		} else {
+			folio_unlock(f);
+			list_add(&f->lru, ret_folios);
+		}
+	}
+	batch->nr = 0;
+	return reclaimed;
+}
+#endif
+
 /*
  * shrink_folio_list() returns the number of reclaimed pages
  */
 static unsigned int shrink_folio_list(struct list_head *folio_list,
 		struct pglist_data *pgdat, struct scan_control *sc,
 		struct reclaim_stat *stat, bool ignore_references,
-		struct mem_cgroup *memcg)
+		struct mem_cgroup *memcg, bool lru_gen_reclaim)
 {
 	struct folio_batch free_folios;
 	LIST_HEAD(ret_folios);
@@ -1123,11 +1172,19 @@ static unsigned int shrink_folio_list(struct list_head *folio_list,
 	unsigned int pgactivate = 0;
 	bool do_demote_pass;
 	struct swap_iocb *plug = NULL;
+#ifdef CONFIG_HERMIT
+	struct hermit_batch hbatch = {};
+	struct hermit_reclaim_hint batch_hint = {};
+#endif
 
 	folio_batch_init(&free_folios);
 	memset(stat, 0, sizeof(*stat));
 	cond_resched();
 	do_demote_pass = can_demote(pgdat->node_id, sc, memcg);
+#ifdef CONFIG_HERMIT
+	/* Rank the tail window once per pass, not once per dequeued folio. */
+	hermit_policy_sort(folio_list, lru_gen_reclaim);
+#endif
 
 retry:
 	while (!list_empty(folio_list)) {
@@ -1137,6 +1194,9 @@ retry:
 		bool dirty, writeback;
 		unsigned int nr_pages;
 		int transfer_order = -1;
+#ifdef CONFIG_HERMIT
+		struct hermit_reclaim_hint hint = {};
+#endif
 
 		cond_resched();
 
@@ -1403,6 +1463,10 @@ retry:
 			if (folio_test_large(folio))
 				flags |= TTU_SYNC;
 
+#ifdef CONFIG_HERMIT
+			/* One rmap walk reads the hint and records the ghost. */
+			hermit_policy_eviction(folio, &hint, lru_gen_reclaim);
+#endif
 			transfer_order = hermit_swapout_order(folio);
 			try_to_unmap(folio, flags);
 			if (folio_mapped(folio)) {
@@ -1467,6 +1531,28 @@ retry:
 			 * starts and then write it out here.
 			 */
 			try_to_unmap_flush_dirty();
+#ifdef CONFIG_HERMIT
+			if ((hint.cold || hint.mglru) && hint.owner && !folio_test_large(folio) &&
+			    hermit_policy_feature(HERMIT_POLICY_BATCH) &&
+			    folio_test_swapcache(folio) && is_page_cache_freeable(folio) &&
+			    hermit_backend_ready()) {
+				if (hbatch.nr && (hbatch.nr == HERMIT_BATCH_MAX ||
+				    hint.owner != batch_hint.owner ||
+				    hint.generation != batch_hint.generation ||
+				    hint.start != batch_hint.start || hint.end != batch_hint.end ||
+				    swp_type(folio->swap) != swp_type(hbatch.entries[0])))
+					nr_reclaimed += hermit_reclaim_batch_finish(&hbatch,
+						sc, stat, &ret_folios, &free_folios);
+				if (folio_clear_dirty_for_io(folio)) {
+					batch_hint = hint;
+					hbatch.folios[hbatch.nr] = folio;
+					hbatch.addresses[hbatch.nr] = hint.address;
+					hbatch.entries[hbatch.nr++] = folio->swap;
+					folio_set_reclaim(folio);
+					continue;
+				}
+			}
+#endif
 			switch (pageout(folio, mapping, &plug, folio_list, transfer_order)) {
 			case PAGE_KEEP:
 				goto keep_locked;
@@ -1615,6 +1701,10 @@ keep:
 		VM_BUG_ON_FOLIO(folio_test_lru(folio) ||
 				folio_test_unevictable(folio), folio);
 	}
+#ifdef CONFIG_HERMIT
+	nr_reclaimed += hermit_reclaim_batch_finish(&hbatch, sc, stat,
+						  &ret_folios, &free_folios);
+#endif
 	/* 'folio_list' is always empty here */
 
 	/* Migrate folios selected for demotion */
@@ -1697,7 +1787,7 @@ unsigned int reclaim_clean_pages_from_list(struct zone *zone,
 	 */
 	noreclaim_flag = memalloc_noreclaim_save();
 	nr_reclaimed = shrink_folio_list(&clean_folios, zone->zone_pgdat, &sc,
-					&stat, true, NULL);
+					&stat, true, NULL, false);
 	memalloc_noreclaim_restore(noreclaim_flag);
 
 	list_splice(&clean_folios, folio_list);
@@ -2069,7 +2159,7 @@ static unsigned long shrink_inactive_list(unsigned long nr_to_scan,
 		return 0;
 
 	nr_reclaimed = shrink_folio_list(&folio_list, pgdat, sc, &stat, false,
-					 lruvec_memcg(lruvec));
+					 lruvec_memcg(lruvec), false);
 
 	spin_lock_irq(&lruvec->lru_lock);
 	move_folios_to_lru(lruvec, &folio_list);
@@ -2234,6 +2324,10 @@ static void shrink_active_list(unsigned long nr_to_scan,
 	lru_note_cost_unlock_irq(lruvec, file, 0, nr_rotated);
 	trace_mm_vmscan_lru_shrink_active(pgdat->node_id, nr_taken, nr_activate,
 			nr_deactivate, nr_rotated, sc->priority, file);
+#ifdef CONFIG_HERMIT
+	/* Flush accessed-bit clears queued by hermit_policy_observe(). */
+	try_to_unmap_flush();
+#endif
 }
 
 static unsigned int reclaim_folio_list(struct list_head *folio_list,
@@ -2250,7 +2344,7 @@ static unsigned int reclaim_folio_list(struct list_head *folio_list,
 		.no_demotion = 1,
 	};
 
-	nr_reclaimed = shrink_folio_list(folio_list, pgdat, &sc, &stat, true, NULL);
+	nr_reclaimed = shrink_folio_list(folio_list, pgdat, &sc, &stat, true, NULL, false);
 	while (!list_empty(folio_list)) {
 		folio = lru_to_folio(folio_list);
 		list_del(&folio->lru);
@@ -4762,7 +4856,11 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
 	if (list_empty(&list))
 		return scanned;
 retry:
-	reclaimed = shrink_folio_list(&list, pgdat, sc, &stat, false, memcg);
+	/* Isolation clears the folio generation bits. Carry the origin explicitly;
+	 * generic reclaim and ignore_references callers are not MGLRU candidates.
+	 * shrink_folio_list() still performs its normal reference check.
+	 */
+	reclaimed = shrink_folio_list(&list, pgdat, sc, &stat, false, memcg, true);
 	sc->nr.unqueued_dirty += stat.nr_unqueued_dirty;
 	sc->nr_reclaimed += reclaimed;
 	trace_mm_vmscan_lru_shrink_inactive(pgdat->node_id,
@@ -5225,6 +5323,10 @@ static void lru_gen_change_state(bool enabled)
 	if (enabled == lru_gen_enabled())
 		goto unlock;
 
+#ifdef CONFIG_HERMIT
+	hermit_policy_lru_changed();
+#endif
+
 	if (enabled)
 		static_branch_enable_cpuslocked(&lru_gen_caps[LRU_GEN_CORE]);
 	else
@@ -5255,6 +5357,10 @@ static void lru_gen_change_state(bool enabled)
 
 		cond_resched();
 	} while ((memcg = mem_cgroup_iter(NULL, memcg, NULL)));
+#ifdef CONFIG_HERMIT
+	/* Also invalidate intervals opened while the lists were transitioning. */
+	hermit_policy_lru_changed();
+#endif
 unlock:
 	mutex_unlock(&state_mutex);
 	put_online_mems();

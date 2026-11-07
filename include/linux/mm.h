@@ -628,6 +628,7 @@ struct vm_fault {
 	u64 hermit_policy_time;
 	unsigned int hermit_policy_order;
 	bool hermit_policy_used;
+	bool hermit_policy_large;	/* long stream: keep largest legal folio */
 #endif
 	const struct {
 		struct vm_area_struct *vma;	/* Target VMA */

@@ -45,6 +45,7 @@
 #include <linux/mm.h>
 #ifdef CONFIG_HERMIT
 #include <linux/hermit_pebs.h>
+#include <linux/hermit_policy.h>
 #endif
 #include <linux/mm_inline.h>
 #include <linux/memblock.h>
@@ -705,6 +706,7 @@ void __mmdrop(struct mm_struct *mm)
 #ifdef CONFIG_HERMIT
 	/* Last mm_count reference: no policy lookup can still hold mmgrab. */
 	hermit_pebs_mm_exit(mm);
+	hermit_policy_mm_exit(mm);
 #endif
 
 	free_mm(mm);
@@ -1065,6 +1067,8 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	mm->locked_vm = 0;
 #ifdef CONFIG_HERMIT
 	mm->hermit_pebs = NULL;
+	mm->hermit_policy = NULL;
+	atomic64_set(&mm->hermit_vma_generation, 1);
 	mm->hermit_pebs_enabled = false;
 #endif
 	atomic64_set(&mm->pinned_vm, 0);

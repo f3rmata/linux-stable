@@ -4,6 +4,7 @@
 
 #include <linux/compiler.h>
 #include <linux/types.h>
+#include <linux/spinlock_types.h>
 #include <linux/workqueue.h>
 
 struct mem_cgroup;
@@ -20,6 +21,7 @@ struct mem_cgroup;
 #define HMT_MAX_RECLAIM_REQUEUES 8
 
 struct hmt_reclaim_work {
+	spinlock_t lock;
 	struct work_struct work;
 	struct mem_cgroup *memcg;
 	/* Self-requeues performed in the current chain. */
@@ -46,6 +48,7 @@ enum hmt_ctl_var_type {
 	HMT_STHD_CNT,
 	HMT_RECLAIM_MODE,
 	HMT_RECLAIM_HEADROOM_PAGES,
+	HMT_RECLAIM_STOP_HEADROOM_PAGES,
 	NUM_HMT_CTL_VARS,
 };
 

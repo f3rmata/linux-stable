@@ -1246,6 +1246,8 @@ struct mm_struct {
 		 * reference is gone.
 		 */
 		struct hermit_pebs_state *hermit_pebs;
+		struct hermit_policy_state *hermit_policy;
+		atomic64_t hermit_vma_generation;
 		bool hermit_pebs_enabled;
 #endif
 	} __randomize_layout;

@@ -44,6 +44,7 @@ struct hermit_pebs_observation {
 };
 
 /* Tunables (debugfs), defaults from Hermit measurements. */
+extern u64 hermit_pebs_epoch;
 extern u32 hermit_pebs_enabled; /* master switch */
 extern u32 hermit_pebs_all; /* track every mm, no cgroup required */
 extern u32 hermit_pebs_mode; /* enum hermit_pebs_mode */
@@ -70,6 +71,7 @@ void hermit_pebs_mm_exit(struct mm_struct *mm);
 void hermit_pebs_mm_enable(struct mm_struct *mm, bool enable);
 
 /* -1 means disabled; sparse PEBS evidence uses swap readahead feedback. */
+unsigned int hermit_pebs_predict_pages(struct vm_fault *vmf);
 int hermit_swapin_order(struct vm_fault *vmf, unsigned long candidates);
 void hermit_pebs_fault(struct mm_struct *mm, unsigned long addr,
 		       unsigned long pc, u64 time);

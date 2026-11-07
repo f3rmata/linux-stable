@@ -3,6 +3,7 @@
 #include <linux/hermit.h>
 #include <linux/hermit_backend.h>
 #include <linux/hermit_pebs.h>
+#include <linux/hermit_policy.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
 
@@ -19,6 +20,7 @@ static const char *const hmt_ctl_var_names[NUM_HMT_CTL_VARS] = {
 	"sthd_cnt",
 	"reclaim_mode",
 	"reclaim_headroom_pages",
+	"reclaim_stop_headroom_pages",
 };
 
 static int __init hermit_init(void)
@@ -47,6 +49,7 @@ static int __init hermit_init(void)
 #endif
 	hermit_backend_debugfs_init(root);
 	hermit_pebs_debugfs_init(root);
+	hermit_policy_debugfs_init(root);
 	return 0;
 }
 subsys_initcall(hermit_init);

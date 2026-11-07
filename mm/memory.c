@@ -74,6 +74,7 @@
 #include <linux/hermit_backend.h>
 #include <linux/hermit_stats.h>
 #include <linux/hermit_pebs.h>
+#include <linux/hermit_policy.h>
 #include <linux/ptrace.h>
 #include <linux/memcontrol.h>
 #endif
@@ -2054,6 +2055,10 @@ void unmap_page_range(struct mmu_gather *tlb, struct vm_area_struct *vma,
 	unsigned long next;
 
 	BUG_ON(addr >= end);
+#ifdef CONFIG_HERMIT
+	/* munmap, MADV_DONTNEED and friends: drop only this range's history. */
+	hermit_policy_unmap(vma, addr, end);
+#endif
 	tlb_start_vma(tlb, vma);
 	pgd = pgd_offset(vma->vm_mm, addr);
 	do {
@@ -4519,7 +4524,7 @@ static bool can_swapin_thp(struct vm_fault *vmf, pte_t *ptep, int nr_pages)
 		return false;
 
 #ifdef CONFIG_HERMIT
-	/* A large remote read must be covered by one committed extent. */
+	/* Legacy large-folio allocation also requires actual remote adjacency. */
 	{
 		bool any_remote = false;
 		int i;
@@ -4530,9 +4535,18 @@ static bool can_swapin_thp(struct vm_fault *vmf, pte_t *ptep, int nr_pages)
 				any_remote = true;
 				break;
 			}
-		if (any_remote &&
-		    !hermit_backend_range_remote(entry, ilog2(nr_pages)))
-			return false;
+		if (any_remote) {
+			unsigned long first, offset;
+
+			if (!hermit_backend_range_remote(entry, ilog2(nr_pages)) ||
+			    hermit_backend_offset(entry, &first))
+				return false;
+			for (i = 1; i < nr_pages; i++)
+				if (hermit_backend_offset(swp_entry(swp_type(entry),
+						 swp_offset(entry) + i), &offset) ||
+				    offset != first + i)
+					return false;
+		}
 	}
 #endif
 
@@ -4636,8 +4650,11 @@ static struct folio *alloc_swap_folio(struct vm_fault *vmf)
 	pte_unmap_unlock(pte, ptl);
 
 #ifdef CONFIG_HERMIT
-	/* PEBS policy: choose the folio, leaving read-side WR splitting alone. */
-	if (hermit_backend_entry_remote(entry)) {
+	/* PEBS policy: choose the folio, leaving read-side WR splitting alone.
+	 * A long base-page stream already proved it consumes whole ranges, so
+	 * it keeps the largest legal candidate.
+	 */
+	if (hermit_backend_entry_remote(entry) && !vmf->hermit_policy_large) {
 		int selected = hermit_swapin_order(vmf, orders);
 
 		if (selected >= 0) {
@@ -4676,6 +4693,31 @@ static struct folio *alloc_swap_folio(struct vm_fault *vmf)
 #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
 
 static DECLARE_WAIT_QUEUE_HEAD(swapcache_wq);
+
+#ifdef CONFIG_HERMIT
+/*
+ * Can alloc_swap_folio() return anything but a base page here? Mirrors its
+ * uffd, zswap and THP order filters; extent and PTE checks still run later.
+ * Without this, a long stream under a 4 KiB ceiling would leave the batched
+ * path for a "large" path that can only read one base page per fault.
+ */
+static bool hermit_swapin_large_allowed(struct vm_fault *vmf)
+{
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+	struct vm_area_struct *vma = vmf->vma;
+	unsigned long orders;
+
+	if (unlikely(userfaultfd_armed(vma)) || !zswap_never_enabled())
+		return false;
+	orders = thp_vma_allowable_orders(vma, vma->vm_flags, TVA_PAGEFAULT,
+					  BIT(PMD_ORDER + 1) - 1);
+	orders = thp_vma_suitable_orders(vma, vmf->address, orders);
+	return orders & ~BIT(0);
+#else
+	return false;
+#endif
+}
+#endif
 
 #ifdef CONFIG_HERMIT
 static void hermit_set_swapin_ptes(struct vm_fault *vmf, unsigned long addr,
@@ -4837,6 +4879,21 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	if (!folio) {
 		bool synchronous_direct =
 			data_race(si->flags & SWP_SYNCHRONOUS_IO);
+#ifdef CONFIG_HERMIT
+		/* Long sequential streams keep the legacy large-folio read, which
+		 * needs one WR per contiguous extent; everything else uses 4 KiB
+		 * predicted SG batches. The large path is only taken when this
+		 * VMA can actually allocate a folio larger than 4 KiB.
+		 */
+		if (hermit_remote_fault && hermit_policy_active(vma->vm_mm) &&
+		    hermit_policy_feature(HERMIT_POLICY_SWAPIN) &&
+		    !(vmf->hermit_policy_large = hermit_swapin_large_allowed(vmf) &&
+					       hermit_policy_large(vmf))) {
+			folio = hermit_swapin_pages(entry, GFP_HIGHUSER_MOVABLE, vmf);
+			swapcache = folio;
+			goto swapin_allocated;
+		}
+#endif
 #ifdef CONFIG_HERMIT
 		/*
 		 * Hermit direct swap-in does not access the native swap device:
@@ -5229,6 +5286,7 @@ check_folio:
 #ifdef CONFIG_HERMIT
 	hermit_set_swapin_ptes(vmf, address, ptep, pte, nr_pages);
 	if (hermit_remote_fault) {
+		hermit_policy_installed(vmf, page_to_pfn(page), address, nr_pages);
 		hermit_pebs_fault(vma->vm_mm, vmf->address, vmf->hermit_fault_pc,
 				  hermit_observe_start_ns);
 		hermit_pebs_swapin_result(vmf, folio_order(folio),

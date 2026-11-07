@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/mm.h>
+#include <linux/hermit_policy.h>
 #include <linux/gfp.h>
 #include <linux/hugetlb.h>
 #include <asm/pgalloc.h>
@@ -451,6 +452,9 @@ int ptep_test_and_clear_young(struct vm_area_struct *vma,
 	if (pte_young(*ptep))
 		ret = test_and_clear_bit(_PAGE_BIT_ACCESSED,
 					 (unsigned long *) &ptep->pte);
+
+	if (pte_present(*ptep) && !pte_special(*ptep))
+		hermit_policy_observe(page_folio(pte_page(*ptep)), vma, addr, ret, true);
 
 	return ret;
 }

@@ -118,6 +118,11 @@ static inline void hermit_history_add(struct hermit_pc_history *h,
 {
 	struct hermit_footprint *f = &h->slot[h->next];
 
+	/* A window with no PEBS load is not evidence; it must not push out a
+	 * sampled one. Demand bits alone are already known to the fault path.
+	 */
+	if (!w->loads)
+		return;
 	f->end_ns = w->end_ns;
 	f->region = w->region;
 	f->loads = w->loads;
@@ -197,7 +202,8 @@ static inline int hermit_footprint_choose(const struct hermit_pc_history *h,
 			if (!(bits[offset / 64] & (1ULL << (offset % 64))))
 				useful++;
 		}
-		transfer = DIV_ROUND_UP_ULL(bytes * 1000000000ULL,
+		/* Bytes/s can exceed the 32-bit divisor used by do_div(). */
+		transfer = DIV64_U64_ROUND_UP(bytes * 1000000000ULL,
 					 (u64)p->bw_mibps << 20);
 		cost = (p->read_ns + (u64)wrs * p->wr_ns + transfer) *
 			1024 * hweight32(live);
