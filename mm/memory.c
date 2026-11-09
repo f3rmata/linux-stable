@@ -4649,21 +4649,6 @@ static struct folio *alloc_swap_folio(struct vm_fault *vmf)
 
 	pte_unmap_unlock(pte, ptl);
 
-#ifdef CONFIG_HERMIT
-	/* PEBS policy: choose the folio, leaving read-side WR splitting alone.
-	 * A long base-page stream already proved it consumes whole ranges, so
-	 * it keeps the largest legal candidate.
-	 */
-	if (hermit_backend_entry_remote(entry) && !vmf->hermit_policy_large) {
-		int selected = hermit_swapin_order(vmf, orders);
-
-		if (selected >= 0) {
-			vmf->hermit_policy_used = true;
-			vmf->hermit_policy_order = selected;
-			orders &= (BIT(selected + 1) - 1) & ~BIT(0);
-		}
-	}
-#endif
 	order = highest_order(orders);
 
 	/* Try allocating the highest of the remaining orders. */
@@ -4696,6 +4681,28 @@ static DECLARE_WAIT_QUEUE_HEAD(swapcache_wq);
 
 #ifdef CONFIG_HERMIT
 /*
+ * MGLRU already records the eviction generation in the swap shadow. Read it
+ * before swap-in replaces the shadow, so Hermit needs no per-page ghost table
+ * to detect refaults. The caller holds a swap device reference.
+ *
+ * "Recent" alone means evicted within the last MAX_NR_GENS generations, which
+ * is true for nearly every page a scan evicts and reads back; counting those
+ * drove st->refault past its gate and disabled prediction. Like
+ * lru_gen_refault(), which sets PG_workingset for the swapcache-hit path,
+ * require the shadow's workingset bit as well: the page was promoted, i.e.
+ * accessed again while resident, before it was evicted. That is a thrashing
+ * refault, not a first re-read.
+ */
+static bool hermit_shadow_refault(swp_entry_t entry)
+{
+	void *shadow = swap_cache_get_shadow(entry);
+	bool workingset = false;
+
+	return shadow && workingset_test_recent(shadow, false, &workingset, false) &&
+	       workingset;
+}
+
+/*
  * Can alloc_swap_folio() return anything but a base page here? Mirrors its
  * uffd, zswap and THP order filters; extent and PTE checks still run later.
  * Without this, a long stream under a 4 KiB ceiling would leave the batched
@@ -4720,28 +4727,6 @@ static bool hermit_swapin_large_allowed(struct vm_fault *vmf)
 #endif
 
 #ifdef CONFIG_HERMIT
-static void hermit_set_swapin_ptes(struct vm_fault *vmf, unsigned long addr,
-		pte_t *ptep, pte_t pte, unsigned int nr)
-{
-	struct mm_struct *mm = vmf->vma->vm_mm;
-	unsigned int demand = (vmf->address - addr) >> PAGE_SHIFT;
-
-	if (!vmf->hermit_policy_time || nr == 1) {
-		set_ptes(mm, addr, ptep, pte, nr);
-		return;
-	}
-	/* Prefetched PTEs start old so hardware accesses supply real feedback.
-	 * Install each PTE once: rewriting it could lose a concurrent dirty bit.
-	 */
-	if (demand)
-		set_ptes(mm, addr, ptep, pte_mkold(pte), demand);
-	set_ptes(mm, vmf->address, ptep + demand,
-		 pte_mkyoung(pte_advance_pfn(pte, demand)), 1);
-	if (demand + 1 < nr)
-		set_ptes(mm, vmf->address + PAGE_SIZE, ptep + demand + 1,
-			 pte_mkold(pte_advance_pfn(pte, demand + 1)), nr - demand - 1);
-}
-
 static int hermit_direct_swapin(struct folio *folio, struct hermit_io *io,
 				bool *pending, u64 *start_ns)
 {
@@ -4872,6 +4857,13 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 		swap_update_readahead(folio, vma, vmf->address);
 #ifdef CONFIG_HERMIT
 		hermit_stat_inc(HMT_STAT_HIT_ON_SWAPCACHE);
+		/* The shadow was consumed when this folio was read ahead;
+		 * workingset_refault() then set PG_workingset only for a recent
+		 * refault of a working-set folio, the same rule as
+		 * hermit_shadow_refault() on the direct path.
+		 */
+		if (hermit_remote_fault && lru_gen_enabled())
+			vmf->hermit_refault = folio_test_workingset(folio);
 #endif
 	}
 	swapcache = folio;
@@ -4880,6 +4872,9 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 		bool synchronous_direct =
 			data_race(si->flags & SWP_SYNCHRONOUS_IO);
 #ifdef CONFIG_HERMIT
+		/* Before any swap-in path below replaces the shadow. */
+		if (hermit_remote_fault && lru_gen_enabled())
+			vmf->hermit_refault = hermit_shadow_refault(entry);
 		/* Long sequential streams keep the legacy large-folio read, which
 		 * needs one WR per contiguous extent; everything else uses 4 KiB
 		 * predicted SG batches. The large path is only taken when this
@@ -4887,8 +4882,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 		 */
 		if (hermit_remote_fault && hermit_policy_active(vma->vm_mm) &&
 		    hermit_policy_feature(HERMIT_POLICY_SWAPIN) &&
-		    !(vmf->hermit_policy_large = hermit_swapin_large_allowed(vmf) &&
-					       hermit_policy_large(vmf))) {
+		    !(hermit_swapin_large_allowed(vmf) && hermit_policy_large(vmf))) {
 			folio = hermit_swapin_pages(entry, GFP_HIGHUSER_MOVABLE, vmf);
 			swapcache = folio;
 			goto swapin_allocated;
@@ -5283,17 +5277,14 @@ check_folio:
 
 	VM_BUG_ON(!folio_test_anon(folio) ||
 		  (pte_write(pte) && !PageAnonExclusive(page)));
+	set_ptes(vma->vm_mm, address, ptep, pte, nr_pages);
 #ifdef CONFIG_HERMIT
-	hermit_set_swapin_ptes(vmf, address, ptep, pte, nr_pages);
 	if (hermit_remote_fault) {
 		hermit_policy_installed(vmf, page_to_pfn(page), address, nr_pages);
 		hermit_pebs_fault(vma->vm_mm, vmf->address, vmf->hermit_fault_pc,
 				  hermit_observe_start_ns);
-		hermit_pebs_swapin_result(vmf, folio_order(folio),
-					 address, pte_pfn(pte), nr_pages);
+		hermit_pebs_account_swapin(vma->vm_mm, folio_order(folio));
 	}
-#else
-	set_ptes(vma->vm_mm, address, ptep, pte, nr_pages);
 #endif
 	arch_do_swap_page_nr(vma->vm_mm, vma, address, pte, pte, nr_pages);
 

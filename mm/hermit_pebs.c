@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Hermit PEBS page-size policy.
+ * Hermit PEBS access-footprint sampling.
  *
  * Per-mm, fault-triggered event-time windows train cross-region fault-PC
- * footprints. Only the swap-in folio size is predicted; transport splitting
- * remains a backend decision. Tracking works without CONFIG_MEMCG.
+ * footprints for the 4 KiB swap-in predictor. Folio allocation and transport
+ * splitting remain separate decisions. Tracking works without CONFIG_MEMCG.
  */
 #include <linux/kernel.h>
 #include <linux/capability.h>
@@ -15,19 +15,16 @@
 #include <linux/seq_file.h>
 #include <linux/hash.h>
 #include <linux/bitops.h>
-#include <linux/log2.h>
 #include <linux/sched.h>
 #include <linux/sched/task.h>
 #include <linux/mm.h>
 #include <linux/perf_event.h>
 #include <linux/syscalls.h>
-#include <linux/uaccess.h>
 #include <linux/hermit_pebs.h>
 #include <linux/hermit_policy.h>
 #include <linux/hermit_backend.h>
 #include <linux/rbtree.h>
 #include <linux/ktime.h>
-#include <asm/pgtable.h>
 
 #include "../kernel/events/internal.h"
 #include "hermit_pebs_policy.h"
@@ -40,19 +37,11 @@ u32 hermit_pebs_load_period;
 u32 hermit_pebs_store_period;
 u32 hermit_pebs_adaptive = 1;
 u32 hermit_pebs_mode = HERMIT_PEBS_MODE_STATIC;
-u32 hermit_pebs_force_order;
 u32 hermit_pebs_fixed_cost_ns = 7000;
-u32 hermit_pebs_bw_mibps = 12288;
-u32 hermit_pebs_min_f = 50; /* permille */
-u32 hermit_pebs_hysteresis = 900; /* permille */
-u32 hermit_pebs_cooling_period = 100000;
 u32 hermit_pebs_region_max = HERMIT_PEBS_MAX_REGIONS;
 static u32 hermit_pebs_pc_max = 4096;
 static u32 hermit_pebs_window_ms = 10;
 static u32 hermit_pebs_history_ms = 1000;
-static u32 hermit_pebs_min_regions = 4;
-static u32 hermit_pebs_min_samples = 32;
-static u32 hermit_pebs_wr_cost_ns;
 /* Epoch invalidation is lazy; no global mm walk or reference pinning. */
 u64 hermit_pebs_epoch;
 
@@ -87,8 +76,6 @@ static atomic_long_t hermit_nr_sampled;
 static atomic_long_t hermit_window_samples;
 static atomic_long_t hermit_nr_throttled;
 static atomic_long_t hermit_nr_lost;
-static atomic_long_t hermit_order_decisions[HERMIT_PEBS_MAX_ORDER + 1];
-static atomic_long_t hermit_order_unknown;
 
 /* ---------- per-mm windows and cross-region fault-PC table ---------- */
 
@@ -107,15 +94,12 @@ struct hermit_region {
 };
 
 struct hermit_pc_entry {
-	u64 task_start;
-	pid_t tid;
 	struct hlist_node hnode;
 	struct list_head lru;
 	unsigned long pc;
 	u16 offset;
 	u64 epoch;
 	struct hermit_pc_history history;
-	struct hermit_readahead readahead;
 };
 
 struct hermit_pebs_state {
@@ -129,9 +113,7 @@ struct hermit_pebs_state {
 };
 
 enum hermit_policy_counter {
-	HPC_COMPLETED, HPC_EXPIRED, HPC_LATE, HPC_PC_HIT, HPC_EVIDENCE,
-	HPC_ALLOC_FAIL, HPC_EVICT, HPC_FALLBACK, HPC_FORCED,
-	HPC_PEBS, HPC_READAHEAD, HPC_RA_FEEDBACK, HPC_RA_HITS,
+	HPC_COMPLETED, HPC_EXPIRED, HPC_LATE, HPC_ALLOC_FAIL, HPC_EVICT,
 	/* Sample pipeline: tracked mm -> recorded in an open window. */
 	HPC_SAMPLE_TARGET, HPC_SAMPLE_WINDOW,
 	/* 4 KiB predictor: why PEBS did or did not extend a batch. */
@@ -142,9 +124,7 @@ static atomic_long_t hermit_policy_counters[HPC_NR];
 static atomic_long_t hermit_actual_orders[HERMIT_PEBS_MAX_ORDER + 1];
 static const char * const hermit_policy_names[HPC_NR] = {
 	"windows_completed", "history_expired", "samples_late_or_untracked",
-	"pc_hit", "insufficient_evidence", "metadata_alloc_failed",
-	"table_evictions", "allocation_fallback", "forced",
-	"pebs_selected", "readahead_selected", "readahead_feedback", "readahead_hits",
+	"metadata_alloc_failed", "table_evictions",
 	"samples_target_mm", "samples_in_window",
 	"predict_calls", "predict_no_entry", "predict_few_regions",
 	"predict_few_samples", "predict_no_votes", "predict_extended",
@@ -201,19 +181,17 @@ static struct hermit_pebs_state *hermit_pebs_state_get(struct mm_struct *mm)
 	return new;
 }
 
-static struct hermit_pc_entry *hermit_pc_get_key(struct hermit_pebs_state *st,
-		unsigned long pc, unsigned int offset, pid_t tid, u64 task_start, bool create)
+static struct hermit_pc_entry *hermit_pc_get(struct hermit_pebs_state *st,
+		unsigned long pc, unsigned int offset, bool create)
 {
-	unsigned int hash = hash_long(pc ^ (offset << 4) ^ tid, 8);
+	unsigned int hash = hash_long(pc ^ (offset << 4), 8);
 	struct hermit_pc_entry *p;
 
 	hlist_for_each_entry(p, &st->pc_buckets[hash], hnode) {
-		if (p->pc != pc || p->offset != offset || p->tid != tid || p->task_start != task_start)
+		if (p->pc != pc || p->offset != offset)
 			continue;
 		if (p->epoch != hermit_state_epoch(st)) {
 			memset(&p->history, 0, sizeof(p->history));
-			memset(&p->readahead, 0, sizeof(p->readahead));
-			p->history.last_order = -1;
 			p->epoch = hermit_state_epoch(st);
 		}
 		list_move(&p->lru, &st->pc_lru);
@@ -235,28 +213,12 @@ static struct hermit_pc_entry *hermit_pc_get_key(struct hermit_pebs_state *st,
 		st->nr_pcs++;
 	}
 	memset(p, 0, sizeof(*p));
-	p->tid = tid;
-	p->task_start = task_start;
 	p->pc = pc;
 	p->offset = offset;
 	p->epoch = hermit_state_epoch(st);
-	p->history.last_order = -1;
 	hlist_add_head(&p->hnode, &st->pc_buckets[hash]);
 	list_add(&p->lru, &st->pc_lru);
 	return p;
-}
-
-/* Only readahead feedback (the last range this thread installed) is owned by
- * a thread. Cross-region PEBS footprints are shared by every thread of the mm:
- * splitting them per thread divided already sparse evidence.
- */
-static struct hermit_pc_entry *hermit_pc_get(struct hermit_pebs_state *st,
-		unsigned long pc, unsigned int offset, bool create)
-{
-	if (offset != HERMIT_PC_RA_OFFSET)
-		return hermit_pc_get_key(st, pc, offset, 0, 0, create);
-	return hermit_pc_get_key(st, pc, offset, task_pid_nr(current),
-				 current->start_time, create);
 }
 
 static void hermit_window_remove(struct hermit_pebs_state *st,
@@ -314,7 +276,7 @@ static void hermit_windows_finish(struct hermit_pebs_state *st, u64 now)
 			atomic_long_inc(&hermit_policy_counters[HPC_EXPIRED]);
 			continue;
 		}
-		p = hermit_pc_get_key(st, w->data.pc, w->data.offset, 0, 0, true);
+		p = hermit_pc_get(st, w->data.pc, w->data.offset, true);
 		if (p)
 			hermit_history_add(&p->history, &w->data);
 		atomic_long_inc(&hermit_policy_counters[HPC_COMPLETED]);
@@ -855,103 +817,14 @@ void hermit_pebs_stop_sampling(void)
 	mutex_unlock(&hermit_pebs_mutex);
 }
 
-/* ---------- swap-in policy (swap-out never calls this model) ---------- */
-
-static struct hermit_cost_params hermit_cost_params_read(void)
-{
-	return (struct hermit_cost_params) {
-		.read_ns = READ_ONCE(hermit_pebs_fixed_cost_ns),
-		.wr_ns = READ_ONCE(hermit_pebs_wr_cost_ns),
-		.bw_mibps = READ_ONCE(hermit_pebs_bw_mibps),
-		.hysteresis = READ_ONCE(hermit_pebs_hysteresis),
-		.min_regions = READ_ONCE(hermit_pebs_min_regions),
-		.min_samples = READ_ONCE(hermit_pebs_min_samples),
-		.ttl_ns = (u64)READ_ONCE(hermit_pebs_history_ms) * NSEC_PER_MSEC,
-	};
-}
-
-/* Called without the state lock or a PTL. The fault holds its VMA stable.
- * Inspect at most one previously installed, PMD-contained PTE range. Check
- * PFNs to reject reclaimed/remapped ranges; never clear live accessed bits.
- */
-static bool hermit_readahead_hits(struct vm_area_struct *vma,
-		const struct hermit_readahead *ra, unsigned int *hits)
-{
-	pgd_t *pgd;
-	p4d_t *p4d;
-	pud_t *pud;
-	pmd_t *pmd;
-	pte_t *ptes;
-	spinlock_t *ptl;
-	unsigned int i;
-	bool valid = false;
-
-	*hits = 0;
-	if (!ra->nr_pages || ra->nr_pages > HERMIT_REGION_NR_SUBPAGES ||
-	    ra->vma_start != vma->vm_start || ra->vma_end != vma->vm_end ||
-	    ra->start < vma->vm_start || ra->start >= vma->vm_end ||
-	    ra->nr_pages > (vma->vm_end - ra->start) / PAGE_SIZE ||
-	    pte_index(ra->start) + ra->nr_pages > PTRS_PER_PTE)
-		return false;
-	pgd = pgd_offset(vma->vm_mm, ra->start);
-	if (pgd_none(*pgd) || pgd_bad(*pgd))
-		return false;
-	p4d = p4d_offset(pgd, ra->start);
-	if (p4d_none(*p4d) || p4d_bad(*p4d))
-		return false;
-	pud = pud_offset(p4d, ra->start);
-	if (pud_none(*pud) || pud_leaf(*pud) || pud_bad(*pud))
-		return false;
-	pmd = pmd_offset(pud, ra->start);
-	ptes = pte_offset_map_lock(vma->vm_mm, pmd, ra->start, &ptl);
-	if (!ptes)
-		return false;
-	for (i = 0; i < ra->nr_pages; i++) {
-		pte_t pte = ptep_get(ptes + i);
-
-		if (!pte_present(pte) || pte_pfn(pte) != ra->pfn + i)
-			goto out;
-		if (ra->start + i * PAGE_SIZE != ra->fault_addr && pte_young(pte))
-			(*hits)++;
-	}
-	valid = true;
-out:
-	pte_unmap_unlock(ptes, ptl);
-	return valid;
-}
-
-static int hermit_readahead_order(struct vm_fault *vmf,
-		struct hermit_pebs_state *st, unsigned long candidates,
-		unsigned long wr_mask, u64 now, u64 ttl)
-{
-	struct hermit_readahead ra = {};
-	struct hermit_pc_entry *p;
-	unsigned int hits = 0;
-
-	spin_lock(&st->lock);
-	p = hermit_pc_get(st, vmf->hermit_fault_pc, HERMIT_PC_RA_OFFSET, false);
-	if (p)
-		ra = p->readahead;
-	spin_unlock(&st->lock);
-	if (ra.nr_pages && now >= ra.time_ns && now - ra.time_ns < ttl &&
-	    hermit_readahead_hits(vmf->vma, &ra, &hits)) {
-		atomic_long_inc(&hermit_policy_counters[HPC_RA_FEEDBACK]);
-		atomic_long_add(hits, &hermit_policy_counters[HPC_RA_HITS]);
-	} else {
-		memset(&ra, 0, sizeof(ra));
-		hits = 0;
-	}
-	atomic_long_inc(&hermit_policy_counters[HPC_READAHEAD]);
-	return hermit_readahead_choose(&ra, vmf->address, hits, candidates, wr_mask);
-}
+/* ---------- base-page swap-in prediction ---------- */
 
 /* Predict individual 4 KiB pages from repeated load footprints. An extent
  * length is never evidence. Return only the contiguous, independently supported
  * prefix; transport may still split it for remote layout or SGE constraints.
  */
-/* Base-page predictor gates. Independent of pebs_min_regions/min_samples,
- * which gate the folio cost model; each extra page still needs a majority
- * vote across distinct regions, so sparse evidence only shortens a batch.
+/* Each extra page needs a 75% vote across distinct regions; sparse
+ * evidence only shortens the suggested batch.
  */
 static u32 hermit_pebs_predict_regions = 2;
 static u32 hermit_pebs_predict_samples = 8;
@@ -960,7 +833,7 @@ unsigned int hermit_pebs_predict_pages(struct vm_fault *vmf)
 {
 	struct hermit_pebs_state *st;
 	struct hermit_pc_entry *p;
-	struct hermit_cost_params params = hermit_cost_params_read();
+	u64 ttl = (u64)READ_ONCE(hermit_pebs_history_ms) * NSEC_PER_MSEC;
 	unsigned int i, j, regions = 0, loads = 0, votes[HERMIT_SWAPIN_MAX] = {};
 	unsigned int offset = hermit_page_offset(vmf->address), nr = 1;
 	unsigned int reason = HPC_PRED_NO_ENTRY;
@@ -981,7 +854,7 @@ unsigned int hermit_pebs_predict_pages(struct vm_fault *vmf)
 	for (i = 0; i < HERMIT_PC_HISTORY; i++) {
 		struct hermit_footprint *f = &p->history.slot[i];
 
-		if (!f->end_ns || now < f->end_ns || now - f->end_ns >= params.ttl_ns)
+		if (!f->end_ns || now < f->end_ns || now - f->end_ns >= ttl)
 			continue;
 		/* Repeated windows of one region are one piece of evidence. */
 		for (j = 0; j < i; j++)
@@ -1012,114 +885,11 @@ out:
 	return nr;
 }
 
-int hermit_swapin_order(struct vm_fault *vmf, unsigned long candidates)
+/* Count successfully mapped folios independently of the prediction path. */
+void hermit_pebs_account_swapin(struct mm_struct *mm, unsigned int order)
 {
-	struct mm_struct *mm = vmf->vma->vm_mm;
-	unsigned long addr = vmf->address, pc = vmf->hermit_fault_pc;
-	struct hermit_pebs_state *st;
-	struct hermit_pc_entry *p;
-	struct hermit_cost_params params;
-	unsigned long wr_mask;
-	unsigned int force;
-	u64 now;
-	bool confident = false;
-	int best = 0;
-
-	vmf->hermit_policy_time = 0;
-	if (!READ_ONCE(hermit_pebs_enabled))
-		return -1;
-	force = READ_ONCE(hermit_pebs_force_order);
-	candidates = (candidates | BIT(0)) & (BIT(HERMIT_PEBS_MAX_ORDER + 1) - 1) & ~BIT(1);
-	/* Explicit experiment override retains its global scope. */
-	if (force) {
-		force = min_t(unsigned int, force, HERMIT_PEBS_MAX_ORDER);
-		best = fls_long(candidates & (BIT(force + 1) - 1)) - 1;
-		atomic_long_inc(&hermit_policy_counters[HPC_FORCED]);
-		goto account;
-	}
-	if (!hermit_pebs_tracks(mm) || READ_ONCE(hermit_pebs_mode) != HERMIT_PEBS_MODE_POLICY)
-		return -1;
-	if (!pc || !READ_ONCE(hermit_pebs_window_ms))
-		goto unknown;
-	params = hermit_cost_params_read();
-	if (!params.ttl_ns)
-		goto unknown;
-	st = hermit_pebs_state_get(mm);
-	if (!st)
-		goto unknown;
-	now = ktime_get_ns();
-	vmf->hermit_policy_time = now;
-	wr_mask = hermit_backend_effective_order_mask();
-	spin_lock(&st->lock);
-	hermit_windows_finish(st, now);
-	p = hermit_pc_get(st, pc, hermit_page_offset(addr), false);
-	if (p) {
-		unsigned int i;
-
-		for (i = 0; i < HERMIT_PC_HISTORY; i++) {
-			struct hermit_footprint *f = &p->history.slot[i];
-
-			if (f->end_ns && now >= f->end_ns &&
-			    now - f->end_ns >= params.ttl_ns) {
-				memset(f, 0, sizeof(*f));
-				atomic_long_inc(&hermit_policy_counters[HPC_EXPIRED]);
-			}
-		}
-		atomic_long_inc(&hermit_policy_counters[HPC_PC_HIT]);
-		best = hermit_footprint_choose(&p->history, hermit_page_offset(addr),
-				candidates, wr_mask, now, &params, NULL, &confident);
-		p->history.last_order = confident ? best : -1;
-	}
-	spin_unlock(&st->lock);
-	if (confident)
-		atomic_long_inc(&hermit_policy_counters[HPC_PEBS]);
-	else
-		best = hermit_readahead_order(vmf, st, candidates, wr_mask, now, params.ttl_ns);
-unknown:
-	if (!confident) {
-		atomic_long_inc(&hermit_order_unknown);
-		atomic_long_inc(&hermit_policy_counters[HPC_EVIDENCE]);
-	}
-account:
-	atomic_long_inc(&hermit_order_decisions[best]);
-	return best;
-}
-
-void hermit_pebs_swapin_result(struct vm_fault *vmf, unsigned int order,
-		unsigned long start, unsigned long pfn, unsigned int nr_pages)
-{
-	struct hermit_pebs_state *st;
-	struct hermit_pc_entry *p;
-
-	if (order > HERMIT_PEBS_MAX_ORDER ||
-	    (!hermit_pebs_tracks(vmf->vma->vm_mm) &&
-	     !(READ_ONCE(hermit_pebs_enabled) && READ_ONCE(hermit_pebs_force_order))))
-		return;
-	atomic_long_inc(&hermit_actual_orders[order]);
-	if (vmf->hermit_policy_used && order != vmf->hermit_policy_order)
-		atomic_long_inc(&hermit_policy_counters[HPC_FALLBACK]);
-	/* Train only after successful PTE installation, using actual allocation
-	 * size. Failed/retried faults and force/static/off do not train this path.
-	 */
-	if (!vmf->hermit_policy_time ||
-	    READ_ONCE(hermit_pebs_mode) != HERMIT_PEBS_MODE_POLICY)
-		return;
-	st = READ_ONCE(vmf->vma->vm_mm->hermit_pebs);
-	if (!st)
-		return;
-	spin_lock(&st->lock);
-	if (vmf->hermit_policy_time < hermit_state_epoch(st))
-		goto out;
-	p = hermit_pc_get(st, vmf->hermit_fault_pc, HERMIT_PC_RA_OFFSET, true);
-	if (p && vmf->hermit_policy_time >= p->readahead.time_ns)
-		p->readahead = (struct hermit_readahead) {
-			.time_ns = vmf->hermit_policy_time,
-			.start = start, .pfn = pfn, .nr_pages = nr_pages,
-			.fault_addr = vmf->address,
-			.vma_start = vmf->vma->vm_start, .vma_end = vmf->vma->vm_end,
-		};
-out:
-	spin_unlock(&st->lock);
+	if (order <= HERMIT_PEBS_MAX_ORDER && hermit_pebs_tracks(mm))
+		atomic_long_inc(&hermit_actual_orders[order]);
 }
 
 /* ---------- syscalls ---------- */
@@ -1183,18 +953,12 @@ static int hermit_pebs_stats_show(struct seq_file *m, void *v)
 {
 	int i;
 
-	seq_puts(m, "order: decisions\n");
-	for (i = 0; i <= HERMIT_PEBS_MAX_ORDER; i++)
-		seq_printf(m, "%2d: %ld\n", i,
-			   atomic_long_read(&hermit_order_decisions[i]));
 	for (i = 0; i < HPC_NR; i++)
 		seq_printf(m, "%s: %ld\n", hermit_policy_names[i],
 			   atomic_long_read(&hermit_policy_counters[i]));
 	for (i = 0; i <= HERMIT_PEBS_MAX_ORDER; i++)
 		seq_printf(m, "actual_order_%d: %ld\n", i,
 			   atomic_long_read(&hermit_actual_orders[i]));
-	seq_printf(m, "unknown: %ld\n",
-		   atomic_long_read(&hermit_order_unknown));
 	seq_printf(m, "sampled: %ld\n", atomic_long_read(&hermit_nr_sampled));
 	seq_printf(m, "throttled: %ld\n",
 		   atomic_long_read(&hermit_nr_throttled));
@@ -1218,83 +982,6 @@ static int hermit_pebs_stats_open(struct inode *inode, struct file *file)
 static const struct file_operations hermit_pebs_stats_fops = {
 	.open = hermit_pebs_stats_open,
 	.read = seq_read,
-	.llseek = seq_lseek,
-	.release = single_release,
-};
-
-/* test hook: write 8 hex u64 words (512-bit touched bitmap), read back the
- * policy evaluation for a 2 MiB folio at base 0.
- */
-static u64 hermit_test_touched[HERMIT_REGION_WORDS];
-static unsigned long hermit_test_allowed = ~0UL;
-
-static u32 hermit_test_offset;
-static u32 hermit_test_candidates = 0x3fd;
-
-static int hermit_test_eval_show(struct seq_file *m, void *v)
-{
-	struct hermit_pc_history h = { .last_order = -1 };
-	struct hermit_cost_params p = hermit_cost_params_read();
-	u64 scores[HERMIT_PEBS_MAX_ORDER + 1] = {};
-	bool confident;
-	unsigned int i;
-	int best;
-
-	/* A deterministic, fully trained fixture, independent of real time. */
-	for (i = 0; i < HERMIT_PC_HISTORY; i++) {
-		h.slot[i].end_ns = 1;
-		h.slot[i].region = i;
-		h.slot[i].loads = 32;
-		memcpy(h.slot[i].load, hermit_test_touched, sizeof(hermit_test_touched));
-	}
-	best = hermit_footprint_choose(&h, READ_ONCE(hermit_test_offset),
-		READ_ONCE(hermit_test_candidates), hermit_test_allowed, 2,
-		&p, scores, &confident);
-	seq_puts(m, "order cost(ns/useful-page * 1024)\n");
-	for (i = 0; i <= HERMIT_PEBS_MAX_ORDER; i++)
-		if (scores[i])
-			seq_printf(m, "%2u %llu\n", i, scores[i]);
-	seq_printf(m, "confident: %u\ndecision: %d\n", confident, best);
-	return 0;
-}
-
-static int hermit_test_eval_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, hermit_test_eval_show, NULL);
-}
-
-static ssize_t hermit_test_eval_write(struct file *file,
-				      const char __user *ubuf, size_t len,
-				      loff_t *ppos)
-{
-	char buf[256];
-	char *p = buf;
-	u64 words[HERMIT_REGION_WORDS];
-	int i, n;
-
-	if (len >= sizeof(buf))
-		return -E2BIG;
-	if (copy_from_user(buf, ubuf, len))
-		return -EFAULT;
-	buf[len] = '\0';
-
-	memset(words, 0, sizeof(words));
-	for (i = 0; i < HERMIT_REGION_WORDS; i++) {
-		if (sscanf(p, "%llx%n", &words[i], &n) != 1)
-			break;
-		p += n;
-	}
-	if (i < HERMIT_REGION_WORDS)
-		return -EINVAL;
-
-	memcpy(hermit_test_touched, words, sizeof(words));
-	return len;
-}
-
-static const struct file_operations hermit_test_eval_fops = {
-	.open = hermit_test_eval_open,
-	.read = seq_read,
-	.write = hermit_test_eval_write,
 	.llseek = seq_lseek,
 	.release = single_release,
 };
@@ -1378,14 +1065,9 @@ void hermit_pebs_debugfs_init(struct dentry *root)
 {
 	debugfs_create_u32("pebs_window_ms", 0600, root, &hermit_pebs_window_ms);
 	debugfs_create_u32("pebs_history_ms", 0600, root, &hermit_pebs_history_ms);
-	debugfs_create_u32("pebs_min_regions", 0600, root, &hermit_pebs_min_regions);
-	debugfs_create_u32("pebs_min_samples", 0600, root, &hermit_pebs_min_samples);
 	debugfs_create_u32("pebs_predict_regions", 0600, root, &hermit_pebs_predict_regions);
 	debugfs_create_u32("pebs_predict_samples", 0600, root, &hermit_pebs_predict_samples);
 	debugfs_create_u32("pebs_pc_max", 0600, root, &hermit_pebs_pc_max);
-	debugfs_create_u32("pebs_wr_cost_ns", 0600, root, &hermit_pebs_wr_cost_ns);
-	debugfs_create_u32("pebs_test_offset", 0600, root, &hermit_test_offset);
-	debugfs_create_u32("pebs_test_candidates", 0600, root, &hermit_test_candidates);
 	debugfs_create_file("pebs_ring_test", S_IRUSR, root, NULL,
 			    &hermit_ring_test_fops);
 	debugfs_create_u32("pebs_load_period", S_IRUSR | S_IWUSR, root,
@@ -1400,22 +1082,10 @@ void hermit_pebs_debugfs_init(struct dentry *root)
 			   &hermit_pebs_all);
 	debugfs_create_u32("pebs_mode", S_IRUSR | S_IWUSR, root,
 			   &hermit_pebs_mode);
-	debugfs_create_u32("pebs_force_order", S_IRUSR | S_IWUSR, root,
-			   &hermit_pebs_force_order);
 	debugfs_create_u32("pebs_fixed_cost_ns", S_IRUSR | S_IWUSR, root,
 			   &hermit_pebs_fixed_cost_ns);
-	debugfs_create_u32("pebs_bw_mibps", S_IRUSR | S_IWUSR, root,
-			   &hermit_pebs_bw_mibps);
-	debugfs_create_u32("pebs_min_f", S_IRUSR | S_IWUSR, root,
-			   &hermit_pebs_min_f);
-	debugfs_create_u32("pebs_hysteresis", S_IRUSR | S_IWUSR, root,
-			   &hermit_pebs_hysteresis);
-	debugfs_create_u32("pebs_cooling_period", S_IRUSR | S_IWUSR, root,
-			   &hermit_pebs_cooling_period);
 	debugfs_create_u32("pebs_region_max", S_IRUSR | S_IWUSR, root,
 			   &hermit_pebs_region_max);
 	debugfs_create_file("pebs_order_stats", S_IRUSR, root, NULL,
 			    &hermit_pebs_stats_fops);
-	debugfs_create_file("pebs_test_eval", S_IRUSR | S_IWUSR, root, NULL,
-			    &hermit_test_eval_fops);
 }

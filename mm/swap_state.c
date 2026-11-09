@@ -543,7 +543,7 @@ struct folio *read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
 	return folio;
 }
 
-unsigned int swapin_readahead_pages(unsigned long prev_offset,
+static unsigned int swapin_readahead_pages(unsigned long prev_offset,
 				      unsigned long offset,
 				      int hits,
 				      int max_pages,
@@ -946,6 +946,11 @@ struct folio *hermit_swapin_pages(swp_entry_t entry, gfp_t gfp, struct vm_fault 
 	}
 	if (!count)
 		goto out;
+	/* The pages actually read, not the prediction: allocation failure,
+	 * swapcache hits and PTE holes shorten a batch. Run-length feedback in
+	 * hermit_policy_installed() measures use against this.
+	 */
+	vmf->hermit_batch_pages = count;
 	nr_batches = DIV_ROUND_UP(count, HERMIT_BATCH_MAX);
 	time = ktime_get_ns();
 	/* Every batch is in flight before the fault waits on the first. */

@@ -3,48 +3,9 @@
 #define _MM_HERMIT_PEBS_POLICY_H
 
 #include <linux/hermit_pebs.h>
-#include <linux/math64.h>
 #include <linux/string.h>
-#include "swap.h"
 
 #define HERMIT_PC_HISTORY 8
-
-/* Separate PC-table key: readahead must span different fault offsets. */
-#define HERMIT_PC_RA_OFFSET HERMIT_REGION_NR_SUBPAGES
-
-struct hermit_readahead {
-	u64 time_ns;
-	unsigned long start, pfn, fault_addr, vma_start, vma_end;
-	unsigned int nr_pages;
-};
-
-/* Native hits+2, power-of-two growth and half-window decay. The legal folio
- * sizes replace page-cluster's limit; the native swap path keeps its limit.
- * Only measured young non-demand PTEs count as hits, never an assumed scan.
- */
-static inline int hermit_readahead_choose(const struct hermit_readahead *ra,
-		unsigned long addr, unsigned int hits, unsigned long candidates,
-		unsigned long wr_mask)
-{
-	unsigned long legal = (candidates & wr_mask &
-		(BIT(HERMIT_PEBS_MAX_ORDER + 1) - 1) & ~BIT(1)) | BIT(0);
-	unsigned long prev = ra->fault_addr >> PAGE_SHIFT;
-	unsigned long fault_pfn = addr >> PAGE_SHIFT;
-	unsigned int max_pages = 1U << (fls_long(legal) - 1);
-	unsigned int pages;
-
-	pages = swapin_readahead_pages(prev, fault_pfn,
-			ra->nr_pages ? hits : 4, max_pages, ra->nr_pages);
-	/* The native half-window floor can exceed a newly reduced ceiling. */
-	pages = min(pages, max_pages);
-	/* There is no anonymous order-1 THP. Let adjacent base-page faults
-	 * probe the smallest large folio; otherwise floor the prediction.
-	 */
-	if (pages == 2 && ra->nr_pages == 1 &&
-	    (fault_pfn == prev + 1 || prev == fault_pfn + 1) && (legal & BIT(2)))
-		pages = 4;
-	return fls_long(legal & (BIT(fls(pages)) - 1)) - 1;
-}
 
 /* Half-open event-time window; collection may continue until close_ns. */
 struct hermit_footprint_window {
@@ -65,13 +26,6 @@ struct hermit_footprint {
 struct hermit_pc_history {
 	struct hermit_footprint slot[HERMIT_PC_HISTORY];
 	unsigned int next;
-	int last_order;
-};
-
-struct hermit_cost_params {
-	u32 read_ns, wr_ns, bw_mibps, hysteresis;
-	u32 min_regions, min_samples;
-	u64 ttl_ns;
 };
 
 static inline unsigned int hermit_page_offset(unsigned long addr)
@@ -130,98 +84,4 @@ static inline void hermit_history_add(struct hermit_pc_history *h,
 	h->next = (h->next + 1) % HERMIT_PC_HISTORY;
 }
 
-static inline unsigned int hermit_footprint_count(const u64 *bits,
-						 unsigned int start, unsigned int nr)
-{
-	unsigned int count = 0;
-
-	while (nr) {
-		unsigned int take = min(nr, 64U - start % 64);
-		u64 word = bits[start / 64] >> (start % 64);
-
-		if (take < 64)
-			word &= (1ULL << take) - 1;
-		count += hweight64(word);
-		start += take;
-		nr -= take;
-	}
-	return count;
-}
-
-/*
- * U is mean observed useful pages, with the demanded page forced to one
- * in every history window. Absence of a sample is not proof of coldness.
- * Cost units are ns/useful-page * 1024. All products fit u64 for u32
- * parameters, <= 512 pages and <= 8 histories. The transport currently
- * uses one WR when order is in its mask, otherwise order-0 WRs.
- */
-static inline int hermit_footprint_choose(const struct hermit_pc_history *h,
-		unsigned int offset, unsigned long candidates, unsigned long wr_mask,
-		u64 now, const struct hermit_cost_params *p, u64 *scores,
-		bool *confident)
-{
-	unsigned int live = 0, distinct = 0, i, j, o;
-	unsigned long regions[HERMIT_PC_HISTORY];
-	u64 samples = 0, best_cost = U64_MAX, previous = U64_MAX;
-	int best = 0;
-
-	*confident = false;
-	if (!p->bw_mibps || !p->ttl_ns || offset >= HERMIT_REGION_NR_SUBPAGES ||
-	    !p->min_regions || p->min_regions > HERMIT_PC_HISTORY ||
-	    !p->min_samples || p->hysteresis > 1000)
-		return 0;
-	for (i = 0; i < HERMIT_PC_HISTORY; i++) {
-		const struct hermit_footprint *f = &h->slot[i];
-
-		if (!f->end_ns || now < f->end_ns || now - f->end_ns >= p->ttl_ns)
-			continue;
-		live |= BIT(i);
-		samples += f->loads;
-		for (j = 0; j < distinct && regions[j] != f->region; j++)
-			;
-		if (j == distinct)
-			regions[distinct++] = f->region;
-	}
-	if (distinct < p->min_regions || samples < p->min_samples)
-		return 0;
-	*confident = true;
-	candidates = (candidates | BIT(0)) & ~BIT(1);
-	for (o = 0; o <= HERMIT_PEBS_MAX_ORDER; o++) {
-		unsigned int nr = 1U << o, start = offset & ~(nr - 1);
-		u64 useful = 0, bytes = (u64)PAGE_SIZE << o, cost, transfer;
-		unsigned int wrs = (wr_mask & BIT(o)) ? 1 : nr;
-
-		if (!(candidates & BIT(o)))
-			continue;
-		for (i = 0; i < HERMIT_PC_HISTORY; i++) {
-			const u64 *bits = h->slot[i].load;
-
-			if (!(live & BIT(i)))
-				continue;
-			useful += hermit_footprint_count(bits, start, nr);
-			if (!(bits[offset / 64] & (1ULL << (offset % 64))))
-				useful++;
-		}
-		/* Bytes/s can exceed the 32-bit divisor used by do_div(). */
-		transfer = DIV64_U64_ROUND_UP(bytes * 1000000000ULL,
-					 (u64)p->bw_mibps << 20);
-		cost = (p->read_ns + (u64)wrs * p->wr_ns + transfer) *
-			1024 * hweight32(live);
-		cost = div64_u64(cost, useful);
-		if (scores)
-			scores[o] = cost;
-		if (cost < best_cost) {
-			best_cost = cost;
-			best = o;
-		}
-		if ((int)o == h->last_order)
-			previous = cost;
-	}
-	/* Both operands stay below 2^64 even at maximum u32 cost settings. */
-	if (previous != U64_MAX && best_cost != previous && best != h->last_order &&
-	    best_cost * 1000 > previous * p->hysteresis)
-		best = h->last_order;
-	return best;
-}
-
-#endif
+#endif /* _MM_HERMIT_PEBS_POLICY_H */

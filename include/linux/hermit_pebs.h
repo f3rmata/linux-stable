@@ -31,7 +31,7 @@ struct dentry;
 
 enum hermit_pebs_mode {
 	HERMIT_PEBS_MODE_STATIC = 0, /* keep remote_order_mask behaviour */
-	HERMIT_PEBS_MODE_POLICY = 1, /* fault-PC swap-in folio policy */
+	HERMIT_PEBS_MODE_POLICY = 1, /* 4 KiB prediction and reclaim policy */
 };
 
 #define HERMIT_PEBS_BUCKETS 256
@@ -48,12 +48,8 @@ extern u64 hermit_pebs_epoch;
 extern u32 hermit_pebs_enabled; /* master switch */
 extern u32 hermit_pebs_all; /* track every mm, no cgroup required */
 extern u32 hermit_pebs_mode; /* enum hermit_pebs_mode */
-extern u32 hermit_pebs_force_order; /* 0 = off, else forced swap-in folio order */
-extern u32 hermit_pebs_fixed_cost_ns; /* per-read fixed cost, default 7000 */
-extern u32 hermit_pebs_bw_mibps; /* link bandwidth MiB/s, default 12288 */
-extern u32 hermit_pebs_min_f; /* deprecated; ignored */
-extern u32 hermit_pebs_hysteresis; /* permille, default 900 */
-extern u32 hermit_pebs_cooling_period; /* deprecated; ignored */
+/* Cold observation interval is at least twice this value (default 7000 ns). */
+extern u32 hermit_pebs_fixed_cost_ns;
 extern u32 hermit_pebs_region_max;
 
 /* Attach a ring to a disabled kernel event; enable only after success. */
@@ -70,13 +66,11 @@ void hermit_pebs_debugfs_init(struct dentry *root);
 void hermit_pebs_mm_exit(struct mm_struct *mm);
 void hermit_pebs_mm_enable(struct mm_struct *mm, bool enable);
 
-/* -1 means disabled; sparse PEBS evidence uses swap readahead feedback. */
+/* Predict a contiguous base-page prefix; insufficient evidence returns one. */
 unsigned int hermit_pebs_predict_pages(struct vm_fault *vmf);
-int hermit_swapin_order(struct vm_fault *vmf, unsigned long candidates);
 void hermit_pebs_fault(struct mm_struct *mm, unsigned long addr,
 		       unsigned long pc, u64 time);
-void hermit_pebs_swapin_result(struct vm_fault *vmf, unsigned int order,
-		unsigned long start, unsigned long pfn, unsigned int nr_pages);
+void hermit_pebs_account_swapin(struct mm_struct *mm, unsigned int order);
 bool hermit_pebs_snapshot(struct mm_struct *mm, unsigned long addr,
 			  struct hermit_pebs_observation *out);
 

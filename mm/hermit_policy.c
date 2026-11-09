@@ -21,7 +21,13 @@
 #define POLICY_BUCKET_BITS 10
 #define POLICY_BUCKETS (1U << POLICY_BUCKET_BITS)
 #define POLICY_PAGES_LIMIT 262144
-#define POLICY_STREAMS 64
+/* Stream state is set-associative: a key hashes to one set and may occupy any
+ * of its ways. With one slot per hash, two threads that collided reset each
+ * other's run on every fault and never reached the large-folio threshold.
+ */
+#define POLICY_STREAM_SET_BITS 3
+#define POLICY_STREAM_WAYS 8
+#define POLICY_STREAMS ((1U << POLICY_STREAM_SET_BITS) * POLICY_STREAM_WAYS)
 #define POLICY_SCAN 32
 #define POLICY_TTL NSEC_PER_SEC
 
@@ -67,6 +73,12 @@ struct policy_stream {
 	pid_t tid;
 	unsigned long pc, start, end, last;
 	u16 sequential;		/* consecutive base pages, demand + prefetch */
+	/* The last predicted batch [batch_start, batch_end) as actually read.
+	 * Later faults on its prefetched pages advance s->last through it, so a
+	 * run that breaks before batch_end left part of it unused.
+	 */
+	unsigned long batch_start, batch_end;
+	u16 fit;		/* length of the last predicted run, 0 = none yet */
 };
 struct hermit_policy_state {
 	spinlock_t lock;
@@ -83,6 +95,10 @@ static atomic_long_t predicted_pages, refault_pages, ranked_pages;
 /* Cold-evidence lifecycle: why observations did or did not become cold. */
 static atomic_long_t started_epochs, young_epochs, short_epochs, evicted_pages;
 static atomic_long_t sorted_lists, large_streams, unmapped_pages;
+/* A live stream (used within POLICY_TTL) replaced by a different key. */
+static atomic_long_t stream_evictions;
+/* Runs that ended inside a predicted batch; capped_batches = predictions cut by that cap. */
+static atomic_long_t batch_overruns, capped_batches;
 static atomic_long_t mglru_candidates, mglru_sort_bypasses;
 
 /* A round trip through MGLRU must not complete an old empty PTE interval. */
@@ -305,9 +321,15 @@ void hermit_policy_sample(struct mm_struct *mm, unsigned long addr, u64 time)
 {
 	struct hermit_policy_state *st = READ_ONCE(mm->hermit_policy);
 	struct policy_page *p;
-	u64 now = ktime_get_ns();
+	u64 now;
 
-	if (!st || !hermit_policy_active(mm) || time > now)
+	/* Samples only feed the negative-observation evidence (reuse, hot_until,
+	 * epoch_hit). Under MGLRU nothing reads it, so skip the lock entirely.
+	 */
+	if (!st || lru_gen_enabled() || !hermit_policy_active(mm))
+		return;
+	now = ktime_get_ns();
+	if (time > now)
 		return;
 	spin_lock(&st->lock);
 	p = policy_page(st, addr, false);
@@ -327,28 +349,82 @@ out:
 	spin_unlock(&st->lock);
 }
 
+static bool policy_stream_match(const struct policy_stream *s,
+		struct vm_fault *vmf, u64 gen, u64 epoch)
+{
+	return s->time && s->tid == task_pid_nr(current) &&
+	       s->task_start == current->start_time &&
+	       s->pc == vmf->hermit_fault_pc && s->start == vmf->vma->vm_start &&
+	       s->end == vmf->vma->vm_end && s->generation == gen && s->epoch == epoch;
+}
+
+/* Replacement order: unused or invalidated ways first, then the stream idle
+ * the longest. An expired stream (idle >= POLICY_TTL) is never counted as an
+ * eviction because it could no longer extend a run.
+ */
+static u64 policy_stream_age(const struct policy_stream *s, u64 gen, u64 epoch, u64 now)
+{
+	if (!s->time || s->generation != gen || s->epoch != epoch)
+		return ~0ULL;
+	return now > s->time ? now - s->time : 0;
+}
+
+/* Find this thread/PC/VMA stream. @create replaces a way on a miss; lookups
+ * from the prediction paths pass false so they never disturb other streams.
+ */
 static struct policy_stream *policy_stream(struct hermit_policy_state *st,
-		struct vm_fault *vmf)
+		struct vm_fault *vmf, bool create)
 {
 	struct vm_area_struct *vma = vmf->vma;
 	unsigned long key = vmf->hermit_fault_pc ^ (unsigned long)current;
-	struct policy_stream *s = &st->streams[hash_long(key, 6)];
+	struct policy_stream *set, *s, *victim = NULL;
 	u64 gen = atomic64_read(&vma->vm_mm->hermit_vma_generation);
+	u64 epoch = READ_ONCE(hermit_pebs_epoch);
+	u64 now = ktime_get_ns(), age, victim_age = 0;
+	unsigned int i;
 
-	if (s->tid != task_pid_nr(current) || s->task_start != current->start_time ||
-	    s->pc != vmf->hermit_fault_pc || s->start != vma->vm_start ||
-	    s->end != vma->vm_end || s->generation != gen ||
-	    s->epoch != READ_ONCE(hermit_pebs_epoch)) {
-		memset(s, 0, sizeof(*s));
-		s->tid = task_pid_nr(current);
-		s->task_start = current->start_time;
-		s->pc = vmf->hermit_fault_pc;
-		s->start = vma->vm_start;
-		s->end = vma->vm_end;
-		s->generation = gen;
-		s->epoch = READ_ONCE(hermit_pebs_epoch);
+	set = &st->streams[hash_long(key, POLICY_STREAM_SET_BITS) * POLICY_STREAM_WAYS];
+	for (i = 0; i < POLICY_STREAM_WAYS; i++) {
+		s = &set[i];
+		if (policy_stream_match(s, vmf, gen, epoch))
+			return s;
+		age = policy_stream_age(s, gen, epoch, now);
+		if (!victim || age > victim_age) {
+			victim = s;
+			victim_age = age;
+		}
 	}
-	return s;
+	if (!create)
+		return NULL;
+	if (victim_age < POLICY_TTL)
+		atomic_long_inc(&stream_evictions);
+	memset(victim, 0, sizeof(*victim));
+	victim->tid = task_pid_nr(current);
+	victim->task_start = current->start_time;
+	victim->pc = vmf->hermit_fault_pc;
+	victim->start = vma->vm_start;
+	victim->end = vma->vm_end;
+	victim->generation = gen;
+	victim->epoch = epoch;
+	return victim;
+}
+
+/* The run ended. Doubling sizes the next batch from the run so far, so a run
+ * that stops mid-batch leaves the rest of that batch read for nothing; with
+ * fixed-length accesses (one 128 KiB record per region) that happens on every
+ * run. Remember the length of a run that used prediction, and let the next run
+ * of this stream read up to that length but not past it. A run that grows
+ * beyond the learned length is no longer capped and records the longer length
+ * when it ends. Runs that never predicted carry no evidence and keep the value.
+ */
+static void policy_stream_break(struct policy_stream *s)
+{
+	if (s->batch_end) {
+		if (s->last >= s->batch_start && s->last < s->batch_end - PAGE_SIZE)
+			atomic_long_inc(&batch_overruns);
+		s->fit = min_t(unsigned int, 1024, s->sequential + 1);
+	}
+	s->batch_start = s->batch_end = 0;
 }
 
 /* @start/@nr is the PTE range installed by this fault. A large folio maps
@@ -373,31 +449,49 @@ void hermit_policy_installed(struct vm_fault *vmf, unsigned long pfn,
 	if (!st)
 		return;
 	spin_lock(&st->lock);
-	p = policy_page(st, addr, nr == 1);
-	if (p) {
-		refault = p->ghost && now - p->observed < POLICY_TTL &&
-			p->start == vma->vm_start && p->end == vma->vm_end &&
-			p->epoch == READ_ONCE(hermit_pebs_epoch) &&
-			p->generation == atomic64_read(&vma->vm_mm->hermit_vma_generation);
-		if (nr == 1)
-			policy_reset(p, vma, pfn, now);
-		else
-			policy_free(st, p);	/* large folios are never tracked */
-		if (refault && nr == 1) {
-			p->hot_until = now + 4 * policy_interval();
+	if (lru_gen_enabled()) {
+		/* MGLRU: do_swap_page() read the swap shadow before swap-in, and
+		 * protecting the refaulted page is MGLRU's job. No per-page entry.
+		 */
+		refault = vmf->hermit_refault;
+		if (refault)
 			atomic_long_inc(&refault_pages);
+	} else {
+		p = policy_page(st, addr, nr == 1);
+		if (p) {
+			refault = p->ghost && now - p->observed < POLICY_TTL &&
+				p->start == vma->vm_start && p->end == vma->vm_end &&
+				p->epoch == READ_ONCE(hermit_pebs_epoch) &&
+				p->generation == atomic64_read(&vma->vm_mm->hermit_vma_generation);
+			if (nr == 1)
+				policy_reset(p, vma, pfn, now);
+			else
+				policy_free(st, p);	/* large folios are never tracked */
+			if (refault && nr == 1) {
+				p->hot_until = now + 4 * policy_interval();
+				atomic_long_inc(&refault_pages);
+			}
 		}
 	}
 	st->refault = (st->refault * 7 + (refault ? 1024 : 0)) / 8;
-	s = policy_stream(st, vmf);
+	s = policy_stream(st, vmf, true);
 	if (s->time && now - s->time < POLICY_TTL && start <= s->last + PAGE_SIZE &&
-	    addr >= s->last + PAGE_SIZE && addr < end)
+	    addr >= s->last + PAGE_SIZE && addr < end) {
 		s->sequential = min_t(unsigned int, 1024, s->sequential +
 				      ((end - (s->last + PAGE_SIZE)) >> PAGE_SHIFT));
-	else
+	} else {
+		policy_stream_break(s);
 		s->sequential = 0;
+	}
 	s->last = end - PAGE_SIZE;
 	s->time = now;
+	/* hermit_swapin_pages() read this many pages from the demand page on;
+	 * later faults on them advance s->last through the batch.
+	 */
+	if (vmf->hermit_batch_pages > 1 && nr == 1) {
+		s->batch_start = addr;
+		s->batch_end = addr + (unsigned long)vmf->hermit_batch_pages * PAGE_SIZE;
+	}
 #ifdef CONFIG_MEMCG
 	if (current->mm) {
 		struct mem_cgroup *memcg = get_mem_cgroup_from_mm(current->mm);
@@ -419,21 +513,33 @@ static unsigned int policy_swapin_limit(void)
 }
 
 /* Length of the current forward run of this thread/PC/VMA, 0 if broken. */
+/* Length of the current forward run, 0 if broken. @remaining, if not NULL,
+ * receives the pages left from this fault to the end of the last predicted
+ * run's length, or 0 when that length gives no bound (none learned yet, or
+ * this run already reached it and keeps growing).
+ */
 static unsigned int policy_run(struct hermit_policy_state *st,
-		struct vm_fault *vmf, u64 now)
+		struct vm_fault *vmf, u64 now, unsigned int *remaining)
 {
-	struct policy_stream *s = policy_stream(st, vmf);
+	struct policy_stream *s = policy_stream(st, vmf, false);
+	unsigned int run;
 
-	if (!s->time || now - s->time >= POLICY_TTL || st->refault >= 256 ||
+	if (remaining)
+		*remaining = 0;
+	if (!s || now - s->time >= POLICY_TTL || st->refault >= 256 ||
 	    (vmf->address & PAGE_MASK) != s->last + PAGE_SIZE)
 		return 0;
-	return s->sequential;
+	run = s->sequential;
+	/* The demand page is page run + 1 of this run (0-based). */
+	if (remaining && s->fit > run + 1)
+		*remaining = s->fit - (run + 1);
+	return run;
 }
 
 unsigned int hermit_policy_predict(struct vm_fault *vmf)
 {
 	struct hermit_policy_state *st = policy_state(vmf->vma->vm_mm);
-	unsigned int nr = 1, run, pebs;
+	unsigned int nr = 1, run, pebs, remaining;
 	u64 now = ktime_get_ns();
 
 	if (!st || !vmf->hermit_fault_pc)
@@ -447,11 +553,20 @@ unsigned int hermit_policy_predict(struct vm_fault *vmf)
 	 * consumed batch of N pages extends the run by N, so the next miss
 	 * reads 2N. No cold-start padding, no inference from WRITE sizes.
 	 */
-	run = policy_run(st, vmf, now);
+	run = policy_run(st, vmf, now, &remaining);
 	spin_unlock(&st->lock);
-	if (run >= 2)
+	if (run >= 2) {
 		nr = min_t(unsigned int, policy_swapin_limit(),
 			   roundup_pow_of_two(run + 1));
+		/* Doubling alone overshoots a fixed-length access by up to the
+		 * last batch; stop at the length this stream's last predicted run
+		 * reached. Batches are SG lists, so any page count is legal.
+		 */
+		if (remaining && nr > remaining) {
+			nr = remaining;
+			atomic_long_inc(&capped_batches);
+		}
+	}
 	if (hermit_policy_feature(HERMIT_POLICY_PEBS)) {
 		pebs = hermit_pebs_predict_pages(vmf);
 		nr = max(nr, min(pebs, policy_swapin_limit()));
@@ -467,6 +582,7 @@ unsigned int hermit_policy_predict(struct vm_fault *vmf)
 bool hermit_policy_large(struct vm_fault *vmf)
 {
 	struct hermit_policy_state *st;
+	unsigned int run, remaining;
 	bool large;
 
 	if (!hermit_policy_feature(HERMIT_POLICY_LARGE) || !vmf->hermit_fault_pc)
@@ -475,7 +591,13 @@ bool hermit_policy_large(struct vm_fault *vmf)
 	if (!st)
 		return false;
 	spin_lock(&st->lock);
-	large = policy_run(st, vmf, ktime_get_ns()) >= 2 * policy_swapin_limit();
+	run = policy_run(st, vmf, ktime_get_ns(), &remaining);
+	/* A large folio cannot be trimmed to the learned run length; when the
+	 * run is expected to end within the SG budget, stay on the capped
+	 * base-page batches instead.
+	 */
+	large = run >= 2 * policy_swapin_limit() &&
+		(!remaining || remaining >= 2 * policy_swapin_limit());
 	spin_unlock(&st->lock);
 	if (large)
 		atomic_long_inc(&large_streams);
@@ -501,22 +623,27 @@ static bool hint_one(struct folio *folio, struct vm_area_struct *vma,
 	if (!hermit_policy_active(vma->vm_mm))
 		return true;
 	if (walk->mglru) {
+		/* MGLRU selected this folio and its swap shadow will report a
+		 * refault, so neither a table entry nor a ghost is needed: the
+		 * batch key comes straight from the VMA, without taking the lock.
+		 */
 		if (mm_has_notifiers(vma->vm_mm))
 			return true;
 		st = policy_state(vma->vm_mm);
+		if (!st)
+			return true;
+		hint->owner = st->id;
+		hint->generation = atomic64_read(&vma->vm_mm->hermit_vma_generation);
+		hint->start = vma->vm_start;
+		hint->end = vma->vm_end;
+		hint->address = address & PAGE_MASK;
+		hint->mglru = true;
+		return true;
 	}
 	if (!st)
 		return true;
 	spin_lock(&st->lock);
-	/* First eviction must also leave a ghost: pages need not have been
-	 * swapped in or observed by Hermit before MGLRU selects them.
-	 */
-	p = policy_page(st, address, walk->mglru);
-	if (p && walk->mglru && (p->pfn != folio_pfn(folio) || p->ghost ||
-	    p->start != vma->vm_start || p->end != vma->vm_end ||
-	    p->epoch != READ_ONCE(hermit_pebs_epoch) ||
-	    p->generation != atomic64_read(&vma->vm_mm->hermit_vma_generation)))
-		policy_reset(p, vma, folio_pfn(folio), now);
+	p = policy_page(st, address, false);
 	if (p && p->pfn == folio_pfn(folio) && !p->ghost &&
 	    p->epoch == READ_ONCE(hermit_pebs_epoch) &&
 	    p->generation == atomic64_read(&vma->vm_mm->hermit_vma_generation)) {
@@ -726,6 +853,9 @@ static int policy_stats_show(struct seq_file *m, void *unused)
 		{ "unmapped_4k", &unmapped_pages },
 		{ "sorted_lists", &sorted_lists },
 		{ "large_streams", &large_streams },
+		{ "stream_evictions", &stream_evictions },
+		{ "batch_overruns", &batch_overruns },
+		{ "capped_batches", &capped_batches },
 		{ "mglru_candidates", &mglru_candidates },
 		{ "mglru_sort_bypasses", &mglru_sort_bypasses },
 	};

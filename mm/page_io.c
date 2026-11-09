@@ -344,7 +344,7 @@ static inline void count_swpout_vm_event(struct folio *folio)
 
 /* Preserve the entire folio; use the largest supported write segment.
  * Future cold-page merging can consult hermit_pebs_snapshot() before unmap.
- * The swap-in predictor and force-order override never affect write sizing.
+ * The swap-in predictor never affects write sizing.
  */
 int hermit_swapout_order(struct folio *folio)
 {

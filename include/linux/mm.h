@@ -625,10 +625,8 @@ static inline bool fault_flag_allow_retry_first(enum fault_flag flags)
 struct vm_fault {
 #ifdef CONFIG_HERMIT
 	unsigned long hermit_fault_pc;
-	u64 hermit_policy_time;
-	unsigned int hermit_policy_order;
-	bool hermit_policy_used;
-	bool hermit_policy_large;	/* long stream: keep largest legal folio */
+	bool hermit_refault;		/* MGLRU: recent refault of a working-set page */
+	unsigned int hermit_batch_pages;	/* pages hermit_swapin_pages() read */
 #endif
 	const struct {
 		struct vm_area_struct *vma;	/* Target VMA */
