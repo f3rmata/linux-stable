@@ -4,6 +4,7 @@
 #include <linux/hermit_backend.h>
 #include <linux/hermit_pebs.h>
 #include <linux/hermit_policy.h>
+#include <linux/hermit_stats.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
 
@@ -50,6 +51,7 @@ static int __init hermit_init(void)
 	hermit_backend_debugfs_init(root);
 	hermit_pebs_debugfs_init(root);
 	hermit_policy_debugfs_init(root);
+	hermit_stats_debugfs_init(root);
 	return 0;
 }
 subsys_initcall(hermit_init);

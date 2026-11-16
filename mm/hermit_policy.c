@@ -30,6 +30,12 @@
 #define POLICY_STREAMS ((1U << POLICY_STREAM_SET_BITS) * POLICY_STREAM_WAYS)
 #define POLICY_SCAN 32
 #define POLICY_TTL NSEC_PER_SEC
+/* Cost instrumentation only: direct-mapped slots for the swap entries that
+ * hermit_swapin_pages() read speculatively. 256 slots cover several in-flight
+ * batches; a collision only loses one hit count, never a policy decision.
+ */
+#define POLICY_PREFETCH_BITS 8
+#define POLICY_PREFETCH_SLOTS (1U << POLICY_PREFETCH_BITS)
 
 /* debugfs tunables; see HERMIT_POLICY_* for the ablation bits. */
 static u32 policy_features = HERMIT_POLICY_DEFAULT;
@@ -87,6 +93,13 @@ struct hermit_policy_state {
 	struct policy_stream streams[POLICY_STREAMS];
 	unsigned int nr, refault;
 	u64 id;
+	/* Swap entries read speculatively by hermit_swapin_pages(), used only by
+	 * the swap-in cost counters (debugfs swapin_cost_enable).
+	 */
+	struct {
+		unsigned long entry;	/* swp_entry_t.val */
+		u64 time;		/* 0 = unused */
+	} prefetch[POLICY_PREFETCH_SLOTS];
 };
 static atomic64_t policy_ids;
 static atomic64_t policy_aging_epoch;
@@ -602,6 +615,50 @@ bool hermit_policy_large(struct vm_fault *vmf)
 	if (large)
 		atomic_long_inc(&large_streams);
 	return large;
+}
+
+/* Record one page read speculatively by hermit_swapin_pages(). The caller
+ * tests hermit_swapin_cost_enabled() first, so an uninstrumented run pays
+ * nothing for this bookkeeping.
+ */
+void hermit_policy_prefetched(struct mm_struct *mm, unsigned long entry_val)
+{
+	struct hermit_policy_state *st = READ_ONCE(mm->hermit_policy);
+	typeof(st->prefetch[0]) *slot;
+	unsigned long flags;
+
+	if (!st)
+		return;
+	spin_lock_irqsave(&st->lock, flags);
+	slot = &st->prefetch[hash_long(entry_val, POLICY_PREFETCH_BITS)];
+	slot->entry = entry_val;
+	slot->time = ktime_get_ns();
+	spin_unlock_irqrestore(&st->lock, flags);
+}
+
+/* A demand fault found its page in swapcache: was it one of ours? A hit is
+ * consumed so a later refault of the same entry is not counted twice.
+ */
+bool hermit_policy_prefetch_hit(struct mm_struct *mm, unsigned long entry_val)
+{
+	struct hermit_policy_state *st = READ_ONCE(mm->hermit_policy);
+	typeof(st->prefetch[0]) *slot;
+	unsigned long flags;
+	u64 now;
+	bool hit = false;
+
+	if (!st)
+		return false;
+	now = ktime_get_ns();
+	spin_lock_irqsave(&st->lock, flags);
+	slot = &st->prefetch[hash_long(entry_val, POLICY_PREFETCH_BITS)];
+	if (slot->time && slot->entry == entry_val &&
+	    now - slot->time < POLICY_TTL) {
+		slot->time = 0;
+		hit = true;
+	}
+	spin_unlock_irqrestore(&st->lock, flags);
+	return hit;
 }
 
 struct hint_walk {

@@ -952,6 +952,18 @@ struct folio *hermit_swapin_pages(swp_entry_t entry, gfp_t gfp, struct vm_fault 
 	 */
 	vmf->hermit_batch_pages = count;
 	nr_batches = DIV_ROUND_UP(count, HERMIT_BATCH_MAX);
+	/* Cost instrumentation (debugfs swapin_cost_enable): remember the pages
+	 * this fault reads for other addresses, so a later demand fault that
+	 * finds one in swapcache is reported as a prefetch hit. Only the demand
+	 * page (batch 0, page 0) is excluded.
+	 */
+	if (hermit_swapin_cost_enabled() && count > 1) {
+		for (b = 0; b < nr_batches; b++)
+			for (i = b ? 0 : 1; i < batch[b].nr; i++)
+				hermit_policy_prefetched(vmf->vma->vm_mm,
+						batch[b].entries[i].val);
+		hermit_swapin_cost_prefetched(count - 1);
+	}
 	time = ktime_get_ns();
 	/* Every batch is in flight before the fault waits on the first. */
 	for (b = 0; b < nr_batches; b++) {

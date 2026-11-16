@@ -50,6 +50,15 @@ void hermit_policy_observe(struct folio *folio, struct vm_area_struct *vma,
 void hermit_policy_installed(struct vm_fault *vmf, unsigned long pfn,
 		unsigned long start, unsigned int nr);
 unsigned int hermit_policy_predict(struct vm_fault *vmf);
+/*
+ * Cost instrumentation (debugfs swapin_cost_enable) only. @entry_val is a
+ * swp_entry_t.val. Prefetched pages are remembered for one POLICY_TTL so a
+ * later demand fault that finds the page in swapcache can be counted as a
+ * prefetch hit instead of a backend read. Both calls are cheap no-ops when the
+ * caller has already tested hermit_swapin_cost_enabled().
+ */
+void hermit_policy_prefetched(struct mm_struct *mm, unsigned long entry_val);
+bool hermit_policy_prefetch_hit(struct mm_struct *mm, unsigned long entry_val);
 void hermit_policy_hint(struct folio *folio, struct hermit_reclaim_hint *hint);
 void hermit_policy_defer_flush(struct vm_area_struct *vma, unsigned long addr);
 void hermit_policy_eviction(struct folio *folio, struct hermit_reclaim_hint *hint,

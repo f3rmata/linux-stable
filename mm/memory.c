@@ -4779,6 +4779,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	bool hermit_swap_fault = false;
 	bool hermit_major_fault = false;
 	bool hermit_remote_fault = false;
+	bool hermit_prefetch_hit = false;
 	u64 hermit_observe_start_ns = READ_ONCE(hermit_pebs_enabled) &&
 		vmf->hermit_fault_pc ? ktime_get_ns() : 0;
 #endif
@@ -4864,6 +4865,12 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 		 */
 		if (hermit_remote_fault && lru_gen_enabled())
 			vmf->hermit_refault = folio_test_workingset(folio);
+		/* Cost instrumentation: the page was already read, either by this
+		 * fault's own batch or by an earlier policy readahead.
+		 */
+		if (hermit_remote_fault && hermit_swapin_cost_enabled() &&
+		    hermit_policy_prefetch_hit(vma->vm_mm, entry.val))
+			hermit_prefetch_hit = true;
 #endif
 	}
 	swapcache = folio;
@@ -5284,6 +5291,21 @@ check_folio:
 		hermit_pebs_fault(vma->vm_mm, vmf->address, vmf->hermit_fault_pc,
 				  hermit_observe_start_ns);
 		hermit_pebs_account_swapin(vma->vm_mm, folio_order(folio));
+	}
+	/*
+	 * Same clock as hermit_fault_start_ns: no new timestamp is taken at fault
+	 * entry, and the interval covers backend read, swapcache work and any
+	 * wait, i.e. everything between entering do_swap_page() and the PTE being
+	 * installed. Disabled by default (static key), so the cost is one patched
+	 * branch when the debugfs toggle is off.
+	 */
+	if (hermit_swap_fault && hermit_swapin_cost_enabled()) {
+		u64 installed_ns = ktime_get_mono_fast_ns();
+
+		hermit_swapin_cost_add(folio_order(folio),
+				       installed_ns - hermit_fault_start_ns);
+		if (hermit_prefetch_hit)
+			hermit_swapin_cost_hit(installed_ns - hermit_fault_start_ns);
 	}
 #endif
 	arch_do_swap_page_nr(vma->vm_mm, vma, address, pte, pte, nr_pages);
