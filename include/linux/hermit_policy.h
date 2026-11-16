@@ -31,6 +31,7 @@ struct hermit_reclaim_hint {
 #define HERMIT_POLICY_RESERVE	BIT(6)	/* replace apt_reclaim headroom/workers */
 #define HERMIT_POLICY_LARGE	BIT(7)	/* long sequential streams use mTHP path */
 #define HERMIT_POLICY_MGLRU	BIT(8)	/* reuse MGLRU selection for SG writeout */
+#define HERMIT_POLICY_MEDIUM	BIT(9)	/* fit-driven 16-64 KiB swap-in orders */
 #define HERMIT_POLICY_DEFAULT	(HERMIT_POLICY_SWAPIN | HERMIT_POLICY_PEBS | \
 				 HERMIT_POLICY_SORT | HERMIT_POLICY_OBSERVE | \
 				 HERMIT_POLICY_FLUSH | HERMIT_POLICY_BATCH | \
@@ -39,7 +40,16 @@ struct hermit_reclaim_hint {
 #ifdef CONFIG_HERMIT
 bool hermit_policy_feature(unsigned int feature);
 bool hermit_policy_reserve_mode(void);
-bool hermit_policy_large(struct vm_fault *vmf);
+/*
+ * Order suggestion for the Hermit swap-in path: returns the highest folio
+ * order the caller may allocate, or -1 to keep the 4 KiB SG batches. @orders
+ * is the caller's legal order mask; it is only read. @medium reports a
+ * fit-driven HERMIT_POLICY_MEDIUM suggestion (a LARGE one is not counted).
+ */
+int hermit_policy_swapin_order(struct vm_fault *vmf, unsigned long orders,
+		bool *medium);
+void hermit_policy_medium_used(unsigned int order);
+void hermit_policy_medium_fallback(bool alloc);
 void hermit_policy_unmap(struct vm_area_struct *vma, unsigned long start,
 		unsigned long end);
 bool hermit_policy_active(struct mm_struct *mm);

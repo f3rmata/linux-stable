@@ -43,6 +43,12 @@ static u32 policy_cold_us = 1000;	/* minimum empty observation interval */
 static u32 policy_cold_epochs = 1;	/* empty intervals required for cold */
 static u32 policy_pages_max = 32768;	/* tracked base pages per mm */
 static u32 policy_swapin_max = HERMIT_SWAPIN_MAX;
+/* Phase B: one medium folio instead of a 4 KiB batch. The default ceiling is
+ * 64 KiB because upstream swpout fallback rates rise steeply above it, and a
+ * segment length must repeat before it is trusted.
+ */
+static u32 policy_medium_max_order = 4;
+static u32 policy_medium_stable = 3;
 
 bool hermit_policy_feature(unsigned int feature)
 {
@@ -85,6 +91,12 @@ struct policy_stream {
 	 */
 	unsigned long batch_start, batch_end;
 	u16 fit;		/* length of the last predicted run, 0 = none yet */
+	/* Medium-order confidence: how many completed segments in a row ended at
+	 * the same rounded-down power-of-two length. Both fields live in the
+	 * padding the struct already had, so no stream slot grows.
+	 */
+	u8 fit_order;		/* ilog2(fit) */
+	u8 fit_stable;		/* consecutive completed segments of fit_order */
 };
 struct hermit_policy_state {
 	spinlock_t lock;
@@ -113,6 +125,12 @@ static atomic_long_t stream_evictions;
 /* Runs that ended inside a predicted batch; capped_batches = predictions cut by that cap. */
 static atomic_long_t batch_overruns, capped_batches;
 static atomic_long_t mglru_candidates, mglru_sort_bypasses;
+/* Fit-driven medium orders: one suggestion per fault, then exactly one of
+ * medium_used[order], medium_fallback_alloc or medium_fallback_extent.
+ */
+static atomic_long_t medium_suggested, medium_fallback_alloc;
+static atomic_long_t medium_fallback_extent;
+static atomic_long_t medium_used[PMD_ORDER + 1];
 
 /* A round trip through MGLRU must not complete an old empty PTE interval. */
 void hermit_policy_lru_changed(void)
@@ -432,10 +450,25 @@ static struct policy_stream *policy_stream(struct hermit_policy_state *st,
  */
 static void policy_stream_break(struct policy_stream *s)
 {
+	unsigned int order;
+
 	if (s->batch_end) {
 		if (s->last >= s->batch_start && s->last < s->batch_end - PAGE_SIZE)
 			atomic_long_inc(&batch_overruns);
 		s->fit = min_t(unsigned int, 1024, s->sequential + 1);
+		/* Confidence that this is a fixed-length access: count the completed
+		 * segments that ended at the same rounded-down power of two. A new
+		 * length starts its own run at one, so a mixed workload never looks
+		 * stable.
+		 */
+		order = ilog2(s->fit);
+		if (order == s->fit_order) {
+			if (s->fit_stable < 255)
+				s->fit_stable++;
+		} else {
+			s->fit_order = order;
+			s->fit_stable = 1;
+		}
 	}
 	s->batch_start = s->batch_end = 0;
 }
@@ -494,7 +527,11 @@ void hermit_policy_installed(struct vm_fault *vmf, unsigned long pfn,
 				      ((end - (s->last + PAGE_SIZE)) >> PAGE_SHIFT));
 	} else {
 		policy_stream_break(s);
-		s->sequential = 0;
+		/* The demand page of a new run is not counted, so a folio that also
+		 * mapped the rest of the segment must add those pages itself; the
+		 * equivalent 4 KiB batch counts them through later swapcache faults.
+		 */
+		s->sequential = nr > 1 ? min_t(unsigned int, 1024, nr - 1) : 0;
 	}
 	s->last = end - PAGE_SIZE;
 	s->time = now;
@@ -504,6 +541,13 @@ void hermit_policy_installed(struct vm_fault *vmf, unsigned long pfn,
 	if (vmf->hermit_batch_pages > 1 && nr == 1) {
 		s->batch_start = addr;
 		s->batch_end = addr + (unsigned long)vmf->hermit_batch_pages * PAGE_SIZE;
+	} else if (nr > 1) {
+		/* A large folio maps @nr pages at once, which must look like a batch
+		 * of @nr base pages to the run-break logic above: the folio is the
+		 * whole read, so its range is what the next run is measured against.
+		 */
+		s->batch_start = start;
+		s->batch_end = end;
 	}
 #ifdef CONFIG_MEMCG
 	if (current->mm) {
@@ -588,33 +632,102 @@ unsigned int hermit_policy_predict(struct vm_fault *vmf)
 	return nr;
 }
 
-/* A long forward run whose next pages exceed the SG budget is cheaper as one
- * mTHP read of a contiguous remote extent; alloc_swap_folio() still checks
- * extent coverage and remote adjacency for every candidate order.
+/*
+ * Fit-driven medium order: the last completed segments all had the same
+ * rounded-down power-of-two length, so that length can be read as one folio
+ * without reading past the segment. The folio is allocated at
+ * ALIGN_DOWN(fault, 1 << order), so only an order that starts exactly at this
+ * position is legal: pages already mapped in front of it are no longer swap
+ * entries. The tunable ceiling keeps the default at 64 KiB, where upstream
+ * swpout fallback is still cheap.
  */
-bool hermit_policy_large(struct vm_fault *vmf)
+static int policy_medium_order(struct policy_stream *s, unsigned long addr)
+{
+	unsigned int pos, left, order, max;
+
+	if (s->fit < 4 ||
+	    s->fit_stable < clamp_t(u32, READ_ONCE(policy_medium_stable), 1, 8))
+		return -1;
+	/* The demand page of a contiguous run is page sequential + 1; a fault
+	 * that does not continue the run starts a new segment at page 0.
+	 */
+	pos = addr == s->last + PAGE_SIZE ? s->sequential + 1 : 0;
+	if (pos + 1 > s->fit)		/* the run already reached the learned length */
+		return -1;
+	left = s->fit - pos;
+	max = clamp_t(u32, READ_ONCE(policy_medium_max_order), 2, PMD_ORDER);
+	order = min_t(unsigned int, ilog2(s->fit), max);
+	while (order >= 2 &&
+	       ((1U << order) > left || (pos & ((1U << order) - 1))))
+		order--;
+	return order >= 2 ? (int)order : -1;
+}
+
+/*
+ * Suggested folio order for this fault, -1 to keep the 4 KiB SG batches.
+ * LARGE keeps its phase-A rule (a long run that cannot be trimmed to the SG
+ * budget is cheaper as one contiguous mTHP read) and lets alloc_swap_folio()
+ * validate the extent; MEDIUM adds a fit-driven order that the caller validates
+ * before allocating anything.
+ */
+int hermit_policy_swapin_order(struct vm_fault *vmf, unsigned long orders,
+		bool *medium)
 {
 	struct hermit_policy_state *st;
-	unsigned int run, remaining;
-	bool large;
+	struct policy_stream *s;
+	unsigned int run, remaining, limit;
+	u64 now;
+	int order = -1;
 
-	if (!hermit_policy_feature(HERMIT_POLICY_LARGE) || !vmf->hermit_fault_pc)
-		return false;
+	if (medium)
+		*medium = false;
+	if (!vmf->hermit_fault_pc || !(orders & ~(BIT(0) | BIT(1))))
+		return -1;
+	if (!hermit_policy_feature(HERMIT_POLICY_LARGE) &&
+	    !hermit_policy_feature(HERMIT_POLICY_MEDIUM))
+		return -1;
 	st = READ_ONCE(vmf->vma->vm_mm->hermit_policy);
 	if (!st)
-		return false;
+		return -1;
+	now = ktime_get_ns();
+	limit = 2 * policy_swapin_limit();
 	spin_lock(&st->lock);
-	run = policy_run(st, vmf, ktime_get_ns(), &remaining);
-	/* A large folio cannot be trimmed to the learned run length; when the
-	 * run is expected to end within the SG budget, stay on the capped
-	 * base-page batches instead.
-	 */
-	large = run >= 2 * policy_swapin_limit() &&
-		(!remaining || remaining >= 2 * policy_swapin_limit());
-	spin_unlock(&st->lock);
-	if (large)
+	run = policy_run(st, vmf, now, &remaining);
+	if (hermit_policy_feature(HERMIT_POLICY_LARGE) && run >= limit &&
+	    (!remaining || remaining >= limit)) {
+		/* No extra restriction: take the largest legal folio. */
+		order = min_t(unsigned int, ilog2(orders), PMD_ORDER);
 		atomic_long_inc(&large_streams);
-	return large;
+	} else if (hermit_policy_feature(HERMIT_POLICY_MEDIUM)) {
+		s = policy_stream(st, vmf, false);
+		if (s && now - s->time < POLICY_TTL && st->refault < 256) {
+			order = policy_medium_order(s, vmf->address & PAGE_MASK);
+			if (order >= 0) {
+				if (medium)
+					*medium = true;
+				atomic_long_inc(&medium_suggested);
+			}
+		}
+	}
+	spin_unlock(&st->lock);
+	return order;
+}
+
+/* Called from alloc_swap_folio() only when a MEDIUM order was requested. */
+void hermit_policy_medium_used(unsigned int order)
+{
+	if (order >= 2 && order <= PMD_ORDER)
+		atomic_long_inc(&medium_used[order]);
+	else
+		atomic_long_inc(&medium_fallback_alloc);
+}
+
+/* The requested order was not used: @alloc separates an allocation or memcg
+ * charge failure from an extent that no legal order covered.
+ */
+void hermit_policy_medium_fallback(bool alloc)
+{
+	atomic_long_inc(alloc ? &medium_fallback_alloc : &medium_fallback_extent);
 }
 
 /* Record one page read speculatively by hermit_swapin_pages(). The caller
@@ -920,6 +1033,18 @@ static int policy_stats_show(struct seq_file *m, void *unused)
 
 	for (i = 0; i < ARRAY_SIZE(rows); i++)
 		seq_printf(m, "%s %ld\n", rows[i].name, atomic_long_read(rows[i].value));
+	/* Phase B, appended: one suggestion per fault, then exactly one of the
+	 * per-order / fallback counters (order 0 and 1 are never medium orders).
+	 */
+	seq_printf(m, "medium_suggested %ld\n",
+		   atomic_long_read(&medium_suggested));
+	for (i = 2; i <= PMD_ORDER; i++)
+		seq_printf(m, "medium_used_order%u %ld\n", i,
+			   atomic_long_read(&medium_used[i]));
+	seq_printf(m, "medium_fallback_alloc %ld\n",
+		   atomic_long_read(&medium_fallback_alloc));
+	seq_printf(m, "medium_fallback_extent %ld\n",
+		   atomic_long_read(&medium_fallback_extent));
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(policy_stats);
@@ -931,4 +1056,8 @@ void hermit_policy_debugfs_init(struct dentry *root)
 	debugfs_create_u32("policy_cold_epochs", 0600, root, &policy_cold_epochs);
 	debugfs_create_u32("policy_pages_max", 0600, root, &policy_pages_max);
 	debugfs_create_u32("policy_swapin_max", 0600, root, &policy_swapin_max);
+	debugfs_create_u32("policy_medium_max_order", S_IRUSR | S_IWUSR, root,
+			   &policy_medium_max_order);
+	debugfs_create_u32("policy_medium_stable", S_IRUSR | S_IWUSR, root,
+			   &policy_medium_stable);
 }

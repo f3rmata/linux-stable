@@ -627,6 +627,7 @@ struct vm_fault {
 	unsigned long hermit_fault_pc;
 	bool hermit_refault;		/* MGLRU: recent refault of a working-set page */
 	unsigned int hermit_batch_pages;	/* pages hermit_swapin_pages() read */
+	int hermit_folio_order;		/* MEDIUM: validated folio order, 0 = none */
 #endif
 	const struct {
 		struct vm_area_struct *vma;	/* Target VMA */

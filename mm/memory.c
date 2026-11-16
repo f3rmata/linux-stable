@@ -4631,6 +4631,18 @@ static struct folio *alloc_swap_folio(struct vm_fault *vmf)
 	if (!orders)
 		goto fallback;
 
+#ifdef CONFIG_HERMIT
+	/* A MEDIUM order the caller already validated under this PTE lock: the
+	 * exact PTE batch is checked again before the folio is installed, so only
+	 * the allocation loop is left.
+	 */
+	if (vmf->hermit_folio_order) {
+		orders &= BIT(vmf->hermit_folio_order + 1) - 1;
+		order = highest_order(orders);
+		goto hermit_alloc;
+	}
+#endif
+
 	pte = pte_offset_map_lock(vmf->vma->vm_mm, vmf->pmd,
 				  vmf->address & PMD_MASK, &ptl);
 	if (unlikely(!pte))
@@ -4651,15 +4663,32 @@ static struct folio *alloc_swap_folio(struct vm_fault *vmf)
 
 	order = highest_order(orders);
 
+#ifdef CONFIG_HERMIT
+hermit_alloc:
+#endif
 	/* Try allocating the highest of the remaining orders. */
-	gfp = vma_thp_gfp_mask(vma);
+#ifdef CONFIG_HERMIT
+	/* A 16-64 KiB swap-in must not stall for synchronous compaction; if the
+	 * folio is unavailable, fall back to the base page instead.
+	 */
+	if (vmf->hermit_folio_order)
+		gfp = (vma_thp_gfp_mask(vma) & ~__GFP_DIRECT_RECLAIM) |
+		      __GFP_NORETRY | __GFP_NOWARN;
+	else
+#endif
+		gfp = vma_thp_gfp_mask(vma);
 	while (orders) {
 		addr = ALIGN_DOWN(vmf->address, PAGE_SIZE << order);
 		folio = vma_alloc_folio(gfp, order, vma, addr);
 		if (folio) {
 			if (!mem_cgroup_swapin_charge_folio(folio, vma->vm_mm,
-							    gfp, entry))
+							    gfp, entry)) {
+#ifdef CONFIG_HERMIT
+				if (vmf->hermit_folio_order)
+					hermit_policy_medium_used(order);
+#endif
 				return folio;
+			}
 			count_mthp_stat(order, MTHP_STAT_SWPIN_FALLBACK_CHARGE);
 			folio_put(folio);
 		}
@@ -4667,6 +4696,10 @@ static struct folio *alloc_swap_folio(struct vm_fault *vmf)
 		order = next_order(&orders, order);
 	}
 
+#ifdef CONFIG_HERMIT
+	if (vmf->hermit_folio_order)
+		hermit_policy_medium_fallback(true);
+#endif
 fallback:
 	return __alloc_swap_folio(vmf);
 }
@@ -4703,26 +4736,96 @@ static bool hermit_shadow_refault(swp_entry_t entry)
 }
 
 /*
- * Can alloc_swap_folio() return anything but a base page here? Mirrors its
- * uffd, zswap and THP order filters; extent and PTE checks still run later.
- * Without this, a long stream under a 4 KiB ceiling would leave the batched
- * path for a "large" path that can only read one base page per fault.
+ * Orders alloc_swap_folio() may allocate for this fault. Mirrors its uffd,
+ * zswap and THP order filters; extent and PTE checks still run later. Without
+ * this, a long stream under a 4 KiB ceiling would leave the batched path for a
+ * "large" path that can only read one base page per fault.
  */
-static bool hermit_swapin_large_allowed(struct vm_fault *vmf)
+static unsigned long hermit_swapin_orders(struct vm_fault *vmf)
 {
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 	struct vm_area_struct *vma = vmf->vma;
 	unsigned long orders;
 
 	if (unlikely(userfaultfd_armed(vma)) || !zswap_never_enabled())
-		return false;
+		return 0;
 	orders = thp_vma_allowable_orders(vma, vma->vm_flags, TVA_PAGEFAULT,
 					  BIT(PMD_ORDER + 1) - 1);
-	orders = thp_vma_suitable_orders(vma, vmf->address, orders);
-	return orders & ~BIT(0);
+	return thp_vma_suitable_orders(vma, vmf->address, orders);
 #else
-	return false;
+	return 0;
 #endif
+}
+
+/*
+ * Highest order up to @top whose aligned range is one contiguous remote extent,
+ * or -1 when none is. Runs under the PTE lock once per MEDIUM suggestion: a
+ * range that fails here must not be read as a folio at all, because nothing
+ * guarantees the neighbouring pages belong to this segment.
+ */
+static int hermit_swapin_order_valid(struct vm_fault *vmf, unsigned long orders,
+		int top)
+{
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+	struct mm_struct *mm = vmf->vma->vm_mm;
+	spinlock_t *ptl;
+	pte_t *pte;
+	unsigned long addr;
+	int order;
+
+	/* Never validate an order the VMA cannot allocate, even when the
+	 * tunable ceiling sits above the legal mask.
+	 */
+	orders &= BIT(top + 1) - 1;
+	if (!(orders & ~(BIT(0) | BIT(1))))
+		return -1;
+	order = highest_order(orders);
+	pte = pte_offset_map_lock(mm, vmf->pmd, vmf->address & PMD_MASK, &ptl);
+	if (unlikely(!pte))
+		return -1;
+	while (orders) {
+		addr = ALIGN_DOWN(vmf->address, PAGE_SIZE << order);
+		if (can_swapin_thp(vmf, pte + pte_index(addr), 1 << order))
+			break;
+		order = next_order(&orders, order);
+	}
+	pte_unmap_unlock(pte, ptl);
+	return orders ? order : -1;
+#else
+	return -1;
+#endif
+}
+
+/*
+ * Should this fault read one large folio instead of the 4 KiB SG batches? A
+ * LARGE suggestion keeps its phase-A behaviour and alloc_swap_folio() validates
+ * the extent, so nothing changes for that ablation. A MEDIUM (fit-driven)
+ * suggestion is validated here, before any allocation: a misaligned or
+ * fragmented extent keeps the SG batches, and the order that is used is stored
+ * in @vmf so alloc_swap_folio() neither re-scans nor compacts.
+ */
+static bool hermit_swapin_folio(struct vm_fault *vmf)
+{
+	unsigned long orders = hermit_swapin_orders(vmf);
+	bool medium = false;
+	int order;
+
+	vmf->hermit_folio_order = 0;
+	if (!(orders & ~(BIT(0) | BIT(1))))
+		return false;
+	order = hermit_policy_swapin_order(vmf, orders, &medium);
+	if (order < 0)
+		return false;
+	if (!medium)
+		return true;
+	order = hermit_swapin_order_valid(vmf, orders, order);
+	if (order < 0) {
+		/* No legal order covers this range: keep the 4 KiB SG batches. */
+		hermit_policy_medium_fallback(false);
+		return false;
+	}
+	vmf->hermit_folio_order = order;
+	return true;
 }
 #endif
 
@@ -4851,6 +4954,8 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 #ifdef CONFIG_HERMIT
 	hermit_swap_fault = true;
 	hermit_remote_fault = hermit_backend_entry_remote(entry);
+	/* A retried fault reuses @vmf; a medium order is validated per attempt. */
+	vmf->hermit_folio_order = 0;
 #endif
 
 	folio = swap_cache_get_folio(entry);
@@ -4889,7 +4994,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 		 */
 		if (hermit_remote_fault && hermit_policy_active(vma->vm_mm) &&
 		    hermit_policy_feature(HERMIT_POLICY_SWAPIN) &&
-		    !(hermit_swapin_large_allowed(vmf) && hermit_policy_large(vmf))) {
+		    !hermit_swapin_folio(vmf)) {
 			folio = hermit_swapin_pages(entry, GFP_HIGHUSER_MOVABLE, vmf);
 			swapcache = folio;
 			goto swapin_allocated;
