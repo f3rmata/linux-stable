@@ -62,6 +62,7 @@
 #include <linux/hermit_stats.h>
 #include <linux/hermit_backend.h>
 #include <linux/hermit_policy.h>
+#include <linux/hermit_split.h>
 #endif
 
 #include <asm/tlbflush.h>
@@ -1375,6 +1376,24 @@ retry:
 		 * Try to allocate it some swap space here.
 		 * Lazyfree folio could be freed directly
 		 */
+#ifdef CONFIG_HERMIT
+		/*
+		 * PEBS-guided split (HERMIT_POLICY_SPLIT): MGLRU selected this folio
+		 * from the oldest generation; if PEBS shows only an aligned subrange
+		 * of it is hot, split it down to that sub-order so the cold remainder
+		 * is evicted at a small granularity instead of being kept whole. The
+		 * folio lock is held, and the split needs it not to be in swapcache,
+		 * so this runs before the swap allocation below.
+		 */
+		if (lru_gen_reclaim && hermit_split_try(folio, folio_list, memcg)) {
+			unsigned int split_nr = folio_nr_pages(folio);
+
+			/* The tail folios are accounted when they are dequeued. */
+			if (split_nr < nr_pages)
+				sc->nr_scanned -= nr_pages - split_nr;
+			nr_pages = split_nr;
+		}
+#endif
 		if (folio_test_anon(folio) && folio_test_swapbacked(folio)) {
 			if (!folio_test_swapcache(folio)) {
 				if (!(sc->gfp_mask & __GFP_IO))

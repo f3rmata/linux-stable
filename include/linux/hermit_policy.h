@@ -34,6 +34,7 @@ struct hermit_reclaim_hint {
 #define HERMIT_POLICY_MEDIUM	BIT(9)	/* fit-driven 16-64 KiB swap-in orders */
 #define HERMIT_POLICY_FITSTART	BIT(10)	/* first batch of a stable segment is fit-sized */
 #define HERMIT_POLICY_PTEBATCH	BIT(11)	/* map the pages an SG batch read ahead */
+#define HERMIT_POLICY_SPLIT	BIT(12)	/* split large folios to their hot sub-order */
 #define HERMIT_POLICY_DEFAULT	(HERMIT_POLICY_SWAPIN | HERMIT_POLICY_PEBS | \
 				 HERMIT_POLICY_SORT | HERMIT_POLICY_OBSERVE | \
 				 HERMIT_POLICY_FLUSH | HERMIT_POLICY_BATCH | \

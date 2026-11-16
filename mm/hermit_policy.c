@@ -7,6 +7,7 @@
 #include <linux/hermit_backend.h>
 #include <linux/hermit_pebs.h>
 #include <linux/hermit_policy.h>
+#include <linux/hermit_split.h>
 #include <linux/ktime.h>
 #include <linux/memcontrol.h>
 #include <linux/mm.h>
@@ -1143,6 +1144,8 @@ static int policy_stats_show(struct seq_file *m, void *unused)
 		   atomic_long_read(&ptebatch_installed));
 	seq_printf(m, "ptebatch_skipped %ld\n",
 		   atomic_long_read(&ptebatch_skipped));
+	/* Phase D, appended: PEBS-guided split of resident large folios. */
+	hermit_split_stats_show(m);
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(policy_stats);

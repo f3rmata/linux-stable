@@ -44,6 +44,8 @@ static u32 hermit_pebs_window_ms = 10;
 static u32 hermit_pebs_history_ms = 1000;
 /* Epoch invalidation is lazy; no global mm walk or reference pinning. */
 u64 hermit_pebs_epoch;
+/* Subpage heat: a sample counter per base page, halved every period. */
+u32 hermit_pebs_heat_ms = 1000;
 
 /* ---------- sampling period lists (from MEMTIS) ---------- */
 #define HERMIT_PCOUNT 30
@@ -91,6 +93,12 @@ struct hermit_region {
 	unsigned long vaddr;
 	/* One open window and its predecessor's collection grace period. */
 	struct hermit_pending_window window[2];
+	/* Per-subpage load+store sample counts for the split policy. Allocated
+	 * on the first sample once HERMIT_POLICY_SPLIT is on; NULL means the
+	 * region has no heat record (unknown, never cold).
+	 */
+	u8 *heat;
+	u64 heat_ns;
 };
 
 struct hermit_pc_entry {
@@ -283,11 +291,70 @@ static void hermit_windows_finish(struct hermit_pebs_state *st, u64 now)
 	}
 }
 
+/* hermit_heat:begin */
+/*
+ * Decayed per-subpage sample counters: one saturating u8 per base page of a
+ * 2 MiB region, halved once per period so that only the last few seconds of
+ * accesses matter. @stamp is the last decay instant; a long idle gap collapses
+ * into one shift of at most 8 bits.
+ */
+static void hermit_heat_decay(u8 *heat, u64 *stamp, u64 now, u64 period)
+{
+	unsigned int i, shift;
+
+	if (!period)
+		return;
+	if (now <= *stamp) {
+		if (now < *stamp)
+			*stamp = now;
+		return;
+	}
+	shift = div_u64(now - *stamp, period);
+	if (!shift)
+		return;
+	*stamp += (u64)shift * period;
+	if (shift >= 8)
+		memset(heat, 0, HERMIT_REGION_NR_SUBPAGES);
+	else
+		for (i = 0; i < HERMIT_REGION_NR_SUBPAGES; i++)
+			heat[i] >>= shift;
+}
+
+static void hermit_heat_add(u8 *heat, u64 *stamp, unsigned int bit, u64 now,
+			    u64 period)
+{
+	hermit_heat_decay(heat, stamp, now, period);
+	if (bit < HERMIT_REGION_NR_SUBPAGES && heat[bit] != U8_MAX)
+		heat[bit]++;
+}
+/* hermit_heat:end */
+
+static u64 hermit_heat_period(void)
+{
+	return (u64)READ_ONCE(hermit_pebs_heat_ms) * NSEC_PER_MSEC;
+}
+
+/* Allocate the heat record lazily; GFP_NOWAIT, so the sample path never sleeps. */
+static u8 *hermit_region_heat(struct hermit_region *r, u64 now)
+{
+	if (!r->heat) {
+		r->heat = kzalloc(HERMIT_REGION_NR_SUBPAGES,
+				  GFP_NOWAIT | __GFP_NOWARN);
+		if (!r->heat) {
+			atomic_long_inc(&hermit_policy_counters[HPC_ALLOC_FAIL]);
+			return NULL;
+		}
+		r->heat_ns = now;
+	}
+	return r->heat;
+}
+
 static struct hermit_region *hermit_region_get(struct hermit_pebs_state *st,
 					      unsigned long addr)
 {
 	unsigned long vaddr = addr & ~((1UL << HERMIT_REGION_SHIFT) - 1);
 	struct hermit_region *r = hermit_region_lookup(st, vaddr);
+	u8 *heat;
 	unsigned int i;
 
 	if (r) {
@@ -301,6 +368,7 @@ static struct hermit_region *hermit_region_get(struct hermit_pebs_state *st,
 		hlist_del(&r->hnode);
 		list_del(&r->lru);
 		atomic_long_inc(&hermit_policy_counters[HPC_EVICT]);
+		heat = r->heat;
 	} else {
 		r = kzalloc(sizeof(*r), GFP_NOWAIT | __GFP_NOWARN);
 		if (!r) {
@@ -308,8 +376,13 @@ static struct hermit_region *hermit_region_get(struct hermit_pebs_state *st,
 			return NULL;
 		}
 		st->nr_regions++;
+		heat = NULL;
 	}
 	memset(r, 0, sizeof(*r));
+	/* Reuse the evicted region's heat record instead of reallocating it. */
+	r->heat = heat;
+	if (heat)
+		memset(heat, 0, HERMIT_REGION_NR_SUBPAGES);
 	r->vaddr = vaddr;
 	hlist_add_head(&r->hnode, &st->buckets[hash_long(vaddr >> HERMIT_REGION_SHIFT, 8)]);
 	list_add(&r->lru, &st->lru);
@@ -380,13 +453,26 @@ static void hermit_region_sample(struct mm_struct *mm, unsigned long addr,
 	u64 now = ktime_get_ns();
 	unsigned int i;
 	bool recorded = false;
+	bool heat_on;
 
 	if (!st)
 		return;
 	spin_lock(&st->lock);
 	hermit_windows_finish(st, now);
+	/* Only the split policy consumes heat, so SPLIT off keeps the table
+	 * exactly as the 4 KiB predictor left it.
+	 */
+	heat_on = hermit_policy_feature(HERMIT_POLICY_SPLIT);
 	r = hermit_region_lookup(st, addr & ~((1UL << HERMIT_REGION_SHIFT) - 1));
+	if (!r && heat_on)
+		r = hermit_region_get(st, addr);
 	if (r) {
+		u8 *heat = heat_on ? hermit_region_heat(r, now) : NULL;
+
+		/* Load and store misses both count as an access to the page. */
+		if (heat)
+			hermit_heat_add(heat, &r->heat_ns, hermit_page_offset(addr),
+					now, hermit_heat_period());
 		for (i = 0; i < ARRAY_SIZE(r->window); i++) {
 			struct hermit_pending_window *w = &r->window[i];
 
@@ -428,6 +514,30 @@ bool hermit_pebs_snapshot(struct mm_struct *mm, unsigned long addr,
 			memcpy(out->store, w->store, sizeof(out->store));
 			found = true;
 		}
+	}
+	spin_unlock(&st->lock);
+	return found;
+}
+
+bool hermit_pebs_heat_read(struct mm_struct *mm, unsigned long addr,
+			   unsigned int nr_pages, u8 *out)
+{
+	struct hermit_pebs_state *st = READ_ONCE(mm->hermit_pebs);
+	struct hermit_region *r;
+	unsigned int offset = hermit_page_offset(addr);
+	u64 now;
+	bool found = false;
+
+	if (!st || !nr_pages || offset + nr_pages > HERMIT_REGION_NR_SUBPAGES ||
+	    offset + nr_pages < offset)
+		return false;
+	now = ktime_get_ns();
+	spin_lock(&st->lock);
+	r = hermit_region_lookup(st, addr & ~((1UL << HERMIT_REGION_SHIFT) - 1));
+	if (r && r->heat) {
+		hermit_heat_decay(r->heat, &r->heat_ns, now, hermit_heat_period());
+		memcpy(out, r->heat + offset, nr_pages);
+		found = true;
 	}
 	spin_unlock(&st->lock);
 	return found;
@@ -923,8 +1033,10 @@ void hermit_pebs_mm_exit(struct mm_struct *mm)
 	if (!st)
 		return;
 	mm->hermit_pebs = NULL;
-	list_for_each_entry_safe(r, tmp, &st->lru, lru)
+	list_for_each_entry_safe(r, tmp, &st->lru, lru) {
+		kfree(r->heat);
 		kfree(r);
+	}
 	list_for_each_entry_safe(p, next, &st->pc_lru, lru)
 		kfree(p);
 	kfree(st);
@@ -1086,6 +1198,8 @@ void hermit_pebs_debugfs_init(struct dentry *root)
 			   &hermit_pebs_fixed_cost_ns);
 	debugfs_create_u32("pebs_region_max", S_IRUSR | S_IWUSR, root,
 			   &hermit_pebs_region_max);
+	debugfs_create_u32("pebs_heat_ms", S_IRUSR | S_IWUSR, root,
+			   &hermit_pebs_heat_ms);
 	debugfs_create_file("pebs_order_stats", S_IRUSR, root, NULL,
 			    &hermit_pebs_stats_fops);
 }

@@ -51,6 +51,8 @@ extern u32 hermit_pebs_mode; /* enum hermit_pebs_mode */
 /* Cold observation interval is at least twice this value (default 7000 ns). */
 extern u32 hermit_pebs_fixed_cost_ns;
 extern u32 hermit_pebs_region_max;
+/* Subpage heat half-life: every this many ms the per-subpage counters halve. */
+extern u32 hermit_pebs_heat_ms;
 
 /* Attach a ring to a disabled kernel event; enable only after success. */
 int hermit_perf_event_init(struct perf_event *event, unsigned int nr_pages);
@@ -73,5 +75,14 @@ void hermit_pebs_fault(struct mm_struct *mm, unsigned long addr,
 void hermit_pebs_account_swapin(struct mm_struct *mm, unsigned int order);
 bool hermit_pebs_snapshot(struct mm_struct *mm, unsigned long addr,
 			  struct hermit_pebs_observation *out);
+/*
+ * Read the decayed per-subpage sample counts of the 2 MiB region that holds
+ * @addr, for the @nr_pages subpages starting at @addr. Returns false when the
+ * region has no heat record at all, which the caller must treat as unknown
+ * rather than as cold. May be called from the reclaim path; takes no sleeping
+ * lock and performs at most one bounded decay pass over the region.
+ */
+bool hermit_pebs_heat_read(struct mm_struct *mm, unsigned long addr,
+			   unsigned int nr_pages, u8 *out);
 
 #endif /* _LINUX_HERMIT_PEBS_H */
