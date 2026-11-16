@@ -49,6 +49,10 @@ static u32 policy_swapin_max = HERMIT_SWAPIN_MAX;
  */
 static u32 policy_medium_max_order = 4;
 static u32 policy_medium_stable = 3;
+/* Phase C: the same completed-segment signal gates the fit-sized first batch
+ * and the PTE install of the pages a batch read ahead.
+ */
+static u32 policy_fitstart_stable = 3;
 
 bool hermit_policy_feature(unsigned int feature)
 {
@@ -131,6 +135,11 @@ static atomic_long_t mglru_candidates, mglru_sort_bypasses;
 static atomic_long_t medium_suggested, medium_fallback_alloc;
 static atomic_long_t medium_fallback_extent;
 static atomic_long_t medium_used[PMD_ORDER + 1];
+/* FITSTART / PTEBATCH: batches whose size came from a stable fit, the pages
+ * they cover, and the PTE install result of an SG batch.
+ */
+static atomic_long_t fitstart_batches, fitstart_pages;
+static atomic_long_t ptebatch_installed, ptebatch_skipped;
 
 /* A round trip through MGLRU must not complete an old empty PTE interval. */
 void hermit_policy_lru_changed(void)
@@ -596,7 +605,8 @@ static unsigned int policy_run(struct hermit_policy_state *st,
 unsigned int hermit_policy_predict(struct vm_fault *vmf)
 {
 	struct hermit_policy_state *st = policy_state(vmf->vma->vm_mm);
-	unsigned int nr = 1, run, pebs, remaining;
+	struct policy_stream *s;
+	unsigned int nr = 1, run, pebs, remaining, fit_nr = 0, pos;
 	u64 now = ktime_get_ns();
 
 	if (!st || !vmf->hermit_fault_pc)
@@ -611,6 +621,25 @@ unsigned int hermit_policy_predict(struct vm_fault *vmf)
 	 * reads 2N. No cold-start padding, no inference from WRITE sizes.
 	 */
 	run = policy_run(st, vmf, now, &remaining);
+	/* A run of zero is a segment start: the first fault of a new segment,
+	 * or the page after a single-page install. Waiting for the doubling to
+	 * reach a repeating length costs one full segment ramp per segment, so
+	 * a stream whose completed segments already agree on a length starts at
+	 * that length instead of at one page.
+	 */
+	if (!run && hermit_policy_feature(HERMIT_POLICY_FITSTART)) {
+		s = policy_stream(st, vmf, false);
+		if (s && now - s->time < POLICY_TTL && s->fit >= 2 &&
+		    s->fit_stable >=
+			    clamp_t(u32, READ_ONCE(policy_fitstart_stable), 1, 8)) {
+			pos = (vmf->address & PAGE_MASK) == s->last + PAGE_SIZE ?
+				s->sequential + 1 : 0;
+			/* Never past the learned length: fit - pos pages are left. */
+			if ((unsigned long)pos < s->fit)
+				fit_nr = min_t(unsigned int, s->fit - pos,
+					       policy_swapin_limit());
+		}
+	}
 	spin_unlock(&st->lock);
 	if (run >= 2) {
 		nr = min_t(unsigned int, policy_swapin_limit(),
@@ -627,6 +656,14 @@ unsigned int hermit_policy_predict(struct vm_fault *vmf)
 	if (hermit_policy_feature(HERMIT_POLICY_PEBS)) {
 		pebs = hermit_pebs_predict_pages(vmf);
 		nr = max(nr, min(pebs, policy_swapin_limit()));
+	}
+	/* The fit length is the whole point of a FITSTART batch, so it replaces
+	 * the doubling and the PEBS vote instead of extending them.
+	 */
+	if (fit_nr > 1) {
+		nr = fit_nr;
+		atomic_long_inc(&fitstart_batches);
+		atomic_long_add(nr, &fitstart_pages);
 	}
 	atomic_long_add(nr - 1, &predicted_pages);
 	return nr;
@@ -728,6 +765,56 @@ void hermit_policy_medium_used(unsigned int order)
 void hermit_policy_medium_fallback(bool alloc)
 {
 	atomic_long_inc(alloc ? &medium_fallback_alloc : &medium_fallback_extent);
+}
+
+/*
+ * May the demand fault install PTEs for the @pages pages its SG batch read?
+ * The batch has to sit inside a segment length this stream repeated often
+ * enough to be trusted: pages past it were speculative readahead, and mapping
+ * them would hide a wrong prediction from the next run instead of letting the
+ * next run fault and correct it. The position is the same one
+ * policy_medium_order() uses: page sequential + 1 for a contiguous run, 0 for
+ * a fault that starts a new segment.
+ */
+bool hermit_policy_pte_install(struct vm_fault *vmf, unsigned int pages)
+{
+	struct hermit_policy_state *st = READ_ONCE(vmf->vma->vm_mm->hermit_policy);
+	struct policy_stream *s;
+	unsigned int pos;
+	bool ok = false;
+	u64 now;
+
+	if (!hermit_policy_feature(HERMIT_POLICY_PTEBATCH) || !st || pages < 2 ||
+	    !vmf->hermit_fault_pc)
+		return false;
+	now = ktime_get_ns();
+	spin_lock(&st->lock);
+	if (st->refault < 256) {
+		s = policy_stream(st, vmf, false);
+		if (s && now - s->time < POLICY_TTL &&
+		    s->fit_stable >=
+			    clamp_t(u32, READ_ONCE(policy_fitstart_stable), 1, 8)) {
+			pos = (vmf->address & PAGE_MASK) == s->last + PAGE_SIZE ?
+				s->sequential + 1 : 0;
+			ok = (unsigned long)pos + pages <= s->fit;
+		}
+	}
+	spin_unlock(&st->lock);
+	return ok;
+}
+
+/* Pages of an SG batch whose PTE was installed by the demand fault. */
+void hermit_policy_pte_installed(unsigned int pages)
+{
+	if (pages)
+		atomic_long_add(pages, &ptebatch_installed);
+}
+
+/* Prefetched pages the batch did not map, e.g. after the first mismatch. */
+void hermit_policy_pte_skipped(unsigned int pages)
+{
+	if (pages)
+		atomic_long_add(pages, &ptebatch_skipped);
 }
 
 /* Record one page read speculatively by hermit_swapin_pages(). The caller
@@ -1045,6 +1132,17 @@ static int policy_stats_show(struct seq_file *m, void *unused)
 		   atomic_long_read(&medium_fallback_alloc));
 	seq_printf(m, "medium_fallback_extent %ld\n",
 		   atomic_long_read(&medium_fallback_extent));
+	/* Phase C, appended: batches started at the learned fit length, the pages
+	 * they cover (demand page included), and the PTEs those batches mapped.
+	 */
+	seq_printf(m, "fitstart_batches %ld\n",
+		   atomic_long_read(&fitstart_batches));
+	seq_printf(m, "fitstart_pages %ld\n",
+		   atomic_long_read(&fitstart_pages));
+	seq_printf(m, "ptebatch_installed %ld\n",
+		   atomic_long_read(&ptebatch_installed));
+	seq_printf(m, "ptebatch_skipped %ld\n",
+		   atomic_long_read(&ptebatch_skipped));
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(policy_stats);
@@ -1060,4 +1158,6 @@ void hermit_policy_debugfs_init(struct dentry *root)
 			   &policy_medium_max_order);
 	debugfs_create_u32("policy_medium_stable", S_IRUSR | S_IWUSR, root,
 			   &policy_medium_stable);
+	debugfs_create_u32("policy_fitstart_stable", S_IRUSR | S_IWUSR, root,
+			   &policy_fitstart_stable);
 }

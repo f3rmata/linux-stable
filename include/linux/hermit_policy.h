@@ -32,6 +32,8 @@ struct hermit_reclaim_hint {
 #define HERMIT_POLICY_LARGE	BIT(7)	/* long sequential streams use mTHP path */
 #define HERMIT_POLICY_MGLRU	BIT(8)	/* reuse MGLRU selection for SG writeout */
 #define HERMIT_POLICY_MEDIUM	BIT(9)	/* fit-driven 16-64 KiB swap-in orders */
+#define HERMIT_POLICY_FITSTART	BIT(10)	/* first batch of a stable segment is fit-sized */
+#define HERMIT_POLICY_PTEBATCH	BIT(11)	/* map the pages an SG batch read ahead */
 #define HERMIT_POLICY_DEFAULT	(HERMIT_POLICY_SWAPIN | HERMIT_POLICY_PEBS | \
 				 HERMIT_POLICY_SORT | HERMIT_POLICY_OBSERVE | \
 				 HERMIT_POLICY_FLUSH | HERMIT_POLICY_BATCH | \
@@ -69,6 +71,15 @@ unsigned int hermit_policy_predict(struct vm_fault *vmf);
  */
 void hermit_policy_prefetched(struct mm_struct *mm, unsigned long entry_val);
 bool hermit_policy_prefetch_hit(struct mm_struct *mm, unsigned long entry_val);
+/*
+ * HERMIT_POLICY_PTEBATCH: may this demand fault install PTEs for every page
+ * of its batch? Only a batch that lies inside a segment length this
+ * stream repeated often enough is mapped; anything read speculatively beyond
+ * the learned length keeps its swap entries and faults normally.
+ */
+bool hermit_policy_pte_install(struct vm_fault *vmf, unsigned int pages);
+void hermit_policy_pte_installed(unsigned int pages);
+void hermit_policy_pte_skipped(unsigned int pages);
 void hermit_policy_hint(struct folio *folio, struct hermit_reclaim_hint *hint);
 void hermit_policy_defer_flush(struct vm_area_struct *vma, unsigned long addr);
 void hermit_policy_eviction(struct folio *folio, struct hermit_reclaim_hint *hint,

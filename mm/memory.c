@@ -4845,6 +4845,127 @@ static int hermit_direct_swapin(struct folio *folio, struct hermit_io *io,
 
 	return hermit_swap_read_folio_sync(folio);
 }
+
+/*
+ * Map the pages an SG batch read ahead, so the application does not take a
+ * minor fault per prefetched page. This repeats what do_swap_page() does for a
+ * page found in swapcache, for every page the batch read, and it does it under
+ * the PTE lock the demand page already holds: the batch is PMD-contained, so
+ * one PTE page covers all of it and the lock is taken once for the whole run.
+ *
+ * @ptep is the demand PTE, @address its address and @swap_pte the swap PTE the
+ * batch was planned with. Every prefetched page is revalidated against that
+ * snapshot and against its folio; the first mismatch stops the run and the
+ * remaining prefetched pages keep their swap entries, i.e. they fault in
+ * exactly as before this function existed.
+ *
+ * Returns the number of extra PTEs installed.
+ */
+static unsigned int hermit_batch_ptes(struct vm_fault *vmf,
+		struct swap_info_struct *si, pte_t *ptep,
+		unsigned long address, pte_t swap_pte)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned long end, addr;
+	unsigned int pages, i;
+
+	/* The batch never crosses the end of the VMA or of its PMD. */
+	end = pmd_addr_end(address, vma->vm_end);
+	pages = min_t(unsigned int, vmf->hermit_batch_pages,
+		      (end - address) >> PAGE_SHIFT);
+	if (pages < 2 || unlikely(userfaultfd_armed(vma)) ||
+	    (vmf->flags & FAULT_FLAG_VMA_LOCK))
+		return 0;
+	if (!hermit_policy_pte_install(vmf, pages))
+		return 0;
+
+	for (i = 1; i < pages; i++) {
+		struct folio *folio;
+		swp_entry_t entry;
+		rmap_t rmap_flags = RMAP_NONE;
+		pte_t old, new;
+		bool exclusive;
+		struct page *page;
+
+		old = ptep_get(ptep + i);
+		/* Swap PTE unchanged and still the page the run planned for. */
+		if (!pte_same(old, pte_move_swp_offset(swap_pte, i)))
+			break;
+		entry = pte_to_swp_entry(old);
+		folio = swap_cache_get_folio(entry);
+		if (!folio)
+			break;
+		/* Order 0 only, and only a page that is really readable now: a
+		 * large folio would map pages outside the batch, and a failed read
+		 * or a KSM copy is not what this mapping refers to.
+		 */
+		if (folio_order(folio) || !folio_test_uptodate(folio) ||
+		    folio_test_ksm(folio) || !folio_test_anon(folio)) {
+			folio_put(folio);
+			break;
+		}
+		/* Same order as do_wp_page(): PTE lock, then a folio trylock.
+		 * Nothing sleeps while the PTE lock is held.
+		 */
+		if (!folio_trylock(folio)) {
+			folio_put(folio);
+			break;
+		}
+		page = &folio->page;
+		if (unlikely(PageHWPoison(page))) {
+			folio_unlock(folio);
+			folio_put(folio);
+			break;
+		}
+		/* A swap PTE must not point at an anon page that is already
+		 * exclusive; do_swap_page() asserts the same invariant.
+		 */
+		BUG_ON(PageAnonExclusive(page));
+		/* Exclusivity is decided exactly as in do_swap_page(): the swap PTE
+		 * says so, unless this backend cannot take concurrent writes under
+		 * writeback (si->flags is set once at swapon time), or we are the
+		 * last user after freeing the swapcache.
+		 */
+		exclusive = pte_swp_exclusive(old);
+		if (exclusive && folio_test_writeback(folio) &&
+		    data_race(si->flags & SWP_STABLE_WRITES)) /* set at swapon */
+			exclusive = false;
+		arch_swap_restore(folio_swap(entry, folio), folio);
+		swap_free(entry);
+		if (should_try_to_free_swap(folio, vma, vmf->flags))
+			folio_free_swap(folio);
+		add_mm_counter(mm, MM_ANONPAGES, 1);
+		add_mm_counter(mm, MM_SWAPENTS, -1);
+		new = mk_pte(page, vma->vm_page_prot);
+		if (pte_swp_soft_dirty(old))
+			new = pte_mksoft_dirty(new);
+		if (pte_swp_uffd_wp(old))
+			new = pte_mkuffd_wp(new);
+		if (exclusive || folio_ref_count(folio) == 1) {
+			if ((vma->vm_flags & VM_WRITE) &&
+			    !userfaultfd_pte_wp(vma, new) &&
+			    !pte_needs_soft_dirty_wp(vma, new))
+				new = pte_mkwrite(new, vma);
+			rmap_flags |= RMAP_EXCLUSIVE;
+		}
+		/* Young, not old: these pages are mapped for the app, so the aging
+		 * consumer must see a real access, not a prefetch guess.
+		 */
+		new = pte_mkyoung(new);
+		flush_icache_pages(vma, page, 1);
+		addr = address + (unsigned long)i * PAGE_SIZE;
+		folio_add_anon_rmap_pte(folio, page, vma, addr, rmap_flags);
+		set_ptes(mm, addr, ptep + i, new, 1);
+		/* The swapcache lookup reference becomes the PTE reference. */
+		folio_unlock(folio);
+	}
+	if (i < pages)
+		hermit_policy_pte_skipped(pages - i);
+	if (i > 1)
+		hermit_policy_pte_installed(i - 1);
+	return i - 1;
+}
 #endif
 
 /*
@@ -4876,6 +4997,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 #ifdef CONFIG_HERMIT
 	struct hermit_io hermit_io = {};
 	swp_entry_t hermit_fault_entry;
+	pte_t hermit_fault_pte;
 	u64 hermit_read_start_ns = 0;
 	u64 hermit_fault_start_ns = ktime_get_mono_fast_ns();
 	bool hermit_read_pending = false;
@@ -4893,6 +5015,11 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	entry = pte_to_swp_entry(vmf->orig_pte);
 #ifdef CONFIG_HERMIT
 	hermit_fault_entry = entry;
+	/* The SG batch installs PTEs for its own prefetched pages, which needs the
+	 * swap PTE this fault was planned with; vmf->orig_pte becomes the new
+	 * present PTE below.
+	 */
+	hermit_fault_pte = vmf->orig_pte;
 #endif
 	if (unlikely(non_swap_entry(entry))) {
 		if (is_migration_entry(entry)) {
@@ -4954,8 +5081,11 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 #ifdef CONFIG_HERMIT
 	hermit_swap_fault = true;
 	hermit_remote_fault = hermit_backend_entry_remote(entry);
-	/* A retried fault reuses @vmf; a medium order is validated per attempt. */
+	/* A retried fault reuses @vmf; a medium order is validated per attempt and
+	 * the batch page count belongs to this attempt only.
+	 */
 	vmf->hermit_folio_order = 0;
+	vmf->hermit_batch_pages = 0;
 #endif
 
 	folio = swap_cache_get_folio(entry);
@@ -5392,7 +5522,16 @@ check_folio:
 	set_ptes(vma->vm_mm, address, ptep, pte, nr_pages);
 #ifdef CONFIG_HERMIT
 	if (hermit_remote_fault) {
-		hermit_policy_installed(vmf, page_to_pfn(page), address, nr_pages);
+		unsigned int hermit_nr = nr_pages;
+
+		/* PTEBATCH: map what the SG batch read for the addresses after
+		 * this one, under the PTE lock already held. The batch covers base
+		 * pages only, so the stream advances like a large folio install.
+		 */
+		if (nr_pages == 1)
+			hermit_nr += hermit_batch_ptes(vmf, si, ptep, address,
+						      hermit_fault_pte);
+		hermit_policy_installed(vmf, page_to_pfn(page), address, hermit_nr);
 		hermit_pebs_fault(vma->vm_mm, vmf->address, vmf->hermit_fault_pc,
 				  hermit_observe_start_ns);
 		hermit_pebs_account_swapin(vma->vm_mm, folio_order(folio));
