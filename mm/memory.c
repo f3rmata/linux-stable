@@ -4912,6 +4912,15 @@ static unsigned int hermit_batch_ptes(struct vm_fault *vmf,
 			folio_put(folio);
 			break;
 		}
+		/* The lookup was lockless: reclaim may have removed the folio
+		 * from swapcache (or the slot reused) before we got the lock.
+		 * do_swap_page() rechecks the same thing after folio_lock_or_retry().
+		 */
+		if (unlikely(!folio_matches_swap_entry(folio, entry))) {
+			folio_unlock(folio);
+			folio_put(folio);
+			break;
+		}
 		page = &folio->page;
 		if (unlikely(PageHWPoison(page))) {
 			folio_unlock(folio);
