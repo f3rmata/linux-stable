@@ -4937,12 +4937,17 @@ static unsigned int hermit_batch_ptes(struct vm_fault *vmf,
 		 * Either VMA read lock stabilizes this range. Use only an
 		 * existing, matching anon rmap: KSM swapin can require a copy
 		 * even for a non-KSM folio with a different root or index.
+		 * A freshly read SG page is not anon yet: do_swap_page() gives
+		 * it a new anon rmap (ksm_might_need_to_copy() needs no copy
+		 * without an anon_vma). That needs the VMA's anon_vma to exist
+		 * already; it does for any VMA that swapped anon pages out.
 		 */
 		if (unlikely(!folio_matches_swap_entry(folio, entry)) ||
 		    folio_order(folio) || !folio_test_uptodate(folio) ||
-		    folio_test_ksm(folio) || !folio_test_anon(folio) ||
-		    PageHWPoison(page) ||
-		    page_address_in_vma(folio, page, vma) != addr) {
+		    folio_test_ksm(folio) || PageHWPoison(page) ||
+		    (folio_test_anon(folio) ?
+		     page_address_in_vma(folio, page, vma) != addr :
+		     (!vma->anon_vma || folio_test_mappedtodisk(folio)))) {
 			folio_unlock(folio);
 			folio_put(folio);
 			break;
@@ -4950,7 +4955,7 @@ static unsigned int hermit_batch_ptes(struct vm_fault *vmf,
 		/* A swap PTE must not point at an anon page that is already
 		 * exclusive; do_swap_page() asserts the same invariant.
 		 */
-		BUG_ON(PageAnonExclusive(page));
+		BUG_ON(folio_test_anon(folio) && PageAnonExclusive(page));
 		/* Exclusivity is decided exactly as in do_swap_page(): the swap PTE
 		 * says so, unless this backend cannot take concurrent writes under
 		 * writeback (si->flags is set once at swapon time), or we are the
@@ -4983,7 +4988,10 @@ static unsigned int hermit_batch_ptes(struct vm_fault *vmf,
 		 */
 		new = pte_mkyoung(new);
 		flush_icache_pages(vma, page, 1);
-		folio_add_anon_rmap_pte(folio, page, vma, addr, rmap_flags);
+		if (folio_test_anon(folio))
+			folio_add_anon_rmap_pte(folio, page, vma, addr, rmap_flags);
+		else
+			folio_add_new_anon_rmap(folio, vma, addr, rmap_flags);
 		set_ptes(mm, addr, ptep + i, new, 1);
 		arch_do_swap_page_nr(mm, vma, addr, new, new, 1);
 		update_mmu_cache_range(vmf, vma, addr, ptep + i, 1);
