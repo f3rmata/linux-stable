@@ -69,12 +69,12 @@
 #include <linux/memory-tiers.h>
 #include <linux/debugfs.h>
 #include <linux/userfaultfd_k.h>
+#include <linux/hermit_policy.h>
 #ifdef CONFIG_HERMIT
 #include <linux/hermit.h>
 #include <linux/hermit_backend.h>
 #include <linux/hermit_stats.h>
 #include <linux/hermit_pebs.h>
-#include <linux/hermit_policy.h>
 #include <linux/ptrace.h>
 #include <linux/memcontrol.h>
 #endif
@@ -4496,7 +4496,8 @@ static struct folio *__alloc_swap_folio(struct vm_fault *vmf)
  * Check if the PTEs within a range are contiguous swap entries
  * and have consistent swapcache, zeromap.
  */
-static bool can_swapin_thp(struct vm_fault *vmf, pte_t *ptep, int nr_pages)
+static enum swapin_extent swapin_thp_check(struct vm_fault *vmf, pte_t *ptep,
+					   int nr_pages)
 {
 	unsigned long addr;
 	swp_entry_t entry;
@@ -4508,10 +4509,10 @@ static bool can_swapin_thp(struct vm_fault *vmf, pte_t *ptep, int nr_pages)
 	pte = ptep_get(ptep);
 
 	if (!pte_same(pte, pte_move_swp_offset(vmf->orig_pte, -idx)))
-		return false;
+		return SWAPIN_EXTENT_SWPBATCH;
 	entry = pte_to_swp_entry(pte);
 	if (swap_pte_batch(ptep, nr_pages, pte) != nr_pages)
-		return false;
+		return SWAPIN_EXTENT_SWPBATCH;
 
 	/*
 	 * swap_read_folio() can't handle the case a large folio is hybridly
@@ -4519,9 +4520,9 @@ static bool can_swapin_thp(struct vm_fault *vmf, pte_t *ptep, int nr_pages)
 	 * things might be added once zswap support large folios.
 	 */
 	if (unlikely(swap_zeromap_batch(entry, nr_pages, NULL) != nr_pages))
-		return false;
+		return SWAPIN_EXTENT_CACHE;
 	if (unlikely(non_swapcache_batch(entry, nr_pages) != nr_pages))
-		return false;
+		return SWAPIN_EXTENT_CACHE;
 
 #ifdef CONFIG_HERMIT
 	/* Legacy large-folio allocation also requires actual remote adjacency. */
@@ -4540,17 +4541,17 @@ static bool can_swapin_thp(struct vm_fault *vmf, pte_t *ptep, int nr_pages)
 
 			if (!hermit_backend_range_remote(entry, ilog2(nr_pages)) ||
 			    hermit_backend_offset(entry, &first))
-				return false;
+				return SWAPIN_EXTENT_REMOTE;
 			for (i = 1; i < nr_pages; i++)
 				if (hermit_backend_offset(swp_entry(swp_type(entry),
 						 swp_offset(entry) + i), &offset) ||
 				    offset != first + i)
-					return false;
+					return SWAPIN_EXTENT_REMOTE;
 		}
 	}
 #endif
 
-	return true;
+	return SWAPIN_EXTENT_OK;
 }
 
 static inline unsigned long thp_swap_suitable_orders(pgoff_t swp_offset,
@@ -4580,6 +4581,7 @@ static struct folio *alloc_swap_folio(struct vm_fault *vmf)
 {
 	struct vm_area_struct *vma = vmf->vma;
 	unsigned long candidate_orders = BIT(PMD_ORDER) - 1;
+	unsigned long vma_orders;
 	unsigned long orders;
 	struct folio *folio;
 	unsigned long addr;
@@ -4624,12 +4626,18 @@ static struct folio *alloc_swap_folio(struct vm_fault *vmf)
 	 */
 	orders = thp_vma_allowable_orders(vma, vma->vm_flags, TVA_PAGEFAULT,
 					  candidate_orders);
-	orders = thp_vma_suitable_orders(vma, vmf->address, orders);
+	vma_orders = thp_vma_suitable_orders(vma, vmf->address, orders);
 	orders = thp_swap_suitable_orders(swp_offset(entry), vmf->address,
-					  orders);
+					  vma_orders);
 
-	if (!orders)
+	if (!orders) {
+#ifdef CONFIG_HERMIT
+		if (vmf->hermit_folio_order)
+			hermit_policy_medium_extent(vma_orders ? SWAPIN_EXTENT_ALIGN :
+						    SWAPIN_EXTENT_NO_ORDER);
+#endif
 		goto fallback;
+	}
 
 #ifdef CONFIG_HERMIT
 	/* A MEDIUM order the caller already validated under this PTE lock: the
@@ -4654,7 +4662,8 @@ static struct folio *alloc_swap_folio(struct vm_fault *vmf)
 	order = highest_order(orders);
 	while (orders) {
 		addr = ALIGN_DOWN(vmf->address, PAGE_SIZE << order);
-		if (can_swapin_thp(vmf, pte + pte_index(addr), 1 << order))
+		if (swapin_thp_check(vmf, pte + pte_index(addr), 1 << order) ==
+		    SWAPIN_EXTENT_OK)
 			break;
 		order = next_order(&orders, order);
 	}
@@ -4698,7 +4707,7 @@ hermit_alloc:
 
 #ifdef CONFIG_HERMIT
 	if (vmf->hermit_folio_order)
-		hermit_policy_medium_fallback(true);
+		hermit_policy_medium_used(0);
 #endif
 fallback:
 	return __alloc_swap_folio(vmf);
@@ -4764,14 +4773,16 @@ static unsigned long hermit_swapin_orders(struct vm_fault *vmf)
  * guarantees the neighbouring pages belong to this segment.
  */
 static int hermit_swapin_order_valid(struct vm_fault *vmf, unsigned long orders,
-		int top)
+		int top, enum swapin_extent *reason)
 {
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 	struct mm_struct *mm = vmf->vma->vm_mm;
+	swp_entry_t entry = pte_to_swp_entry(vmf->orig_pte);
 	spinlock_t *ptl;
 	pte_t *pte;
 	unsigned long addr;
-	int order;
+	int order, first;
+	enum swapin_extent result;
 
 	/* Never validate an order the VMA cannot allocate, even when the
 	 * tunable ceiling sits above the legal mask.
@@ -4779,17 +4790,30 @@ static int hermit_swapin_order_valid(struct vm_fault *vmf, unsigned long orders,
 	orders &= BIT(top + 1) - 1;
 	if (!(orders & ~(BIT(0) | BIT(1))))
 		return -1;
-	order = highest_order(orders);
+	first = highest_order(orders);
+	order = first;
 	pte = pte_offset_map_lock(mm, vmf->pmd, vmf->address & PMD_MASK, &ptl);
-	if (unlikely(!pte))
+	if (unlikely(!pte)) {
+		*reason = SWAPIN_EXTENT_SWPBATCH;
 		return -1;
+	}
 	while (orders) {
 		addr = ALIGN_DOWN(vmf->address, PAGE_SIZE << order);
-		if (can_swapin_thp(vmf, pte + pte_index(addr), 1 << order))
+		result = swapin_thp_check(vmf, pte + pte_index(addr), 1 << order);
+		if (result == SWAPIN_EXTENT_OK)
 			break;
+		if (order == first)
+			*reason = result;
 		order = next_order(&orders, order);
 	}
 	pte_unmap_unlock(pte, ptl);
+	/*
+	 * Attribute a rejected range to the allocator's alignment prerequisite
+	 * before its PTE checks. Keep the original descent through all orders.
+	 */
+	if (!orders && !thp_swap_suitable_orders(swp_offset(entry), vmf->address,
+						 BIT(first)))
+		*reason = SWAPIN_EXTENT_ALIGN;
 	return orders ? order : -1;
 #else
 	return -1;
@@ -4807,6 +4831,7 @@ static int hermit_swapin_order_valid(struct vm_fault *vmf, unsigned long orders,
 static bool hermit_swapin_folio(struct vm_fault *vmf)
 {
 	unsigned long orders = hermit_swapin_orders(vmf);
+	enum swapin_extent reason = SWAPIN_EXTENT_NO_ORDER;
 	bool medium = false;
 	int order;
 
@@ -4818,10 +4843,10 @@ static bool hermit_swapin_folio(struct vm_fault *vmf)
 		return false;
 	if (!medium)
 		return true;
-	order = hermit_swapin_order_valid(vmf, orders, order);
+	order = hermit_swapin_order_valid(vmf, orders, order, &reason);
 	if (order < 0) {
 		/* No legal order covers this range: keep the 4 KiB SG batches. */
-		hermit_policy_medium_fallback(false);
+		hermit_policy_medium_extent(reason);
 		return false;
 	}
 	vmf->hermit_folio_order = order;

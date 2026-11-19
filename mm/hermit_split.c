@@ -51,7 +51,8 @@ static u32 hermit_split_refault_max = 256; /* max refault score for a split */
 enum hermit_split_skip {
 	HSP_SHARED, HSP_KSM, HSP_WRITEBACK, HSP_SWAPCACHE, HSP_PINNED,
 	HSP_NOTIFIER, HSP_UNKNOWN, HSP_ALL_HOT, HSP_COLD_YOUNG, HSP_NO_ORDER,
-	HSP_BUDGET, HSP_PRESSURE, HSP_MEMORY, HSP_NR,
+	HSP_BUDGET, HSP_PRESSURE, HSP_MEMORY,
+	HSP_INACTIVE, HSP_NOHEAT, HSP_FEWSAMPLES, HSP_CONTENDED, HSP_NR,
 };
 static atomic_long_t split_candidates, split_attempts, split_pages;
 static atomic_long_t split_failures;
@@ -61,6 +62,7 @@ static const char * const split_skip_names[HSP_NR] = {
 	"shared", "ksm", "writeback", "swapcache", "pinned",
 	"notifier", "unknown", "all_hot", "cold_young", "no_order",
 	"budget", "pressure", "memory",
+	"inactive", "noheat", "fewsamples", "contended",
 };
 
 /* hermit_split:begin pure */
@@ -79,7 +81,8 @@ static const char * const split_skip_names[HSP_NR] = {
  */
 enum hermit_split_verdict {
 	HERMIT_SPLIT_PICK = 0,	/* @out_order holds the split order */
-	HERMIT_SPLIT_UNKNOWN,	/* not enough evidence: never cold by itself */
+	HERMIT_SPLIT_UNKNOWN,
+	HERMIT_SPLIT_FEWSAMPLES,
 	HERMIT_SPLIT_ALL_HOT,	/* no cold remainder worth splitting */
 	HERMIT_SPLIT_COLD_YOUNG, /* a cold subpage is still accessed */
 	HERMIT_SPLIT_NO_ORDER,	/* no aligned block isolates the hot part */
@@ -108,7 +111,7 @@ hermit_split_select(const u8 *heat, unsigned int nr_pages,
 		total += heat[i];
 	}
 	if (total < rule->min_samples)
-		return HERMIT_SPLIT_UNKNOWN;
+		return HERMIT_SPLIT_FEWSAMPLES;
 	/* Smallest count whose tail still covers hot_cov% of the samples. */
 	for (i = U8_MAX; i > 0; i--) {
 		covered += hist[i] * i;
@@ -232,7 +235,7 @@ static bool hermit_split_probe_one(struct folio *folio,
 		return false;
 	}
 	if (!mm || !hermit_policy_active(mm)) {
-		probe->reason = HSP_UNKNOWN;
+		probe->reason = HSP_INACTIVE;
 		probe->failed = true;
 		return false;
 	}
@@ -245,7 +248,7 @@ static bool hermit_split_probe_one(struct folio *folio,
 	probe->addr = address & PAGE_MASK;
 	if (!hermit_pebs_heat_read(mm, probe->addr, probe->nr_pages,
 				   probe->heat)) {
-		probe->reason = HSP_UNKNOWN;
+		probe->reason = HSP_NOHEAT;
 		probe->failed = true;
 		return false;
 	}
@@ -345,7 +348,7 @@ bool hermit_split_try(struct folio *folio, struct list_head *list,
 	rmap_walk(folio, &rwc);
 	if (probe.failed || rwc.contended || probe.mappings != 1) {
 		hermit_split_skip(probe.failed ? probe.reason :
-				  rwc.contended ? HSP_UNKNOWN : HSP_SHARED);
+				  rwc.contended ? HSP_CONTENDED : HSP_SHARED);
 		kfree(probe.heat);
 		return false;
 	}
@@ -353,6 +356,9 @@ bool hermit_split_try(struct folio *folio, struct list_head *list,
 				      &rule, &target);
 	kfree(probe.heat);
 	switch (verdict) {
+	case HERMIT_SPLIT_FEWSAMPLES:
+		hermit_split_skip(HSP_FEWSAMPLES);
+		return false;
 	case HERMIT_SPLIT_UNKNOWN:
 		hermit_split_skip(HSP_UNKNOWN);
 		return false;
@@ -380,6 +386,22 @@ bool hermit_split_try(struct folio *folio, struct list_head *list,
 	return true;
 }
 
+static void hermit_split_show_skips(struct seq_file *m, unsigned int first,
+				    unsigned int end)
+{
+	unsigned int i;
+
+	for (i = first; i < end; i++)
+		seq_printf(m, "split_skipped_reason_%s %ld\n",
+			   split_skip_names[i],
+			   atomic_long_read(&split_skipped[i]));
+}
+
+void hermit_split_extra_stats_show(struct seq_file *m)
+{
+	hermit_split_show_skips(m, HSP_INACTIVE, HSP_NR);
+}
+
 void hermit_split_stats_show(struct seq_file *m)
 {
 	unsigned int i;
@@ -393,10 +415,7 @@ void hermit_split_stats_show(struct seq_file *m)
 	for (i = 0; i <= HERMIT_SPLIT_MAX_ORDER; i++)
 		seq_printf(m, "split_done_order%u %ld\n", i,
 			   atomic_long_read(&split_done[i]));
-	for (i = 0; i < HSP_NR; i++)
-		seq_printf(m, "split_skipped_reason_%s %ld\n",
-			   split_skip_names[i],
-			   atomic_long_read(&split_skipped[i]));
+	hermit_split_show_skips(m, 0, HSP_INACTIVE);
 }
 
 void hermit_split_debugfs_init(struct dentry *root)

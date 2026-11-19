@@ -135,6 +135,7 @@ static atomic_long_t mglru_candidates, mglru_sort_bypasses;
  */
 static atomic_long_t medium_suggested, medium_fallback_alloc;
 static atomic_long_t medium_fallback_extent;
+static atomic_long_t medium_extent_reasons[SWAPIN_EXTENT_NO_ORDER];
 static atomic_long_t medium_used[PMD_ORDER + 1];
 /* FITSTART / PTEBATCH: batches whose size came from a stable fit, the pages
  * they cover, and the PTE install result of an SG batch.
@@ -761,12 +762,12 @@ void hermit_policy_medium_used(unsigned int order)
 		atomic_long_inc(&medium_fallback_alloc);
 }
 
-/* The requested order was not used: @alloc separates an allocation or memcg
- * charge failure from an extent that no legal order covered.
- */
-void hermit_policy_medium_fallback(bool alloc)
+void hermit_policy_medium_extent(enum swapin_extent reason)
 {
-	atomic_long_inc(alloc ? &medium_fallback_alloc : &medium_fallback_extent);
+	atomic_long_inc(&medium_fallback_extent);
+	/* An empty VMA order mask has no extent to check. */
+	if (reason != SWAPIN_EXTENT_NO_ORDER)
+		atomic_long_inc(&medium_extent_reasons[reason]);
 }
 
 /*
@@ -1154,6 +1155,15 @@ static int policy_stats_show(struct seq_file *m, void *unused)
 	hermit_split_stats_show(m);
 	seq_printf(m, "ptebatch_gate_rejects %ld\n",
 		   atomic_long_read(&ptebatch_gate_rejects));
+	hermit_split_extra_stats_show(m);
+	seq_printf(m, "medium_fallback_swpbatch %ld\n",
+		   atomic_long_read(&medium_extent_reasons[SWAPIN_EXTENT_SWPBATCH]));
+	seq_printf(m, "medium_fallback_cache %ld\n",
+		   atomic_long_read(&medium_extent_reasons[SWAPIN_EXTENT_CACHE]));
+	seq_printf(m, "medium_fallback_remote %ld\n",
+		   atomic_long_read(&medium_extent_reasons[SWAPIN_EXTENT_REMOTE]));
+	seq_printf(m, "medium_fallback_align %ld\n",
+		   atomic_long_read(&medium_extent_reasons[SWAPIN_EXTENT_ALIGN]));
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(policy_stats);

@@ -25,6 +25,7 @@ struct dentry;
 bool hermit_split_try(struct folio *folio, struct list_head *list,
 		      struct mem_cgroup *memcg);
 void hermit_split_stats_show(struct seq_file *m);
+void hermit_split_extra_stats_show(struct seq_file *m);
 void hermit_split_debugfs_init(struct dentry *root);
 #else
 static inline bool hermit_split_try(struct folio *folio, struct list_head *list,

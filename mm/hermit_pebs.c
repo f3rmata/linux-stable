@@ -453,8 +453,12 @@ static void hermit_region_sample(struct mm_struct *mm, unsigned long addr,
 	u64 now = ktime_get_ns();
 	unsigned int i;
 	bool recorded = false;
-	bool heat_on;
+	bool heat_on = hermit_policy_feature(HERMIT_POLICY_SPLIT) &&
+		       hermit_policy_active(mm);
 
+	/* A resident folio can be sampled before the mm's first swap fault. */
+	if (!st && heat_on)
+		st = hermit_pebs_state_get(mm);
 	if (!st)
 		return;
 	spin_lock(&st->lock);
@@ -462,10 +466,10 @@ static void hermit_region_sample(struct mm_struct *mm, unsigned long addr,
 	/* Only the split policy consumes heat, so SPLIT off keeps the table
 	 * exactly as the 4 KiB predictor left it.
 	 */
-	heat_on = hermit_policy_feature(HERMIT_POLICY_SPLIT);
-	r = hermit_region_lookup(st, addr & ~((1UL << HERMIT_REGION_SHIFT) - 1));
-	if (!r && heat_on)
+	if (heat_on)
 		r = hermit_region_get(st, addr);
+	else
+		r = hermit_region_lookup(st, addr & ~((1UL << HERMIT_REGION_SHIFT) - 1));
 	if (r) {
 		u8 *heat = heat_on ? hermit_region_heat(r, now) : NULL;
 

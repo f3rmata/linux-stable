@@ -12,6 +12,15 @@ struct list_head;
 struct dentry;
 struct mem_cgroup;
 
+enum swapin_extent {
+	SWAPIN_EXTENT_OK,
+	SWAPIN_EXTENT_SWPBATCH,
+	SWAPIN_EXTENT_CACHE,
+	SWAPIN_EXTENT_REMOTE,
+	SWAPIN_EXTENT_ALIGN,
+	SWAPIN_EXTENT_NO_ORDER,
+};
+
 struct hermit_reclaim_hint {
 	u64 owner, generation;
 	unsigned long start, end, address;
@@ -52,7 +61,7 @@ bool hermit_policy_reserve_mode(void);
 int hermit_policy_swapin_order(struct vm_fault *vmf, unsigned long orders,
 		bool *medium);
 void hermit_policy_medium_used(unsigned int order);
-void hermit_policy_medium_fallback(bool alloc);
+void hermit_policy_medium_extent(enum swapin_extent reason);
 void hermit_policy_unmap(struct vm_area_struct *vma, unsigned long start,
 		unsigned long end);
 bool hermit_policy_active(struct mm_struct *mm);
