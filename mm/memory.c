@@ -4874,8 +4874,7 @@ static unsigned int hermit_batch_ptes(struct vm_fault *vmf,
 	end = pmd_addr_end(address, vma->vm_end);
 	pages = min_t(unsigned int, vmf->hermit_batch_pages,
 		      (end - address) >> PAGE_SHIFT);
-	if (pages < 2 || unlikely(userfaultfd_armed(vma)) ||
-	    (vmf->flags & FAULT_FLAG_VMA_LOCK))
+	if (pages < 2 || unlikely(userfaultfd_armed(vma)))
 		return 0;
 	if (!hermit_policy_pte_install(vmf, pages))
 		return 0;
@@ -4896,15 +4895,6 @@ static unsigned int hermit_batch_ptes(struct vm_fault *vmf,
 		folio = swap_cache_get_folio(entry);
 		if (!folio)
 			break;
-		/* Order 0 only, and only a page that is really readable now: a
-		 * large folio would map pages outside the batch, and a failed read
-		 * or a KSM copy is not what this mapping refers to.
-		 */
-		if (folio_order(folio) || !folio_test_uptodate(folio) ||
-		    folio_test_ksm(folio) || !folio_test_anon(folio)) {
-			folio_put(folio);
-			break;
-		}
 		/* Same order as do_wp_page(): PTE lock, then a folio trylock.
 		 * Nothing sleeps while the PTE lock is held.
 		 */
@@ -4916,13 +4906,18 @@ static unsigned int hermit_batch_ptes(struct vm_fault *vmf,
 		 * from swapcache (or the slot reused) before we got the lock.
 		 * do_swap_page() rechecks the same thing after folio_lock_or_retry().
 		 */
-		if (unlikely(!folio_matches_swap_entry(folio, entry))) {
-			folio_unlock(folio);
-			folio_put(folio);
-			break;
-		}
 		page = &folio->page;
-		if (unlikely(PageHWPoison(page))) {
+		addr = address + (unsigned long)i * PAGE_SIZE;
+		/*
+		 * Either VMA read lock stabilizes this range. Use only an
+		 * existing, matching anon rmap: KSM swapin can require a copy
+		 * even for a non-KSM folio with a different root or index.
+		 */
+		if (unlikely(!folio_matches_swap_entry(folio, entry)) ||
+		    folio_order(folio) || !folio_test_uptodate(folio) ||
+		    folio_test_ksm(folio) || !folio_test_anon(folio) ||
+		    PageHWPoison(page) ||
+		    page_address_in_vma(folio, page, vma) != addr) {
 			folio_unlock(folio);
 			folio_put(folio);
 			break;
@@ -4963,9 +4958,10 @@ static unsigned int hermit_batch_ptes(struct vm_fault *vmf,
 		 */
 		new = pte_mkyoung(new);
 		flush_icache_pages(vma, page, 1);
-		addr = address + (unsigned long)i * PAGE_SIZE;
 		folio_add_anon_rmap_pte(folio, page, vma, addr, rmap_flags);
 		set_ptes(mm, addr, ptep + i, new, 1);
+		arch_do_swap_page_nr(mm, vma, addr, new, new, 1);
+		update_mmu_cache_range(vmf, vma, addr, ptep + i, 1);
 		/* The swapcache lookup reference becomes the PTE reference. */
 		folio_unlock(folio);
 	}

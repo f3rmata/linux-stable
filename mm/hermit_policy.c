@@ -141,6 +141,7 @@ static atomic_long_t medium_used[PMD_ORDER + 1];
  */
 static atomic_long_t fitstart_batches, fitstart_pages;
 static atomic_long_t ptebatch_installed, ptebatch_skipped;
+static atomic_long_t ptebatch_gate_rejects;
 
 /* A round trip through MGLRU must not complete an old empty PTE interval. */
 void hermit_policy_lru_changed(void)
@@ -785,9 +786,11 @@ bool hermit_policy_pte_install(struct vm_fault *vmf, unsigned int pages)
 	bool ok = false;
 	u64 now;
 
-	if (!hermit_policy_feature(HERMIT_POLICY_PTEBATCH) || !st || pages < 2 ||
-	    !vmf->hermit_fault_pc)
+	if (pages < 2)
 		return false;
+	if (!hermit_policy_feature(HERMIT_POLICY_PTEBATCH) || !st ||
+	    !vmf->hermit_fault_pc)
+		goto out;
 	now = ktime_get_ns();
 	spin_lock(&st->lock);
 	if (st->refault < 256) {
@@ -801,6 +804,9 @@ bool hermit_policy_pte_install(struct vm_fault *vmf, unsigned int pages)
 		}
 	}
 	spin_unlock(&st->lock);
+out:
+	if (!ok)
+		atomic_long_inc(&ptebatch_gate_rejects);
 	return ok;
 }
 
@@ -1146,6 +1152,8 @@ static int policy_stats_show(struct seq_file *m, void *unused)
 		   atomic_long_read(&ptebatch_skipped));
 	/* Phase D, appended: PEBS-guided split of resident large folios. */
 	hermit_split_stats_show(m);
+	seq_printf(m, "ptebatch_gate_rejects %ld\n",
+		   atomic_long_read(&ptebatch_gate_rejects));
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(policy_stats);
