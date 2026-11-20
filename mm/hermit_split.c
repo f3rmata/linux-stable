@@ -41,7 +41,7 @@ static u32 hermit_split_rate = 32;	/* folios per second */
 static u32 hermit_split_hot_cov = 80;	/* % of samples the hot set covers */
 static u32 hermit_split_hot_pct = 75;	/* % of a block's pages that must be hot */
 static u32 hermit_split_min_cold = 25;	/* % of the folio that must be cold */
-static u32 hermit_split_min_samples = 16; /* samples needed in the folio */
+static u32 hermit_split_min_samples = 4; /* samples needed in the folio */
 static u32 hermit_split_refault_max = 256; /* max refault score for a split */
 
 #define HERMIT_SPLIT_MAX_ORDER	9	/* 2 MiB, the PEBS region size */
