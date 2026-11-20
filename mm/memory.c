@@ -39,6 +39,7 @@
  * Aug/Sep 2004 Changed to four level page tables (Andi Kleen)
  */
 
+#include <linux/hermit_adc.h>
 #include <linux/kernel_stat.h>
 #include <linux/mm.h>
 #include <linux/mm_inline.h>
@@ -5016,6 +5017,7 @@ static unsigned int hermit_batch_ptes(struct vm_fault *vmf,
  */
 vm_fault_t do_swap_page(struct vm_fault *vmf)
 {
+	HERMIT_ADC_SCOPE(ADC_TOTAL_PF);
 	struct vm_area_struct *vma = vmf->vma;
 	struct folio *swapcache, *folio = NULL;
 	DECLARE_WAITQUEUE(wait, current);
@@ -5118,6 +5120,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 		goto out;
 #ifdef CONFIG_HERMIT
 	hermit_swap_fault = true;
+	adc_interval.subtype = ADC_SWAP_MINOR;
 	hermit_remote_fault = hermit_backend_entry_remote(entry);
 	/* A retried fault reuses @vmf; a medium order is validated per attempt and
 	 * the batch page count belongs to this attempt only.
@@ -5126,7 +5129,8 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	vmf->hermit_batch_pages = 0;
 #endif
 
-	folio = swap_cache_get_folio(entry);
+	folio = hermit_adc_call(ADC_LOOKUP_SWAPCACHE,
+		swap_cache_get_folio(entry));
 	if (folio) {
 		swap_update_readahead(folio, vma, vmf->address);
 #ifdef CONFIG_HERMIT
@@ -5162,8 +5166,9 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 		 */
 		if (hermit_remote_fault && hermit_policy_active(vma->vm_mm) &&
 		    hermit_policy_feature(HERMIT_POLICY_SWAPIN) &&
-		    !hermit_swapin_folio(vmf)) {
-			folio = hermit_swapin_pages(entry, GFP_HIGHUSER_MOVABLE, vmf);
+		    !hermit_adc_call(ADC_POLICY_PLAN, hermit_swapin_folio(vmf))) {
+			folio = hermit_adc_call(ADC_PREFETCH,
+				hermit_swapin_pages(entry, GFP_HIGHUSER_MOVABLE, vmf));
 			swapcache = folio;
 			goto swapin_allocated;
 		}
@@ -5192,7 +5197,8 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 		     ) &&
 		    __swap_count(entry) == 1) {
 			/* skip swapcache */
-			folio = alloc_swap_folio(vmf);
+			folio = hermit_adc_call(ADC_ALLOC_PAGE,
+				alloc_swap_folio(vmf));
 			if (folio) {
 				__folio_set_locked(folio);
 				__folio_set_swapbacked(folio);
@@ -5209,7 +5215,8 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 				 * undetectable as pte_same() returns true due
 				 * to entry reuse.
 				 */
-				if (swapcache_prepare(entry, nr_pages)) {
+				if (hermit_adc_call(ADC_DEDUP_SWAPIN,
+					swapcache_prepare(entry, nr_pages))) {
 					/*
 					 * Relax a bit to prevent rapid
 					 * repeated page faults.
@@ -5299,6 +5306,7 @@ swapin_allocated:
 		ret = VM_FAULT_MAJOR;
 #ifdef CONFIG_HERMIT
 		hermit_major_fault = true;
+		adc_interval.subtype = ADC_SWAP_MAJOR;
 		hermit_stat_inc(HMT_STAT_ONDEMAND_SWAPIN);
 #endif
 		count_vm_event(PGMAJFAULT);
@@ -5312,7 +5320,8 @@ swapin_allocated:
 		hermit_read_pending = false;
 	}
 #endif
-	ret |= folio_lock_or_retry(folio, vmf);
+	ret |= hermit_adc_call(ADC_LOCK_FOLIO,
+		folio_lock_or_retry(folio, vmf));
 	if (ret & VM_FAULT_RETRY)
 		goto out_release;
 
@@ -5371,8 +5380,9 @@ swapin_allocated:
 	/*
 	 * Back out if somebody else already faulted in this pte.
 	 */
-	vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd, vmf->address,
-				       &vmf->ptl);
+	vmf->pte = hermit_adc_call(ADC_LOCK_GET_PTE,
+		pte_offset_map_lock(vma->vm_mm, vmf->pmd, vmf->address,
+				       &vmf->ptl));
 	if (unlikely(!vmf->pte || !pte_same(ptep_get(vmf->pte), vmf->orig_pte)))
 		goto out_nomap;
 
@@ -5557,7 +5567,8 @@ check_folio:
 
 	VM_BUG_ON(!folio_test_anon(folio) ||
 		  (pte_write(pte) && !PageAnonExclusive(page)));
-	set_ptes(vma->vm_mm, address, ptep, pte, nr_pages);
+	hermit_adc_call(ADC_SETPTE,
+		set_ptes(vma->vm_mm, address, ptep, pte, nr_pages));
 #ifdef CONFIG_HERMIT
 	if (hermit_remote_fault) {
 		unsigned int hermit_nr = nr_pages;
@@ -5567,8 +5578,9 @@ check_folio:
 		 * pages only, so the stream advances like a large folio install.
 		 */
 		if (nr_pages == 1)
-			hermit_nr += hermit_batch_ptes(vmf, si, ptep, address,
-						      hermit_fault_pte);
+			hermit_nr += hermit_adc_call(ADC_BATCH_SETPTE,
+				hermit_batch_ptes(vmf, si, ptep, address,
+						      hermit_fault_pte));
 		hermit_policy_installed(vmf, page_to_pfn(page), address, hermit_nr);
 		hermit_pebs_fault(vma->vm_mm, vmf->address, vmf->hermit_fault_pc,
 				  hermit_observe_start_ns);

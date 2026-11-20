@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
+#include <linux/hermit_adc.h>
 #include <linux/errno.h>
 #include <linux/bitmap.h>
 #include <linux/slab.h>
@@ -121,6 +122,7 @@ static int hermit_io_offset(struct hermit_io *io, bool write);
 
 int hermit_backend_load(struct hermit_io *io, bool async)
 {
+	HERMIT_ADC_SCOPE(async ? ADC_READ_SUBMIT : ADC_READ_SYNC);
 	const struct hermit_backend_ops *ops;
 	int ret, idx = srcu_read_lock(&hermit_backend_srcu);
 
@@ -140,6 +142,7 @@ EXPORT_SYMBOL_GPL(hermit_backend_load);
 
 int hermit_backend_store(struct hermit_io *io)
 {
+	HERMIT_ADC_SCOPE(ADC_WRITE_PAGE);
 	const struct hermit_backend_ops *ops;
 	int ret, idx = srcu_read_lock(&hermit_backend_srcu);
 
@@ -154,6 +157,7 @@ EXPORT_SYMBOL_GPL(hermit_backend_store);
 
 int hermit_backend_poll(struct hermit_io *io, bool wait)
 {
+	HERMIT_ADC_SCOPE(ADC_POLL_LOAD);
 	int ret;
 
 	if (!io->backend)
@@ -169,6 +173,7 @@ EXPORT_SYMBOL_GPL(hermit_backend_poll);
 
 int hermit_backend_submit_batch(struct hermit_batch *batch)
 {
+	HERMIT_ADC_SCOPE(batch->write ? ADC_BATCH_WRITE_SUBMIT : ADC_BATCH_READ_SUBMIT);
 	const struct hermit_backend_ops *ops;
 	int idx, ret = 0;
 	unsigned int i;
@@ -207,6 +212,7 @@ EXPORT_SYMBOL_GPL(hermit_backend_submit_batch);
 
 int hermit_backend_poll_batch(struct hermit_batch *batch, bool wait)
 {
+	HERMIT_ADC_SCOPE(batch->write ? ADC_BATCH_WRITE_POLL : ADC_BATCH_READ_POLL);
 	int ret;
 
 	if (!batch->backend)

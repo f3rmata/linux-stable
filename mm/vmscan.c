@@ -12,6 +12,7 @@
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+#include <linux/hermit_adc.h>
 #include <linux/mm.h>
 #include <linux/sched/mm.h>
 #include <linux/module.h>
@@ -1166,6 +1167,7 @@ static unsigned int shrink_folio_list(struct list_head *folio_list,
 		struct reclaim_stat *stat, bool ignore_references,
 		struct mem_cgroup *memcg, bool lru_gen_reclaim)
 {
+	HERMIT_ADC_SCOPE(ADC_PAGE_RECLAIM);
 	struct folio_batch free_folios;
 	LIST_HEAD(ret_folios);
 	LIST_HEAD(demote_folios);
@@ -1347,7 +1349,8 @@ retry:
 		}
 
 		if (!ignore_references)
-			references = folio_check_references(folio, sc);
+			references = hermit_adc_call(ADC_PG_CHECK_REF,
+				folio_check_references(folio, sc));
 
 		switch (references) {
 		case FOLIOREF_ACTIVATE:
@@ -1413,7 +1416,8 @@ retry:
 					    split_folio_to_list(folio, folio_list))
 						goto activate_locked;
 				}
-				if (folio_alloc_swap(folio, __GFP_HIGH | __GFP_NOWARN)) {
+				if (hermit_adc_call(ADC_ALLOC_SWAP_SLOT,
+					folio_alloc_swap(folio, __GFP_HIGH | __GFP_NOWARN))) {
 					int __maybe_unused order = folio_order(folio);
 
 					if (!folio_test_large(folio))
@@ -1429,7 +1433,8 @@ retry:
 					}
 #endif
 					count_mthp_stat(order, MTHP_STAT_SWPOUT_FALLBACK);
-					if (folio_alloc_swap(folio, __GFP_HIGH | __GFP_NOWARN))
+					if (hermit_adc_call(ADC_ALLOC_SWAP_SLOT,
+						folio_alloc_swap(folio, __GFP_HIGH | __GFP_NOWARN)))
 						goto activate_locked_split;
 				}
 				/*
@@ -1487,7 +1492,8 @@ retry:
 			hermit_policy_eviction(folio, &hint, lru_gen_reclaim);
 #endif
 			transfer_order = hermit_swapout_order(folio);
-			try_to_unmap(folio, flags);
+			hermit_adc_call(ADC_TRY_TO_UNMAP,
+				try_to_unmap(folio, flags));
 			if (folio_mapped(folio)) {
 				stat->nr_unmap_fail += nr_pages;
 				if (!was_swapbacked &&
@@ -1549,7 +1555,8 @@ retry:
 			 * potentially exists to avoid CPU writes after I/O
 			 * starts and then write it out here.
 			 */
-			try_to_unmap_flush_dirty();
+			hermit_adc_call(ADC_TLB_FLUSH_DIRTY,
+				try_to_unmap_flush_dirty());
 #ifdef CONFIG_HERMIT
 			if ((hint.cold || hint.mglru) && hint.owner && !folio_test_large(folio) &&
 			    hermit_policy_feature(HERMIT_POLICY_BATCH) &&

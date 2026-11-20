@@ -25,6 +25,7 @@
  * Copyright (C) 2020 Alibaba, Inc, Alex Shi
  */
 
+#include <linux/hermit_adc.h>
 #include <linux/cgroup-defs.h>
 #include <linux/page_counter.h>
 #include <linux/memcontrol.h>
@@ -4955,6 +4956,7 @@ out:
 int mem_cgroup_swapin_charge_folio(struct folio *folio, struct mm_struct *mm,
 				   gfp_t gfp, swp_entry_t entry)
 {
+	HERMIT_ADC_SCOPE(ADC_CGROUP_ACCOUNT);
 	struct mem_cgroup *memcg;
 	unsigned short id;
 	int ret;

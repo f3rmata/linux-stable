@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
+#include <asm/local64.h>
 #include <linux/atomic.h>
 #include <linux/debugfs.h>
 #include <linux/export.h>
 #include <linux/fs.h>
+#include <linux/hermit_adc.h>
 #include <linux/hermit_stats.h>
 #include <linux/jump_label.h>
 #include <linux/printk.h>
@@ -190,11 +192,92 @@ static int hermit_cost_enable_set(void *data, u64 value)
 DEFINE_DEBUGFS_ATTRIBUTE(hermit_cost_enable_fops, hermit_cost_enable_get,
 			 hermit_cost_enable_set, "%llu\n");
 
+DEFINE_STATIC_KEY_FALSE(hermit_adc_key);
+
+/* Per-CPU updates avoid a shared cacheline on the fault and reclaim paths. */
+struct hermit_adc_cpu {
+	local64_t ns[ADC_STAGE_NR];
+	local64_t count[ADC_STAGE_NR];
+	local64_t ticks[ADC_STAGE_NR];
+	local64_t tick_count[ADC_STAGE_NR];
+};
+static DEFINE_PER_CPU(struct hermit_adc_cpu, hermit_adc_cpu);
+
+void hermit_adc_record(enum hermit_adc_stage stage, u64 ns, u64 ticks)
+{
+	struct hermit_adc_cpu *cpu = get_cpu_ptr(&hermit_adc_cpu);
+
+	local64_add(ns, &cpu->ns[stage]);
+	local64_inc(&cpu->count[stage]);
+	if (ticks) {
+		local64_add(ticks, &cpu->ticks[stage]);
+		local64_inc(&cpu->tick_count[stage]);
+	}
+	put_cpu_ptr(&hermit_adc_cpu);
+}
+
+static const char * const adc_names[] = {
+	"user_addr_fault", "do_swap_page", "lookup_swapcache", "alloc_page",
+	"cgroup_account", "dedup_swapin", "policy_prefetch", "lock_folio",
+	"lock_get_pte", "set_pte", "batch_set_pte", "reclaim_folio_list",
+	"check_references", "alloc_swap_slot", "try_to_unmap", "tlb_flush_dirty",
+	"backend_read_sync", "backend_read_submit", "backend_poll_load", "backend_write",
+	"batch_read_submit", "batch_read_poll", "batch_write_submit", "batch_write_poll",
+	"read_cache_async", "add_to_swapcache", "sg_pte_scan", "sg_finish",
+	"policy_plan", "swap_major", "swap_minor",
+};
+static_assert(ARRAY_SIZE(adc_names) == ADC_STAGE_NR);
+
+static int hermit_adc_show(struct seq_file *m, void *unused)
+{
+	unsigned int stage, cpu;
+
+	seq_puts(m, "stage count total_ns tsc_count total_tsc_ticks\n");
+	for (stage = 0; stage < ADC_STAGE_NR; stage++) {
+		u64 count = 0, ns = 0, tick_count = 0, ticks = 0;
+
+		for_each_possible_cpu(cpu) {
+			struct hermit_adc_cpu *c = per_cpu_ptr(&hermit_adc_cpu, cpu);
+
+			count += local64_read(&c->count[stage]);
+			ns += local64_read(&c->ns[stage]);
+			ticks += local64_read(&c->ticks[stage]);
+			tick_count += local64_read(&c->tick_count[stage]);
+		}
+		seq_printf(m, "%s %llu %llu %llu %llu\n", adc_names[stage],
+			   count, ns, tick_count, ticks);
+	}
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hermit_adc);
+
+static int hermit_adc_enable_get(void *data, u64 *value)
+{
+	*value = static_branch_unlikely(&hermit_adc_key);
+	return 0;
+}
+
+static int hermit_adc_enable_set(void *data, u64 value)
+{
+	if (value > 1)
+		return -EINVAL;
+	if (value)
+		static_branch_enable(&hermit_adc_key);
+	else
+		static_branch_disable(&hermit_adc_key);
+	return 0;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(hermit_adc_enable_fops, hermit_adc_enable_get,
+			 hermit_adc_enable_set, "%llu\n");
+
 /* Owner-only access, as for the sibling Hermit control files. The symbolic
  * bits are used because the tree lint rejects octal literals.
  */
 void hermit_stats_debugfs_init(struct dentry *root)
 {
+	debugfs_create_file("adc_stats", S_IRUSR, root, NULL, &hermit_adc_fops);
+	debugfs_create_file("adc_enable", S_IRUSR | S_IWUSR, root, NULL,
+			    &hermit_adc_enable_fops);
 	debugfs_create_file("swapin_cost_stats", S_IRUSR, root, NULL,
 			    &hermit_cost_stats_fops);
 	debugfs_create_file("swapin_cost_enable", S_IRUSR | S_IWUSR, root, NULL,

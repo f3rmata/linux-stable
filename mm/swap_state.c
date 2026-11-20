@@ -7,6 +7,7 @@
  *
  *  Rewritten to use page cache, (C) 1998 Stephen Tweedie
  */
+#include <linux/hermit_adc.h>
 #include <linux/mm.h>
 #include <linux/hermit_backend.h>
 #include <linux/hermit_policy.h>
@@ -139,6 +140,7 @@ void *swap_cache_get_shadow(swp_entry_t entry)
  */
 void swap_cache_add_folio(struct folio *folio, swp_entry_t entry, void **shadowp)
 {
+	HERMIT_ADC_SCOPE(ADC_ADD_TO_SWAPCACHE);
 	void *shadow = NULL;
 	unsigned long old_tb, new_tb;
 	struct swap_cluster_info *ci;
@@ -409,6 +411,7 @@ struct folio *__read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
 		struct mempolicy *mpol, pgoff_t ilx, bool *new_page_allocated,
 		bool skip_if_exists)
 {
+	HERMIT_ADC_SCOPE(ADC_READ_CACHE_ASYNC);
 	struct swap_info_struct *si = __swap_entry_to_info(entry);
 	struct folio *folio;
 	struct folio *new_folio = NULL;
@@ -812,6 +815,7 @@ skip:
 static unsigned int hermit_swap_ptes(struct vm_fault *vmf, unsigned long start,
 		unsigned int nr, pte_t *values)
 {
+	HERMIT_ADC_SCOPE(ADC_SG_PTE_SCAN);
 	spinlock_t *ptl;
 	pte_t *pte;
 	unsigned int i;
@@ -840,6 +844,7 @@ static unsigned int hermit_swap_ptes(struct vm_fault *vmf, unsigned long start,
 static void hermit_swapin_finish(struct hermit_batch *batch, int ret,
 		const bool *stale, bool first)
 {
+	HERMIT_ADC_SCOPE(ADC_SG_FINISH);
 	unsigned int i;
 
 	for (i = 0; i < batch->nr; i++) {
