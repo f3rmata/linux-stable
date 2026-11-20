@@ -225,6 +225,7 @@ static const char * const adc_names[] = {
 	"batch_read_submit", "batch_read_poll", "batch_write_submit", "batch_write_poll",
 	"read_cache_async", "add_to_swapcache", "sg_pte_scan", "sg_finish",
 	"policy_plan", "swap_major", "swap_minor",
+	"medium_swapin", "ptebatch_install", "ptebatch_skip", "slotrun",
 };
 static_assert(ARRAY_SIZE(adc_names) == ADC_STAGE_NR);
 

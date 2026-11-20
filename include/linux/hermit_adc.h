@@ -17,7 +17,8 @@ enum hermit_adc_stage {
 	ADC_BATCH_READ_SUBMIT, ADC_BATCH_READ_POLL, ADC_BATCH_WRITE_SUBMIT,
 	ADC_BATCH_WRITE_POLL, ADC_READ_CACHE_ASYNC, ADC_ADD_TO_SWAPCACHE,
 	ADC_SG_PTE_SCAN, ADC_SG_FINISH, ADC_POLICY_PLAN, ADC_SWAP_MAJOR,
-	ADC_SWAP_MINOR, ADC_STAGE_NR
+	ADC_SWAP_MINOR, ADC_MEDIUM_SWAPIN, ADC_PTEBATCH_INSTALL, ADC_PTEBATCH_SKIP,
+	ADC_SLOTRUN, ADC_STAGE_NR
 };
 
 DECLARE_STATIC_KEY_FALSE(hermit_adc_key);
@@ -70,6 +71,9 @@ static inline void hermit_adc_finish(struct hermit_adc_interval *interval)
 	hermit_adc_record(interval->stage, ns, ticks);
 	if (interval->subtype != ADC_STAGE_NR)
 		hermit_adc_record(interval->subtype, ns, ticks);
+	/* Successful MEDIUM installs are also major swap faults. */
+	if (interval->subtype == ADC_MEDIUM_SWAPIN)
+		hermit_adc_record(ADC_SWAP_MAJOR, ns, ticks);
 }
 
 /* Each invocation owns its timestamp, including nested or concurrent faults. */

@@ -4895,6 +4895,7 @@ static unsigned int hermit_batch_ptes(struct vm_fault *vmf,
 	struct mm_struct *mm = vma->vm_mm;
 	unsigned long end, addr;
 	unsigned int pages, i;
+	struct hermit_adc_interval loop;
 
 	/* The batch never crosses the end of the VMA or of its PMD. */
 	end = pmd_addr_end(address, vma->vm_end);
@@ -4905,6 +4906,7 @@ static unsigned int hermit_batch_ptes(struct vm_fault *vmf,
 	if (!hermit_policy_pte_install(vmf, pages))
 		return 0;
 
+	loop = hermit_adc_begin(ADC_PTEBATCH_INSTALL);
 	for (i = 1; i < pages; i++) {
 		struct folio *folio;
 		swp_entry_t entry;
@@ -4999,8 +5001,11 @@ static unsigned int hermit_batch_ptes(struct vm_fault *vmf,
 		/* The swapcache lookup reference becomes the PTE reference. */
 		folio_unlock(folio);
 	}
-	if (i < pages)
+	if (i < pages) {
+		loop.subtype = ADC_PTEBATCH_SKIP;
 		hermit_policy_pte_skipped(pages - i);
+	}
+	hermit_adc_finish(&loop);
 	if (i > 1)
 		hermit_policy_pte_installed(i - 1);
 	return i - 1;
@@ -5573,6 +5578,9 @@ check_folio:
 	if (hermit_remote_fault) {
 		unsigned int hermit_nr = nr_pages;
 
+		if (static_branch_unlikely(&hermit_adc_key) && !swapcache &&
+		    vmf->hermit_folio_order && nr_pages > 1)
+			adc_interval.subtype = ADC_MEDIUM_SWAPIN;
 		/* PTEBATCH: map what the SG batch read for the addresses after
 		 * this one, under the PTE lock already held. The batch covers base
 		 * pages only, so the stream advances like a large folio install.
