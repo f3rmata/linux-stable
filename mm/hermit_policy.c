@@ -49,6 +49,7 @@ static u32 policy_swapin_max = HERMIT_SWAPIN_MAX;
  * segment length must repeat before it is trusted.
  */
 static u32 policy_medium_max_order = 4;
+static u32 policy_medium_min_order = 4;
 static u32 policy_medium_stable = 3;
 /* Phase C: the same completed-segment signal gates the fit-sized first batch
  * and the PTE install of the pages a batch read ahead.
@@ -134,6 +135,7 @@ static atomic_long_t mglru_candidates, mglru_sort_bypasses;
  * medium_used[order], medium_fallback_alloc or medium_fallback_extent.
  */
 static atomic_long_t medium_suggested, medium_fallback_alloc;
+static atomic_long_t medium_below_min;
 static atomic_long_t medium_fallback_extent;
 static atomic_long_t medium_extent_reasons[SWAPIN_EXTENT_NO_ORDER];
 static atomic_long_t medium_used[PMD_ORDER + 1];
@@ -672,6 +674,13 @@ unsigned int hermit_policy_predict(struct vm_fault *vmf)
 	return nr;
 }
 
+unsigned int hermit_policy_medium_min_order(void)
+{
+	u32 max = clamp_t(u32, READ_ONCE(policy_medium_max_order), 2, PMD_ORDER);
+
+	return clamp_t(u32, READ_ONCE(policy_medium_min_order), 2, max);
+}
+
 /*
  * Fit-driven medium order: the last completed segments all had the same
  * rounded-down power-of-two length, so that length can be read as one folio
@@ -681,7 +690,8 @@ unsigned int hermit_policy_predict(struct vm_fault *vmf)
  * entries. The tunable ceiling keeps the default at 64 KiB, where upstream
  * swpout fallback is still cheap.
  */
-static int policy_medium_order(struct policy_stream *s, unsigned long addr)
+static int policy_medium_order(struct policy_stream *s, unsigned long addr,
+			       unsigned long orders)
 {
 	unsigned int pos, left, order, max;
 
@@ -698,8 +708,13 @@ static int policy_medium_order(struct policy_stream *s, unsigned long addr)
 	max = clamp_t(u32, READ_ONCE(policy_medium_max_order), 2, PMD_ORDER);
 	order = min_t(unsigned int, ilog2(s->fit), max);
 	while (order >= 2 &&
-	       ((1U << order) > left || (pos & ((1U << order) - 1))))
+	       (!(orders & BIT(order)) || (1U << order) > left ||
+		(pos & ((1U << order) - 1))))
 		order--;
+	if (order >= 2 && order < hermit_policy_medium_min_order()) {
+		atomic_long_inc(&medium_below_min);
+		return -1;
+	}
 	return order >= 2 ? (int)order : -1;
 }
 
@@ -741,7 +756,7 @@ int hermit_policy_swapin_order(struct vm_fault *vmf, unsigned long orders,
 	} else if (hermit_policy_feature(HERMIT_POLICY_MEDIUM)) {
 		s = policy_stream(st, vmf, false);
 		if (s && now - s->time < POLICY_TTL && st->refault < 256) {
-			order = policy_medium_order(s, vmf->address & PAGE_MASK);
+			order = policy_medium_order(s, vmf->address & PAGE_MASK, orders);
 			if (order >= 0) {
 				if (medium)
 					*medium = true;
@@ -1164,6 +1179,7 @@ static int policy_stats_show(struct seq_file *m, void *unused)
 		   atomic_long_read(&medium_extent_reasons[SWAPIN_EXTENT_REMOTE]));
 	seq_printf(m, "medium_fallback_align %ld\n",
 		   atomic_long_read(&medium_extent_reasons[SWAPIN_EXTENT_ALIGN]));
+	seq_printf(m, "medium_below_min %ld\n", atomic_long_read(&medium_below_min));
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(policy_stats);
@@ -1177,6 +1193,8 @@ void hermit_policy_debugfs_init(struct dentry *root)
 	debugfs_create_u32("policy_swapin_max", 0600, root, &policy_swapin_max);
 	debugfs_create_u32("policy_medium_max_order", S_IRUSR | S_IWUSR, root,
 			   &policy_medium_max_order);
+	debugfs_create_u32("policy_medium_min_order", S_IRUSR | S_IWUSR, root,
+			   &policy_medium_min_order);
 	debugfs_create_u32("policy_medium_stable", S_IRUSR | S_IWUSR, root,
 			   &policy_medium_stable);
 	debugfs_create_u32("policy_fitstart_stable", S_IRUSR | S_IWUSR, root,

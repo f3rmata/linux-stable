@@ -4647,6 +4647,7 @@ static struct folio *alloc_swap_folio(struct vm_fault *vmf)
 	 */
 	if (vmf->hermit_folio_order) {
 		orders &= BIT(vmf->hermit_folio_order + 1) - 1;
+		orders &= ~(BIT(hermit_policy_medium_min_order()) - 1);
 		order = highest_order(orders);
 		goto hermit_alloc;
 	}
@@ -4789,8 +4790,14 @@ static int hermit_swapin_order_valid(struct vm_fault *vmf, unsigned long orders,
 	 * tunable ceiling sits above the legal mask.
 	 */
 	orders &= BIT(top + 1) - 1;
-	if (!(orders & ~(BIT(0) | BIT(1))))
+	orders &= ~(BIT(hermit_policy_medium_min_order()) - 1);
+	if (!orders)
 		return -1;
+	orders = thp_swap_suitable_orders(swp_offset(entry), vmf->address, orders);
+	if (!orders) {
+		*reason = SWAPIN_EXTENT_ALIGN;
+		return -1;
+	}
 	first = highest_order(orders);
 	order = first;
 	pte = pte_offset_map_lock(mm, vmf->pmd, vmf->address & PMD_MASK, &ptl);
@@ -4808,13 +4815,6 @@ static int hermit_swapin_order_valid(struct vm_fault *vmf, unsigned long orders,
 		order = next_order(&orders, order);
 	}
 	pte_unmap_unlock(pte, ptl);
-	/*
-	 * Attribute a rejected range to the allocator's alignment prerequisite
-	 * before its PTE checks. Keep the original descent through all orders.
-	 */
-	if (!orders && !thp_swap_suitable_orders(swp_offset(entry), vmf->address,
-						 BIT(first)))
-		*reason = SWAPIN_EXTENT_ALIGN;
 	return orders ? order : -1;
 #else
 	return -1;

@@ -60,6 +60,7 @@ bool hermit_policy_reserve_mode(void);
  */
 int hermit_policy_swapin_order(struct vm_fault *vmf, unsigned long orders,
 		bool *medium);
+unsigned int hermit_policy_medium_min_order(void);
 void hermit_policy_medium_used(unsigned int order);
 void hermit_policy_medium_extent(enum swapin_extent reason);
 void hermit_policy_unmap(struct vm_area_struct *vma, unsigned long start,
