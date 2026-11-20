@@ -18,6 +18,7 @@
 #include <linux/sched.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <linux/swapops.h>
 
 #define POLICY_BUCKET_BITS 10
 #define POLICY_BUCKETS (1U << POLICY_BUCKET_BITS)
@@ -136,6 +137,7 @@ static atomic_long_t mglru_candidates, mglru_sort_bypasses;
  */
 static atomic_long_t medium_suggested, medium_fallback_alloc;
 static atomic_long_t medium_below_min;
+static atomic_long_t slotrun_groups, slotrun_contiguous, slotrun_fallback;
 static atomic_long_t medium_fallback_extent;
 static atomic_long_t medium_extent_reasons[SWAPIN_EXTENT_NO_ORDER];
 static atomic_long_t medium_used[PMD_ORDER + 1];
@@ -1101,6 +1103,34 @@ unsigned long hermit_policy_reserve(struct mem_cgroup *memcg)
 #endif
 }
 
+/* Reclaim has sorted these locked, same-device folios by virtual address.
+ * Their swap entries are already in PTEs. Inspect the layout before I/O.
+ */
+void hermit_policy_slotrun(const struct hermit_batch *batch)
+{
+	unsigned int i, nr = batch->nr;
+	unsigned long addr = batch->addresses[0];
+	unsigned long first = swp_offset(batch->entries[0]);
+
+	if ((nr != 4 && nr != 8 && nr != 16) || !IS_ALIGNED(addr, nr * PAGE_SIZE))
+		return;
+	for (i = 1; i < nr; i++)
+		if (batch->addresses[i] != addr + i * PAGE_SIZE)
+			return;
+
+	atomic_long_inc(&slotrun_groups);
+	if (IS_ALIGNED(first, nr)) {
+		for (i = 1; i < nr; i++)
+			if (swp_offset(batch->entries[i]) != first + i)
+				break;
+		if (i == nr) {
+			atomic_long_inc(&slotrun_contiguous);
+			return;
+		}
+	}
+	atomic_long_inc(&slotrun_fallback);
+}
+
 void hermit_policy_mm_exit(struct mm_struct *mm)
 {
 	struct hermit_policy_state *st = mm->hermit_policy;
@@ -1180,6 +1210,9 @@ static int policy_stats_show(struct seq_file *m, void *unused)
 	seq_printf(m, "medium_fallback_align %ld\n",
 		   atomic_long_read(&medium_extent_reasons[SWAPIN_EXTENT_ALIGN]));
 	seq_printf(m, "medium_below_min %ld\n", atomic_long_read(&medium_below_min));
+	seq_printf(m, "slotrun_groups %ld\n", atomic_long_read(&slotrun_groups));
+	seq_printf(m, "slotrun_contiguous %ld\n", atomic_long_read(&slotrun_contiguous));
+	seq_printf(m, "slotrun_fallback %ld\n", atomic_long_read(&slotrun_fallback));
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(policy_stats);

@@ -1134,6 +1134,8 @@ static unsigned int hermit_reclaim_batch_finish(struct hermit_batch *batch,
 			j--;
 		}
 	}
+	if (hermit_policy_feature(HERMIT_POLICY_SLOTRUN))
+		hermit_policy_slotrun(batch);
 	hermit_swap_write_batch(batch);
 	for (i = 0; i < batch->nr; i++) {
 		struct folio *f = batch->folios[i];

@@ -11,6 +11,7 @@ struct folio;
 struct list_head;
 struct dentry;
 struct mem_cgroup;
+struct hermit_batch;
 
 enum swapin_extent {
 	SWAPIN_EXTENT_OK,
@@ -44,6 +45,7 @@ struct hermit_reclaim_hint {
 #define HERMIT_POLICY_FITSTART	BIT(10)	/* first batch of a stable segment is fit-sized */
 #define HERMIT_POLICY_PTEBATCH	BIT(11)	/* map the pages an SG batch read ahead */
 #define HERMIT_POLICY_SPLIT	BIT(12)	/* split large folios to their hot sub-order */
+#define HERMIT_POLICY_SLOTRUN	BIT(13)	/* measure aligned local swap slot runs */
 #define HERMIT_POLICY_DEFAULT	(HERMIT_POLICY_SWAPIN | HERMIT_POLICY_PEBS | \
 				 HERMIT_POLICY_SORT | HERMIT_POLICY_OBSERVE | \
 				 HERMIT_POLICY_FLUSH | HERMIT_POLICY_BATCH | \
@@ -61,6 +63,7 @@ bool hermit_policy_reserve_mode(void);
 int hermit_policy_swapin_order(struct vm_fault *vmf, unsigned long orders,
 		bool *medium);
 unsigned int hermit_policy_medium_min_order(void);
+void hermit_policy_slotrun(const struct hermit_batch *batch);
 void hermit_policy_medium_used(unsigned int order);
 void hermit_policy_medium_extent(enum swapin_extent reason);
 void hermit_policy_unmap(struct vm_area_struct *vma, unsigned long start,
