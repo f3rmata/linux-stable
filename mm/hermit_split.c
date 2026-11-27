@@ -37,32 +37,47 @@
 #include <linux/hermit_split.h>
 
 /* debugfs tunables; the split only runs when HERMIT_POLICY_SPLIT is set. */
-static u32 hermit_split_rate = 32;	/* folios per second */
-static u32 hermit_split_hot_cov = 80;	/* % of samples the hot set covers */
-static u32 hermit_split_hot_pct = 75;	/* % of a block's pages that must be hot */
-static u32 hermit_split_min_cold = 25;	/* % of the folio that must be cold */
+static u32 hermit_split_rate = 32; /* folios per second */
+static u32 hermit_split_hot_cov = 80; /* % of samples the hot set covers */
+static u32 hermit_split_hot_pct =
+	75; /* % of a block's pages that must be hot */
+static u32 hermit_split_min_cold = 25; /* % of the folio that must be cold */
 static u32 hermit_split_min_samples = 4; /* samples needed in the folio */
 static u32 hermit_split_refault_max = 256; /* max refault score for a split */
 
-#define HERMIT_SPLIT_MAX_ORDER	9	/* 2 MiB, the PEBS region size */
+#define HERMIT_SPLIT_MAX_ORDER 9 /* 2 MiB, the PEBS region size */
 #define HERMIT_SPLIT_MAX_SUBPAGES (1U << HERMIT_SPLIT_MAX_ORDER)
 
 /* Skip reasons: one counter each, printed as split_skipped_reason_<name>. */
 enum hermit_split_skip {
-	HSP_SHARED, HSP_KSM, HSP_WRITEBACK, HSP_SWAPCACHE, HSP_PINNED,
-	HSP_NOTIFIER, HSP_UNKNOWN, HSP_ALL_HOT, HSP_COLD_YOUNG, HSP_NO_ORDER,
-	HSP_BUDGET, HSP_PRESSURE, HSP_MEMORY,
-	HSP_INACTIVE, HSP_NOHEAT, HSP_FEWSAMPLES, HSP_CONTENDED, HSP_NR,
+	HSP_SHARED,
+	HSP_KSM,
+	HSP_WRITEBACK,
+	HSP_SWAPCACHE,
+	HSP_PINNED,
+	HSP_NOTIFIER,
+	HSP_UNKNOWN,
+	HSP_ALL_HOT,
+	HSP_COLD_YOUNG,
+	HSP_NO_ORDER,
+	HSP_BUDGET,
+	HSP_PRESSURE,
+	HSP_MEMORY,
+	HSP_INACTIVE,
+	HSP_NOHEAT,
+	HSP_FEWSAMPLES,
+	HSP_CONTENDED,
+	HSP_NR,
 };
 static atomic_long_t split_candidates, split_attempts, split_pages;
 static atomic_long_t split_failures;
 static atomic_long_t split_done[HERMIT_SPLIT_MAX_ORDER + 1];
 static atomic_long_t split_skipped[HSP_NR];
-static const char * const split_skip_names[HSP_NR] = {
-	"shared", "ksm", "writeback", "swapcache", "pinned",
-	"notifier", "unknown", "all_hot", "cold_young", "no_order",
-	"budget", "pressure", "memory",
-	"inactive", "noheat", "fewsamples", "contended",
+static const char *const split_skip_names[HSP_NR] = {
+	"shared",     "ksm",	   "writeback", "swapcache",  "pinned",
+	"notifier",   "unknown",   "all_hot",	"cold_young", "no_order",
+	"budget",     "pressure",  "memory",	"inactive",   "noheat",
+	"fewsamples", "contended",
 };
 
 /* hermit_split:begin pure */
@@ -80,12 +95,12 @@ static const char * const split_skip_names[HSP_NR] = {
  * accessed vetoes the split.
  */
 enum hermit_split_verdict {
-	HERMIT_SPLIT_PICK = 0,	/* @out_order holds the split order */
+	HERMIT_SPLIT_PICK = 0, /* @out_order holds the split order */
 	HERMIT_SPLIT_UNKNOWN,
 	HERMIT_SPLIT_FEWSAMPLES,
-	HERMIT_SPLIT_ALL_HOT,	/* no cold remainder worth splitting */
+	HERMIT_SPLIT_ALL_HOT, /* no cold remainder worth splitting */
 	HERMIT_SPLIT_COLD_YOUNG, /* a cold subpage is still accessed */
-	HERMIT_SPLIT_NO_ORDER,	/* no aligned block isolates the hot part */
+	HERMIT_SPLIT_NO_ORDER, /* no aligned block isolates the hot part */
 };
 
 struct hermit_split_rule {
@@ -98,7 +113,8 @@ struct hermit_split_rule {
 static enum hermit_split_verdict
 hermit_split_select(const u8 *heat, unsigned int nr_pages,
 		    unsigned int folio_order, const unsigned long *young,
-		    const struct hermit_split_rule *rule, unsigned int *out_order)
+		    const struct hermit_split_rule *rule,
+		    unsigned int *out_order)
 {
 	unsigned int hist[U8_MAX + 1] = {};
 	unsigned int i, j, block, blocks, order, size;
@@ -132,7 +148,7 @@ hermit_split_select(const u8 *heat, unsigned int nr_pages,
 		if (heat[i] < threshold && test_bit(i, young))
 			return HERMIT_SPLIT_COLD_YOUNG;
 	/* Order 1 anonymous folios are not supported by the split code. */
-	for (order = folio_order; order-- > 0; ) {
+	for (order = folio_order; order-- > 0;) {
 		bool any_hot = false, any_cold = false;
 
 		if (order == 1)
@@ -223,7 +239,8 @@ struct hermit_split_probe {
 };
 
 static bool hermit_split_probe_one(struct folio *folio,
-		struct vm_area_struct *vma, unsigned long address, void *arg)
+				   struct vm_area_struct *vma,
+				   unsigned long address, void *arg)
 {
 	struct hermit_split_probe *probe = arg;
 	struct mm_struct *mm = vma->vm_mm;
@@ -280,7 +297,8 @@ static bool hermit_split_probe_one(struct folio *folio,
 bool hermit_split_try(struct folio *folio, struct list_head *list,
 		      struct mem_cgroup *memcg)
 {
-	unsigned int order = folio_order(folio), nr_pages = folio_nr_pages(folio);
+	unsigned int order = folio_order(folio),
+		     nr_pages = folio_nr_pages(folio);
 	unsigned int target = 0;
 	struct hermit_split_rule rule = {
 		.hot_cov = READ_ONCE(hermit_split_hot_cov),
@@ -347,8 +365,9 @@ bool hermit_split_try(struct folio *folio, struct list_head *list,
 	}
 	rmap_walk(folio, &rwc);
 	if (probe.failed || rwc.contended || probe.mappings != 1) {
-		hermit_split_skip(probe.failed ? probe.reason :
-				  rwc.contended ? HSP_CONTENDED : HSP_SHARED);
+		hermit_split_skip(probe.failed	? probe.reason :
+				  rwc.contended ? HSP_CONTENDED :
+						  HSP_SHARED);
 		kfree(probe.heat);
 		return false;
 	}
@@ -411,24 +430,179 @@ void hermit_split_stats_show(struct seq_file *m)
 	seq_printf(m, "split_attempts %ld\n",
 		   atomic_long_read(&split_attempts));
 	seq_printf(m, "split_pages %ld\n", atomic_long_read(&split_pages));
-	seq_printf(m, "split_failures %ld\n", atomic_long_read(&split_failures));
+	seq_printf(m, "split_failures %ld\n",
+		   atomic_long_read(&split_failures));
 	for (i = 0; i <= HERMIT_SPLIT_MAX_ORDER; i++)
 		seq_printf(m, "split_done_order%u %ld\n", i,
 			   atomic_long_read(&split_done[i]));
 	hermit_split_show_skips(m, 0, HSP_INACTIVE);
 }
 
+/*
+ * HERMIT_POLICY_SPLIT_OBS: observe-only skew telemetry on resident and
+ * reclaim-scanned large folios without performing any split.
+ */
+struct hermit_obs_bucket {
+	atomic_long_t total;
+	atomic_long_t noheat;
+	atomic_long_t fewsamples;
+	atomic_long_t skew_lt12; /* k80 / nr_pages < 12.5% */
+	atomic_long_t skew_12_25; /* 12.5% <= k80 / nr_pages < 25% */
+	atomic_long_t skew_25_50; /* 25% <= k80 / nr_pages < 50% */
+	atomic_long_t skew_50_75; /* 50% <= k80 / nr_pages < 75% */
+	atomic_long_t skew_ge75; /* k80 / nr_pages >= 75% */
+	atomic_long_t orders[HERMIT_SPLIT_MAX_ORDER + 1];
+};
+
+static struct hermit_obs_bucket split_obs[HERMIT_OBS_STAGES];
+static const char *const split_obs_names[HERMIT_OBS_STAGES] = {
+	"aged",
+	"kept",
+	"reclaim",
+};
+
+void hermit_split_observe_addr(struct mm_struct *mm, unsigned long addr,
+			       unsigned int order,
+			       enum hermit_split_obs_stage stage)
+{
+	unsigned int nr_pages, total = 0, k = 0;
+	unsigned int min_samples, hot_cov;
+	struct hermit_obs_bucket *b;
+
+	if (!hermit_policy_feature(HERMIT_POLICY_SPLIT_OBS))
+		return;
+	if (!mm || stage >= HERMIT_OBS_STAGES || order < 2 ||
+	    order > HERMIT_SPLIT_MAX_ORDER || !hermit_policy_active(mm))
+		return;
+
+	nr_pages = 1U << order;
+	addr = ALIGN_DOWN(addr, (unsigned long)nr_pages * PAGE_SIZE);
+	b = &split_obs[stage];
+	atomic_long_inc(&b->total);
+	atomic_long_inc(&b->orders[order]);
+
+	hot_cov = READ_ONCE(hermit_split_hot_cov);
+	min_samples = READ_ONCE(hermit_split_min_samples);
+	if (!hermit_pebs_heat_skew(mm, addr, nr_pages, hot_cov, &total, &k)) {
+		atomic_long_inc(&b->noheat);
+		return;
+	}
+	if (total < min_samples) {
+		atomic_long_inc(&b->fewsamples);
+		return;
+	}
+	if (k * 8 < nr_pages)
+		atomic_long_inc(&b->skew_lt12);
+	else if (k * 4 < nr_pages)
+		atomic_long_inc(&b->skew_12_25);
+	else if (k * 2 < nr_pages)
+		atomic_long_inc(&b->skew_25_50);
+	else if (k * 4 < nr_pages * 3)
+		atomic_long_inc(&b->skew_50_75);
+	else
+		atomic_long_inc(&b->skew_ge75);
+}
+
+struct hermit_obs_rmap {
+	struct mm_struct *mm;
+	unsigned long addr;
+	unsigned int mappings;
+};
+
+static bool hermit_obs_rmap_one(struct folio *folio, struct vm_area_struct *vma,
+				unsigned long address, void *arg)
+{
+	struct hermit_obs_rmap *r = arg;
+
+	r->mappings++;
+	if (r->mappings > 1)
+		return false;
+	r->mm = vma->vm_mm;
+	r->addr = address & PAGE_MASK;
+	return true;
+}
+
+void hermit_split_observe_folio(struct folio *folio,
+				enum hermit_split_obs_stage stage)
+{
+	unsigned int order;
+	struct hermit_obs_rmap obs = {};
+	struct rmap_walk_control rwc = {
+		.rmap_one = hermit_obs_rmap_one,
+		.arg = &obs,
+		.try_lock = true,
+	};
+
+	if (!hermit_policy_feature(HERMIT_POLICY_SPLIT_OBS))
+		return;
+	if (!folio_test_large(folio) || !folio_test_anon(folio) ||
+	    folio_test_ksm(folio))
+		return;
+	order = folio_order(folio);
+	if (order < 2 || order > HERMIT_SPLIT_MAX_ORDER)
+		return;
+	rmap_walk(folio, &rwc);
+	if (obs.mappings == 1 && obs.mm)
+		hermit_split_observe_addr(obs.mm, obs.addr, order, stage);
+}
+
+static int hermit_split_obs_show(struct seq_file *m, void *unused)
+{
+	unsigned int s, o;
+
+	for (s = 0; s < HERMIT_OBS_STAGES; s++) {
+		struct hermit_obs_bucket *b = &split_obs[s];
+		const char *n = split_obs_names[s];
+
+		seq_printf(m, "%s_total %ld\n", n, atomic_long_read(&b->total));
+		seq_printf(m, "%s_noheat %ld\n", n,
+			   atomic_long_read(&b->noheat));
+		seq_printf(m, "%s_fewsamples %ld\n", n,
+			   atomic_long_read(&b->fewsamples));
+		seq_printf(m, "%s_skew_lt12 %ld\n", n,
+			   atomic_long_read(&b->skew_lt12));
+		seq_printf(m, "%s_skew_12_25 %ld\n", n,
+			   atomic_long_read(&b->skew_12_25));
+		seq_printf(m, "%s_skew_25_50 %ld\n", n,
+			   atomic_long_read(&b->skew_25_50));
+		seq_printf(m, "%s_skew_50_75 %ld\n", n,
+			   atomic_long_read(&b->skew_50_75));
+		seq_printf(m, "%s_skew_ge75 %ld\n", n,
+			   atomic_long_read(&b->skew_ge75));
+		for (o = 2; o <= HERMIT_SPLIT_MAX_ORDER; o++)
+			seq_printf(m, "%s_order%u %ld\n", n, o,
+				   atomic_long_read(&b->orders[o]));
+	}
+	return 0;
+}
+
+static int hermit_split_obs_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, hermit_split_obs_show, NULL);
+}
+
+static const struct file_operations hermit_split_obs_fops = {
+	.owner = THIS_MODULE,
+	.open = hermit_split_obs_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 void hermit_split_debugfs_init(struct dentry *root)
 {
-	debugfs_create_u32("policy_split_rate", 0600, root, &hermit_split_rate);
-	debugfs_create_u32("policy_split_hot_cov", 0600, root,
+	debugfs_create_u32("policy_split_rate", S_IRUSR | S_IWUSR, root,
+			   &hermit_split_rate);
+	debugfs_create_u32("policy_split_hot_cov", S_IRUSR | S_IWUSR, root,
 			   &hermit_split_hot_cov);
-	debugfs_create_u32("policy_split_hot_pct", 0600, root,
+	debugfs_create_u32("policy_split_hot_pct", S_IRUSR | S_IWUSR, root,
 			   &hermit_split_hot_pct);
-	debugfs_create_u32("policy_split_min_cold", 0600, root,
+	debugfs_create_u32("policy_split_min_cold", S_IRUSR | S_IWUSR, root,
 			   &hermit_split_min_cold);
-	debugfs_create_u32("policy_split_min_samples", 0600, root,
+	debugfs_create_u32("policy_split_min_samples", S_IRUSR | S_IWUSR, root,
 			   &hermit_split_min_samples);
-	debugfs_create_u32("policy_split_refault_max", 0600, root,
+	debugfs_create_u32("policy_split_refault_max", S_IRUSR | S_IWUSR, root,
 			   &hermit_split_refault_max);
+	debugfs_create_file("split_obs_stats", S_IRUSR, root, NULL,
+			    &hermit_split_obs_fops);
 }

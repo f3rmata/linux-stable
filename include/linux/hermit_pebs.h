@@ -84,5 +84,8 @@ bool hermit_pebs_snapshot(struct mm_struct *mm, unsigned long addr,
  */
 bool hermit_pebs_heat_read(struct mm_struct *mm, unsigned long addr,
 			   unsigned int nr_pages, u8 *out);
+bool hermit_pebs_heat_skew(struct mm_struct *mm, unsigned long addr,
+			   unsigned int nr_pages, unsigned int hot_cov,
+			   unsigned int *total_out, unsigned int *k_out);
 
 #endif /* _LINUX_HERMIT_PEBS_H */

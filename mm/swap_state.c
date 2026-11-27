@@ -9,9 +9,11 @@
  */
 #include <linux/hermit_adc.h>
 #include <linux/mm.h>
+#include <linux/hermit.h>
 #include <linux/hermit_backend.h>
 #include <linux/hermit_policy.h>
 #include <linux/hermit_stats.h>
+#include <linux/userfaultfd_k.h>
 #include <linux/ktime.h>
 #include <linux/gfp.h>
 #include <linux/kernel_stat.h>
@@ -36,9 +38,9 @@
  * vmscan's shrink_folio_list.
  */
 static const struct address_space_operations swap_aops = {
-	.dirty_folio	= noop_dirty_folio,
+	.dirty_folio = noop_dirty_folio,
 #ifdef CONFIG_MIGRATION
-	.migrate_folio	= migrate_folio,
+	.migrate_folio = migrate_folio,
 #endif
 };
 
@@ -48,25 +50,25 @@ struct address_space swap_space __read_mostly = {
 
 static bool enable_vma_readahead __read_mostly = true;
 
-#define SWAP_RA_ORDER_CEILING	5
+#define SWAP_RA_ORDER_CEILING 5
 
-#define SWAP_RA_WIN_SHIFT	(PAGE_SHIFT / 2)
-#define SWAP_RA_HITS_MASK	((1UL << SWAP_RA_WIN_SHIFT) - 1)
-#define SWAP_RA_HITS_MAX	SWAP_RA_HITS_MASK
-#define SWAP_RA_WIN_MASK	(~PAGE_MASK & ~SWAP_RA_HITS_MASK)
+#define SWAP_RA_WIN_SHIFT (PAGE_SHIFT / 2)
+#define SWAP_RA_HITS_MASK ((1UL << SWAP_RA_WIN_SHIFT) - 1)
+#define SWAP_RA_HITS_MAX SWAP_RA_HITS_MASK
+#define SWAP_RA_WIN_MASK (~PAGE_MASK & ~SWAP_RA_HITS_MASK)
 
-#define SWAP_RA_HITS(v)		((v) & SWAP_RA_HITS_MASK)
-#define SWAP_RA_WIN(v)		(((v) & SWAP_RA_WIN_MASK) >> SWAP_RA_WIN_SHIFT)
-#define SWAP_RA_ADDR(v)		((v) & PAGE_MASK)
+#define SWAP_RA_HITS(v) ((v) & SWAP_RA_HITS_MASK)
+#define SWAP_RA_WIN(v) (((v) & SWAP_RA_WIN_MASK) >> SWAP_RA_WIN_SHIFT)
+#define SWAP_RA_ADDR(v) ((v) & PAGE_MASK)
 
-#define SWAP_RA_VAL(addr, win, hits)				\
-	(((addr) & PAGE_MASK) |					\
-	 (((win) << SWAP_RA_WIN_SHIFT) & SWAP_RA_WIN_MASK) |	\
+#define SWAP_RA_VAL(addr, win, hits)                         \
+	(((addr) & PAGE_MASK) |                              \
+	 (((win) << SWAP_RA_WIN_SHIFT) & SWAP_RA_WIN_MASK) | \
 	 ((hits) & SWAP_RA_HITS_MASK))
 
 /* Initial readahead hits is 4 to start up with a small window */
-#define GET_SWAP_RA_VAL(vma)					\
-	(atomic_long_read(&(vma)->swap_readahead_info) ? : 4)
+#define GET_SWAP_RA_VAL(vma) \
+	(atomic_long_read(&(vma)->swap_readahead_info) ?: 4)
 
 static atomic_t swapin_readahead_hits = ATOMIC_INIT(4);
 
@@ -138,7 +140,8 @@ void *swap_cache_get_shadow(swp_entry_t entry)
  * The caller also needs to update the corresponding swap_map slots with
  * SWAP_HAS_CACHE bit to avoid race or conflict.
  */
-void swap_cache_add_folio(struct folio *folio, swp_entry_t entry, void **shadowp)
+void swap_cache_add_folio(struct folio *folio, swp_entry_t entry,
+			  void **shadowp)
 {
 	HERMIT_ADC_SCOPE(ADC_ADD_TO_SWAPCACHE);
 	void *shadow = NULL;
@@ -254,8 +257,8 @@ void swap_cache_del_folio(struct folio *folio)
  * Context: Caller must ensure both folios are locked, and lock the
  * cluster that holds the old folio to be replaced.
  */
-void __swap_cache_replace_folio(struct swap_cluster_info *ci,
-				struct folio *old, struct folio *new)
+void __swap_cache_replace_folio(struct swap_cluster_info *ci, struct folio *old,
+				struct folio *new)
 {
 	swp_entry_t entry = new->swap;
 	unsigned long nr_pages = folio_nr_pages(new);
@@ -263,7 +266,8 @@ void __swap_cache_replace_folio(struct swap_cluster_info *ci,
 	unsigned int ci_end = ci_off + nr_pages;
 	unsigned long old_tb, new_tb;
 
-	VM_WARN_ON_ONCE(!folio_test_swapcache(old) || !folio_test_swapcache(new));
+	VM_WARN_ON_ONCE(!folio_test_swapcache(old) ||
+			!folio_test_swapcache(new));
 	VM_WARN_ON_ONCE(!folio_test_locked(old) || !folio_test_locked(new));
 	VM_WARN_ON_ONCE(!entry.val);
 
@@ -271,7 +275,8 @@ void __swap_cache_replace_folio(struct swap_cluster_info *ci,
 	new_tb = folio_to_swp_tb(new);
 	do {
 		old_tb = __swap_table_xchg(ci, ci_off, new_tb);
-		WARN_ON_ONCE(!swp_tb_is_folio(old_tb) || swp_tb_to_folio(old_tb) != old);
+		WARN_ON_ONCE(!swp_tb_is_folio(old_tb) ||
+			     swp_tb_to_folio(old_tb) != old);
 	} while (++ci_off < ci_end);
 
 	/*
@@ -284,7 +289,8 @@ void __swap_cache_replace_folio(struct swap_cluster_info *ci,
 		ci_off = swp_cluster_offset(old->swap);
 		ci_end = ci_off + folio_nr_pages(old);
 		while (ci_off++ < ci_end)
-			WARN_ON_ONCE(swp_tb_to_folio(__swap_table_get(ci, ci_off)) != old);
+			WARN_ON_ONCE(swp_tb_to_folio(__swap_table_get(
+					     ci, ci_off)) != old);
 	}
 }
 
@@ -408,8 +414,9 @@ void swap_update_readahead(struct folio *folio, struct vm_area_struct *vma,
 }
 
 struct folio *__read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
-		struct mempolicy *mpol, pgoff_t ilx, bool *new_page_allocated,
-		bool skip_if_exists)
+				      struct mempolicy *mpol, pgoff_t ilx,
+				      bool *new_page_allocated,
+				      bool skip_if_exists)
 {
 	HERMIT_ADC_SCOPE(ADC_READ_CACHE_ASYNC);
 	struct swap_info_struct *si = __swap_entry_to_info(entry);
@@ -443,7 +450,8 @@ struct folio *__read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
 		 * add it to cache.
 		 */
 		if (!new_folio) {
-			new_folio = folio_alloc_mpol(gfp_mask, 0, mpol, ilx, numa_node_id());
+			new_folio = folio_alloc_mpol(gfp_mask, 0, mpol, ilx,
+						     numa_node_id());
 			if (!new_folio)
 				goto put_and_return;
 		}
@@ -521,8 +529,8 @@ put_and_return:
  * swap cache folio lock.
  */
 struct folio *read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
-		struct vm_area_struct *vma, unsigned long addr,
-		struct swap_iocb **plug)
+				    struct vm_area_struct *vma,
+				    unsigned long addr, struct swap_iocb **plug)
 {
 	struct swap_info_struct *si;
 	bool page_allocated;
@@ -547,10 +555,8 @@ struct folio *read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
 }
 
 static unsigned int swapin_readahead_pages(unsigned long prev_offset,
-				      unsigned long offset,
-				      int hits,
-				      int max_pages,
-				      int prev_win)
+					   unsigned long offset, int hits,
+					   int max_pages, int prev_win)
 {
 	unsigned int pages, last_ra;
 
@@ -598,8 +604,8 @@ static unsigned long swapin_nr_pages(unsigned long offset)
 
 	hits = atomic_xchg(&swapin_readahead_hits, 0);
 	pages = swapin_readahead_pages(READ_ONCE(prev_offset), offset, hits,
-				  max_pages,
-				  atomic_read(&last_readahead_pages));
+				       max_pages,
+				       atomic_read(&last_readahead_pages));
 	if (!hits)
 		WRITE_ONCE(prev_offset, offset);
 	atomic_set(&last_readahead_pages, pages);
@@ -626,7 +632,7 @@ static unsigned long swapin_nr_pages(unsigned long offset)
  * are fairly likely to have been swapped out from the same node.
  */
 struct folio *swap_cluster_readahead(swp_entry_t entry, gfp_t gfp_mask,
-				    struct mempolicy *mpol, pgoff_t ilx)
+				     struct mempolicy *mpol, pgoff_t ilx)
 {
 	struct folio *folio;
 	unsigned long entry_offset = swp_offset(entry);
@@ -645,17 +651,17 @@ struct folio *swap_cluster_readahead(swp_entry_t entry, gfp_t gfp_mask,
 	/* Read a page_cluster sized and aligned cluster around offset. */
 	start_offset = offset & ~mask;
 	end_offset = offset | mask;
-	if (!start_offset)	/* First page is swap header. */
+	if (!start_offset) /* First page is swap header. */
 		start_offset++;
 	if (end_offset >= si->max)
 		end_offset = si->max - 1;
 
 	blk_start_plug(&plug);
-	for (offset = start_offset; offset <= end_offset ; offset++) {
+	for (offset = start_offset; offset <= end_offset; offset++) {
 		/* Ok, do the async read-ahead now */
 		folio = __read_swap_cache_async(
-				swp_entry(swp_type(entry), offset),
-				gfp_mask, mpol, ilx, &page_allocated, false);
+			swp_entry(swp_type(entry), offset), gfp_mask, mpol, ilx,
+			&page_allocated, false);
 		if (!folio)
 			continue;
 		if (page_allocated) {
@@ -669,7 +675,7 @@ struct folio *swap_cluster_readahead(swp_entry_t entry, gfp_t gfp_mask,
 	}
 	blk_finish_plug(&plug);
 	swap_read_unplug(splug);
-	lru_add_drain();	/* Push any new pages onto the LRU now */
+	lru_add_drain(); /* Push any new pages onto the LRU now */
 skip:
 	/* The page was likely read above, so no need for plugging here */
 	folio = __read_swap_cache_async(entry, gfp_mask, mpol, ilx,
@@ -696,8 +702,8 @@ static int swap_vma_ra_win(struct vm_fault *vmf, unsigned long *start,
 	prev_faddr = SWAP_RA_ADDR(ra_val);
 	prev_win = SWAP_RA_WIN(ra_val);
 	hits = SWAP_RA_HITS(ra_val);
-	win = swapin_readahead_pages(PFN_DOWN(prev_faddr), PFN_DOWN(faddr), hits,
-				max_win, prev_win);
+	win = swapin_readahead_pages(PFN_DOWN(prev_faddr), PFN_DOWN(faddr),
+				     hits, max_win, prev_win);
 	atomic_long_set(&vma->swap_readahead_info, SWAP_RA_VAL(faddr, win, 0));
 	if (win == 1)
 		return 1;
@@ -734,7 +740,8 @@ static int swap_vma_ra_win(struct vm_fault *vmf, unsigned long *start,
  *
  */
 static struct folio *swap_vma_readahead(swp_entry_t targ_entry, gfp_t gfp_mask,
-		struct mempolicy *mpol, pgoff_t targ_ilx, struct vm_fault *vmf)
+					struct mempolicy *mpol,
+					pgoff_t targ_ilx, struct vm_fault *vmf)
 {
 	struct blk_plug plug;
 	struct swap_iocb *splug = NULL;
@@ -813,7 +820,7 @@ skip:
  * covers it. Returns the length of the leading run of valid swap PTEs.
  */
 static unsigned int hermit_swap_ptes(struct vm_fault *vmf, unsigned long start,
-		unsigned int nr, pte_t *values)
+				     unsigned int nr, pte_t *values)
 {
 	HERMIT_ADC_SCOPE(ADC_SG_PTE_SCAN);
 	spinlock_t *ptl;
@@ -830,7 +837,8 @@ static unsigned int hermit_swap_ptes(struct vm_fault *vmf, unsigned long start,
 		return 0;
 	for (i = 0; i < nr; i++) {
 		values[i] = ptep_get(pte + i);
-		if (!is_swap_pte(values[i]) || non_swap_entry(pte_to_swp_entry(values[i])))
+		if (!is_swap_pte(values[i]) ||
+		    non_swap_entry(pte_to_swp_entry(values[i])))
 			break;
 	}
 	valid = i;
@@ -842,7 +850,7 @@ static unsigned int hermit_swap_ptes(struct vm_fault *vmf, unsigned long start,
 
 /* Complete one polled batch. Page 0 of batch 0 is the demand page. */
 static void hermit_swapin_finish(struct hermit_batch *batch, int ret,
-		const bool *stale, bool first)
+				 const bool *stale, bool first)
 {
 	HERMIT_ADC_SCOPE(ADC_SG_FINISH);
 	unsigned int i;
@@ -881,82 +889,407 @@ static void hermit_swapin_finish(struct hermit_batch *batch, int ret,
 #define HERMIT_SWAPIN_BATCHES (HERMIT_SWAPIN_MAX / HERMIT_BATCH_MAX)
 
 struct hermit_swapin_work {
+	struct hermit_direct_batch direct;
 	struct hermit_batch batches[HERMIT_SWAPIN_BATCHES];
 	pte_t snapshots[HERMIT_SWAPIN_MAX], now[HERMIT_SWAPIN_MAX];
+	struct page *raw_pages[HERMIT_SWAPIN_MAX];
+	struct folio *prep_folios[HERMIT_SWAPIN_MAX];
+	swp_entry_t prep_entries[HERMIT_SWAPIN_MAX];
+	unsigned long prep_addrs[HERMIT_SWAPIN_MAX];
 };
 
-struct folio *hermit_swapin_pages(swp_entry_t entry, gfp_t gfp, struct vm_fault *vmf)
+void hermit_direct_batch_free(struct hermit_direct_batch *db)
+{
+	if (!db)
+		return;
+	kfree(container_of(db, struct hermit_swapin_work, direct));
+}
+
+static void hermit_release_unused_pages(struct page **pages, unsigned int from,
+					unsigned int to)
+{
+	unsigned int i;
+
+	for (i = from; i < to; i++)
+		if (pages[i])
+			folio_put(page_folio(pages[i]));
+}
+
+static unsigned int hermit_alloc_pages_bulk(struct vm_area_struct *vma,
+					    unsigned long addr, gfp_t gfp,
+					    unsigned int want,
+					    struct page **pages)
+{
+	HERMIT_ADC_SCOPE(ADC_ALLOC_PAGE);
+	gfp_t gfp_pref = (gfp & ~__GFP_DIRECT_RECLAIM) | __GFP_NORETRY |
+			 __GFP_NOWARN;
+	struct mempolicy *mpol;
+	pgoff_t ilx;
+	unsigned int got = 0;
+
+	memset(pages, 0, want * sizeof(*pages));
+	mpol = get_vma_policy(vma, addr, 0, &ilx);
+#ifdef CONFIG_NUMA
+	if (!mpol || mpol->mode == MPOL_DEFAULT)
+		got = alloc_pages_bulk_node(gfp_pref, numa_node_id(), want,
+					    pages);
+	else
+		got = alloc_pages_bulk_mempolicy(gfp_pref, want, pages);
+#else
+	got = alloc_pages_bulk(gfp_pref, want, pages);
+#endif
+	if (!got) {
+		struct folio *f =
+			folio_alloc_mpol(gfp, 0, mpol, ilx, numa_node_id());
+		if (f) {
+			pages[0] = &f->page;
+			got = 1;
+		}
+	}
+	mpol_cond_put(mpol);
+	return got;
+}
+
+static void hermit_fill_batches(struct hermit_batch *batch,
+				struct folio **folios,
+				const swp_entry_t *entries,
+				const unsigned long *addrs, unsigned int count)
+{
+	unsigned int i;
+
+	memset(batch, 0,
+	       DIV_ROUND_UP(count, HERMIT_BATCH_MAX) * sizeof(*batch));
+	for (i = 0; i < count; i++) {
+		struct hermit_batch *cur = &batch[i / HERMIT_BATCH_MAX];
+
+		cur->folios[cur->nr] = folios[i];
+		cur->entries[cur->nr] = entries[i];
+		cur->addresses[cur->nr++] = addrs[i];
+	}
+}
+
+struct folio *hermit_swapin_pages(swp_entry_t entry, gfp_t gfp,
+				  struct vm_fault *vmf,
+				  struct swap_info_struct *si,
+				  unsigned int predicted,
+				  struct hermit_direct_batch **direct_out)
 {
 	struct hermit_swapin_work *w;
 	struct hermit_batch *batch, one;
 	struct folio *demand = NULL;
-	struct mempolicy *mpol;
 	pte_t *snapshots, *now, demand_pte[2];
 	bool stale[HERMIT_BATCH_MAX];
 	int ret[HERMIT_SWAPIN_BATCHES];
 	unsigned long start = vmf->address & PAGE_MASK, end;
-	unsigned int i, b, nr = hermit_policy_predict(vmf), count = 0, nr_batches;
-	pgoff_t ilx;
-	bool allocated;
+	gfp_t gfp_pref = (gfp & ~__GFP_DIRECT_RECLAIM) | __GFP_NORETRY |
+			 __GFP_NOWARN;
+	unsigned int i, b, nr = predicted, want = 0, got = 0, count = 0;
+	unsigned int charged, nr_batches;
+	bool direct_eligible;
 	u64 time;
 
-	/* Batches and PTE snapshots are ~5 KiB: keep them off the fault stack.
-	 * Without memory, still read the demand page through one batch.
+	*direct_out = NULL;
+
+	/* Batches and PTE snapshots are kept off the fault stack.
+	 * Without memory, fall back to a single-page swapcache batch.
 	 */
 	w = kmalloc(sizeof(*w), GFP_NOIO | __GFP_NOWARN);
-	if (w) {
-		batch = w->batches;
-		snapshots = w->snapshots;
-		now = w->now;
-	} else {
+	if (!w) {
+		struct mempolicy *mpol;
+		pgoff_t ilx;
+		bool allocated;
+
 		batch = &one;
 		snapshots = &demand_pte[0];
 		now = &demand_pte[1];
-		nr = 1;
+		nr = hermit_swap_ptes(vmf, start, 1, snapshots);
+		if (!nr || pte_to_swp_entry(snapshots[0]).val != entry.val)
+			return NULL;
+		memset(batch, 0, sizeof(*batch));
+		mpol = get_vma_policy(vmf->vma, start, 0, &ilx);
+		demand = __read_swap_cache_async(entry, gfp, mpol, ilx,
+						 &allocated, false);
+		mpol_cond_put(mpol);
+		if (!demand || !allocated)
+			return demand;
+		batch->folios[0] = demand;
+		batch->entries[0] = entry;
+		batch->addresses[0] = start;
+		batch->nr = 1;
+		batch->cpu = raw_smp_processor_id();
+		vmf->hermit_batch_pages = 1;
+		time = ktime_get_ns();
+		ret[0] = hermit_backend_submit_batch(batch);
+		if (!ret[0])
+			ret[0] = hermit_backend_poll_batch(batch, true);
+		stale[0] = false;
+		hermit_swapin_finish(batch, ret[0], stale, true);
+		hermit_latency_add(HMT_LAT_BACKEND_READ, ktime_get_ns() - time);
+		return demand;
 	}
+
+	batch = w->batches;
+	snapshots = w->snapshots;
+	now = w->now;
+
 	/* Clip to the VMA and the PMD before touching any PTE. */
 	end = min3(vmf->vma->vm_end, (start | (PMD_SIZE - 1)) + 1,
-		   start + (unsigned long)clamp_t(unsigned int, nr, 1, HERMIT_SWAPIN_MAX) * PAGE_SIZE);
-	nr = hermit_swap_ptes(vmf, start, (end - start) >> PAGE_SHIFT, snapshots);
+		   start + (unsigned long)clamp_t(unsigned int, nr, 1,
+						  HERMIT_SWAPIN_MAX) *
+				   PAGE_SIZE);
+	nr = hermit_swap_ptes(vmf, start, (end - start) >> PAGE_SHIFT,
+			      snapshots);
 	/* Demand PTE changed under us: let do_swap_page() retry the fault. */
 	if (!nr || pte_to_swp_entry(snapshots[0]).val != entry.val)
-		goto out;
-	memset(batch, 0, DIV_ROUND_UP(nr, HERMIT_BATCH_MAX) * sizeof(*batch));
+		goto out_free;
 
-	for (i = 0; i < nr; i++) {
-		unsigned long addr = start + i * PAGE_SIZE;
-		struct hermit_batch *cur = &batch[count / HERMIT_BATCH_MAX];
-		struct folio *f;
+	for (want = 0; want < nr; want++) {
+		swp_entry_t next = pte_to_swp_entry(snapshots[want]);
+
+		if (swp_type(next) != swp_type(entry) ||
+		    !hermit_backend_entry_remote(next))
+			break;
+	}
+	if (!want)
+		goto out_free;
+
+	/* Bulk-allocate order-0 pages once for the whole prefix. */
+	got = hermit_alloc_pages_bulk(vmf->vma, start, gfp, want, w->raw_pages);
+	if (!got)
+		goto out_free;
+	want = min(want, got);
+
+	/*
+	 * Direct-bypass SG path: when bypass_swapcache=Y and PTEBATCH is ready
+	 * to map the prefetched pages immediately under the demand fault's PTE
+	 * lock, keep exclusive folios out of swapcache altogether, charge memcg
+	 * once per batch, and overlap LRU/shadow metadata with in-flight RDMA.
+	 */
+	direct_eligible = want >= 2 && hmt_ctl_flag(HMT_BPS_SCACHE) &&
+			  !unlikely(userfaultfd_armed(vmf->vma)) &&
+			  vmf->vma->anon_vma &&
+			  hermit_policy_pte_install_ready(vmf, want);
+
+	if (direct_eligible) {
+		struct hermit_direct_batch *db = &w->direct;
+		unsigned int ok_pages = 0;
+
+		for (i = 0; i < want; i++) {
+			swp_entry_t next = pte_to_swp_entry(snapshots[i]);
+			struct folio *f;
+
+			if (__swap_count(next) != 1)
+				break;
+			if (swapcache_prepare(next, 1))
+				break;
+			f = page_folio(w->raw_pages[i]);
+			__folio_set_locked(f);
+			__folio_set_swapbacked(f);
+			f->swap = next;
+			db->folios[count] = f;
+			db->entries[count] = next;
+			db->snapshots[count] = snapshots[i];
+			db->ok[count] = false;
+			w->prep_addrs[count] =
+				start + (unsigned long)i * PAGE_SIZE;
+			count++;
+		}
+
+		if (count >= 2) {
+			charged = mem_cgroup_swapin_charge_batch(
+				db->folios, db->entries, count, vmf->vma->vm_mm,
+				gfp_pref);
+			if (!charged && !mem_cgroup_swapin_charge_folio(
+						db->folios[0], vmf->vma->vm_mm,
+						gfp, db->entries[0]))
+				charged = 1;
+			for (i = charged; i < count; i++) {
+				db->folios[i]->private = NULL;
+				swapcache_clear(si, db->entries[i], 1);
+				folio_unlock(db->folios[i]);
+			}
+			hermit_release_unused_pages(w->raw_pages, charged, got);
+			count = charged;
+			if (!count)
+				goto out_free;
+
+			vmf->hermit_batch_pages = count;
+			nr_batches = DIV_ROUND_UP(count, HERMIT_BATCH_MAX);
+			hermit_fill_batches(batch, db->folios, db->entries,
+					    w->prep_addrs, count);
+
+			if (hermit_swapin_cost_enabled() && count > 1) {
+				for (i = 1; i < count; i++)
+					hermit_policy_prefetched(
+						vmf->vma->vm_mm,
+						db->entries[i].val);
+				hermit_swapin_cost_prefetched(count - 1);
+			}
+
+			time = ktime_get_ns();
+			for (b = 0; b < nr_batches; b++) {
+				batch[b].cpu = raw_smp_processor_id();
+				ret[b] = hermit_backend_submit_batch(&batch[b]);
+			}
+
+			/* Overlap shadow/refault/LRU setup with in-flight RDMA. */
+			for (i = 0; i < count; i++) {
+				void *shadow;
+
+				memcg1_swapin(db->entries[i], 1);
+				shadow = swap_cache_get_shadow(db->entries[i]);
+				if (shadow)
+					workingset_refault(db->folios[i],
+							   shadow);
+				folio_add_lru(db->folios[i]);
+			}
+
+			for (b = 0; b < nr_batches; b++)
+				if (!ret[b])
+					ret[b] = hermit_backend_poll_batch(
+						&batch[b], true);
+
+			for (b = 0; b < nr_batches; b++) {
+				for (i = 0; i < batch[b].nr; i++) {
+					unsigned int k =
+						b * HERMIT_BATCH_MAX + i;
+					struct folio *f = db->folios[k];
+					int err = ret[b] ?: batch[b].status[i];
+
+					if (!err) {
+						f->private = NULL;
+						folio_mark_uptodate(f);
+						db->ok[k] = true;
+						ok_pages++;
+						count_memcg_folio_events(
+							f, PSWPIN, 1);
+						hermit_backend_account(
+							0, false, false, 0);
+					} else if (k == 0) {
+						/* Demand fallback: swap_read_folio unlocks f. */
+						swap_read_folio(f, NULL);
+						f->private = NULL;
+						db->ok[0] = false;
+					} else {
+						f->private = NULL;
+						db->ok[k] = false;
+					}
+				}
+			}
+			if (ok_pages) {
+				count_vm_events(PSWPIN, ok_pages);
+				hermit_stat_add(HMT_STAT_BACKEND_LOAD,
+						ok_pages);
+			}
+			hermit_latency_add(HMT_LAT_BACKEND_READ,
+					   ktime_get_ns() - time);
+
+			/* Demand page unlocks so do_swap_page's folio_lock_or_retry()
+			 * acquires it cleanly; tail folios stay locked until mapped
+			 * or released after PTL unlock.
+			 */
+			if (db->ok[0])
+				folio_unlock(db->folios[0]);
+			db->nr = count;
+			db->installed = 0;
+			*direct_out = db;
+			return db->folios[0];
+		}
+
+		/* Fewer than 2 exclusive uncached slots: undo and reuse raw_pages
+		 * on the swapcache SG path below.
+		 */
+		for (i = 0; i < count; i++) {
+			db->folios[i]->private = NULL;
+			swapcache_clear(si, db->entries[i], 1);
+			folio_unlock(db->folios[i]);
+		}
+		count = 0;
+	}
+
+	/*
+	 * Optimized swapcache SG path: uses the bulk-allocated pages and a
+	 * single batch memcg charge instead of per-page __read_swap_cache_async().
+	 */
+	for (i = 0; i < want; i++) {
 		swp_entry_t next = pte_to_swp_entry(snapshots[i]);
-		gfp_t flags = i ? (gfp & ~__GFP_DIRECT_RECLAIM) | __GFP_NORETRY | __GFP_NOWARN : gfp;
+		int err = swapcache_prepare(next, 1);
 
-		if (swp_type(next) != swp_type(entry) || !hermit_backend_entry_remote(next))
-			break;
-		mpol = get_vma_policy(vmf->vma, addr, 0, &ilx);
-		f = __read_swap_cache_async(next, flags, mpol, ilx, &allocated, i != 0);
-		mpol_cond_put(mpol);
-		if (!f)
-			break;
-		if (!i)
-			demand = f;
-		if (!allocated) {
-			if (i)
-				folio_put(f);
+		if (err) {
+			if (i == 0) {
+				struct mempolicy *mpol;
+				pgoff_t ilx;
+				bool allocated;
+
+				hermit_release_unused_pages(w->raw_pages, 0,
+							    got);
+				mpol = get_vma_policy(vmf->vma, start, 0, &ilx);
+				demand = __read_swap_cache_async(entry, gfp,
+								 mpol, ilx,
+								 &allocated,
+								 false);
+				mpol_cond_put(mpol);
+				if (!demand || !allocated)
+					goto out_free;
+				w->prep_folios[0] = demand;
+				w->prep_entries[0] = entry;
+				w->prep_addrs[0] = start;
+				count = 1;
+				got = 0;
+				goto submit_swapcache;
+			}
 			break;
 		}
-		cur->folios[cur->nr] = f;
-		cur->entries[cur->nr] = next;
-		cur->addresses[cur->nr++] = addr;
+		w->prep_folios[count] = page_folio(w->raw_pages[i]);
+		__folio_set_locked(w->prep_folios[count]);
+		__folio_set_swapbacked(w->prep_folios[count]);
+		w->prep_entries[count] = next;
+		w->prep_addrs[count] = start + (unsigned long)i * PAGE_SIZE;
 		count++;
 	}
+
+	if (!count) {
+		hermit_release_unused_pages(w->raw_pages, 0, got);
+		goto out_free;
+	}
+
+	charged = mem_cgroup_swapin_charge_batch(w->prep_folios,
+						 w->prep_entries, count,
+						 vmf->vma->vm_mm, gfp_pref);
+	if (!charged &&
+	    !mem_cgroup_swapin_charge_folio(w->prep_folios[0], vmf->vma->vm_mm,
+					    gfp, w->prep_entries[0]))
+		charged = 1;
+	for (i = charged; i < count; i++) {
+		swapcache_clear(si, w->prep_entries[i], 1);
+		folio_unlock(w->prep_folios[i]);
+	}
+	hermit_release_unused_pages(w->raw_pages, charged, got);
+	count = charged;
 	if (!count)
-		goto out;
+		goto out_free;
+
+	for (i = 0; i < count; i++) {
+		void *shadow = NULL;
+
+		swap_cache_add_folio(w->prep_folios[i], w->prep_entries[i],
+				     &shadow);
+		memcg1_swapin(w->prep_entries[i], 1);
+		if (shadow)
+			workingset_refault(w->prep_folios[i], shadow);
+		folio_add_lru(w->prep_folios[i]);
+	}
+	demand = w->prep_folios[0];
+
+submit_swapcache:
 	/* The pages actually read, not the prediction: allocation failure,
 	 * swapcache hits and PTE holes shorten a batch. Run-length feedback in
 	 * hermit_policy_installed() measures use against this.
 	 */
 	vmf->hermit_batch_pages = count;
 	nr_batches = DIV_ROUND_UP(count, HERMIT_BATCH_MAX);
+	hermit_fill_batches(batch, w->prep_folios, w->prep_entries,
+			    w->prep_addrs, count);
 	/* Cost instrumentation (debugfs swapin_cost_enable): remember the pages
 	 * this fault reads for other addresses, so a later demand fault that
 	 * finds one in swapcache is reported as a prefetch hit. Only the demand
@@ -965,8 +1298,9 @@ struct folio *hermit_swapin_pages(swp_entry_t entry, gfp_t gfp, struct vm_fault 
 	if (hermit_swapin_cost_enabled() && count > 1) {
 		for (b = 0; b < nr_batches; b++)
 			for (i = b ? 0 : 1; i < batch[b].nr; i++)
-				hermit_policy_prefetched(vmf->vma->vm_mm,
-						batch[b].entries[i].val);
+				hermit_policy_prefetched(
+					vmf->vma->vm_mm,
+					batch[b].entries[i].val);
 		hermit_swapin_cost_prefetched(count - 1);
 	}
 	time = ktime_get_ns();
@@ -991,7 +1325,7 @@ struct folio *hermit_swapin_pages(swp_entry_t entry, gfp_t gfp, struct vm_fault 
 		hermit_swapin_finish(&batch[b], ret[b], stale, !b);
 	}
 	hermit_latency_add(HMT_LAT_BACKEND_READ, ktime_get_ns() - time);
-out:
+out_free:
 	kfree(w);
 	return demand;
 }
@@ -1010,7 +1344,7 @@ out:
  * or vma-based(ie, virtual address based on faulty address) readahead.
  */
 struct folio *swapin_readahead(swp_entry_t entry, gfp_t gfp_mask,
-				struct vm_fault *vmf)
+			       struct vm_fault *vmf)
 {
 	struct mempolicy *mpol;
 	pgoff_t ilx;
@@ -1018,8 +1352,8 @@ struct folio *swapin_readahead(swp_entry_t entry, gfp_t gfp_mask,
 
 	mpol = get_vma_policy(vmf->vma, vmf->address, 0, &ilx);
 	folio = swap_use_vma_readahead() ?
-		swap_vma_readahead(entry, gfp_mask, mpol, ilx, vmf) :
-		swap_cluster_readahead(entry, gfp_mask, mpol, ilx);
+			swap_vma_readahead(entry, gfp_mask, mpol, ilx, vmf) :
+			swap_cluster_readahead(entry, gfp_mask, mpol, ilx);
 	mpol_cond_put(mpol);
 
 	return folio;
@@ -1027,13 +1361,13 @@ struct folio *swapin_readahead(swp_entry_t entry, gfp_t gfp_mask,
 
 #ifdef CONFIG_SYSFS
 static ssize_t vma_ra_enabled_show(struct kobject *kobj,
-				     struct kobj_attribute *attr, char *buf)
+				   struct kobj_attribute *attr, char *buf)
 {
 	return sysfs_emit(buf, "%s\n", str_true_false(enable_vma_readahead));
 }
 static ssize_t vma_ra_enabled_store(struct kobject *kobj,
-				      struct kobj_attribute *attr,
-				      const char *buf, size_t count)
+				    struct kobj_attribute *attr,
+				    const char *buf, size_t count)
 {
 	ssize_t ret;
 

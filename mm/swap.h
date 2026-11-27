@@ -9,11 +9,11 @@ struct swap_iocb;
 extern int page_cluster;
 
 #ifdef CONFIG_THP_SWAP
-#define SWAPFILE_CLUSTER	HPAGE_PMD_NR
-#define swap_entry_order(order)	(order)
+#define SWAPFILE_CLUSTER HPAGE_PMD_NR
+#define swap_entry_order(order) (order)
 #else
-#define SWAPFILE_CLUSTER	256
-#define swap_entry_order(order)	0
+#define SWAPFILE_CLUSTER 256
+#define swap_entry_order(order) 0
 #endif
 
 extern struct swap_info_struct *swap_info[];
@@ -28,7 +28,7 @@ extern struct swap_info_struct *swap_info[];
  * protected by cluster lock.
  */
 struct swap_cluster_info {
-	spinlock_t lock;	/*
+	spinlock_t lock; /*
 				 * Protect swap_cluster_info fields
 				 * other than list, and swap_info_struct->swap_map
 				 * elements corresponding to the swap cluster.
@@ -36,7 +36,7 @@ struct swap_cluster_info {
 	u16 count;
 	u8 flags;
 	u8 order;
-	atomic_long_t __rcu *table;	/* Swap table entries, see mm/swap_table.h */
+	atomic_long_t __rcu *table; /* Swap table entries, see mm/swap_table.h */
 	struct list_head list;
 };
 
@@ -80,22 +80,23 @@ static inline struct swap_info_struct *__swap_entry_to_info(swp_entry_t entry)
 	return __swap_type_to_info(swp_type(entry));
 }
 
-static inline struct swap_cluster_info *__swap_offset_to_cluster(
-		struct swap_info_struct *si, pgoff_t offset)
+static inline struct swap_cluster_info *
+__swap_offset_to_cluster(struct swap_info_struct *si, pgoff_t offset)
 {
 	VM_WARN_ON_ONCE(percpu_ref_is_zero(&si->users)); /* race with swapoff */
 	VM_WARN_ON_ONCE(offset >= si->max);
 	return &si->cluster_info[offset / SWAPFILE_CLUSTER];
 }
 
-static inline struct swap_cluster_info *__swap_entry_to_cluster(swp_entry_t entry)
+static inline struct swap_cluster_info *
+__swap_entry_to_cluster(swp_entry_t entry)
 {
 	return __swap_offset_to_cluster(__swap_entry_to_info(entry),
 					swp_offset(entry));
 }
 
-static __always_inline struct swap_cluster_info *__swap_cluster_lock(
-		struct swap_info_struct *si, unsigned long offset, bool irq)
+static __always_inline struct swap_cluster_info *
+__swap_cluster_lock(struct swap_info_struct *si, unsigned long offset, bool irq)
 {
 	struct swap_cluster_info *ci = __swap_offset_to_cluster(si, offset);
 
@@ -125,14 +126,14 @@ static __always_inline struct swap_cluster_info *__swap_cluster_lock(
  * Context: The caller must ensure the offset is in the valid range and
  * protect the swap device with reference count or locks.
  */
-static inline struct swap_cluster_info *swap_cluster_lock(
-		struct swap_info_struct *si, unsigned long offset)
+static inline struct swap_cluster_info *
+swap_cluster_lock(struct swap_info_struct *si, unsigned long offset)
 {
 	return __swap_cluster_lock(si, offset, false);
 }
 
-static inline struct swap_cluster_info *__swap_cluster_get_and_lock(
-		const struct folio *folio, bool irq)
+static inline struct swap_cluster_info *
+__swap_cluster_get_and_lock(const struct folio *folio, bool irq)
 {
 	VM_WARN_ON_ONCE_FOLIO(!folio_test_locked(folio), folio);
 	VM_WARN_ON_ONCE_FOLIO(!folio_test_swapcache(folio), folio);
@@ -152,8 +153,8 @@ static inline struct swap_cluster_info *__swap_cluster_get_and_lock(
  * Context: Caller must ensure the folio is locked and in the swap cache.
  * Return: Pointer to the swap cluster.
  */
-static inline struct swap_cluster_info *swap_cluster_get_and_lock(
-		const struct folio *folio)
+static inline struct swap_cluster_info *
+swap_cluster_get_and_lock(const struct folio *folio)
 {
 	return __swap_cluster_get_and_lock(folio, false);
 }
@@ -167,8 +168,8 @@ static inline struct swap_cluster_info *swap_cluster_get_and_lock(
  * Context: Caller must ensure the folio is locked and in the swap cache.
  * Return: Pointer to the swap cluster.
  */
-static inline struct swap_cluster_info *swap_cluster_get_and_lock_irq(
-		const struct folio *folio)
+static inline struct swap_cluster_info *
+swap_cluster_get_and_lock_irq(const struct folio *folio)
 {
 	return __swap_cluster_get_and_lock(folio, true);
 }
@@ -194,9 +195,22 @@ static inline void swap_read_unplug(struct swap_iocb *plug)
 		__swap_read_unplug(plug);
 }
 #ifdef CONFIG_HERMIT
-struct hermit_batch;
+#include <linux/hermit_backend.h>
+struct hermit_direct_batch {
+	struct folio *folios[HERMIT_SWAPIN_MAX];
+	swp_entry_t entries[HERMIT_SWAPIN_MAX];
+	pte_t snapshots[HERMIT_SWAPIN_MAX];
+	bool ok[HERMIT_SWAPIN_MAX];
+	unsigned int nr;
+	unsigned int installed;
+};
 void hermit_swap_write_batch(struct hermit_batch *batch);
-struct folio *hermit_swapin_pages(swp_entry_t entry, gfp_t gfp, struct vm_fault *vmf);
+struct folio *hermit_swapin_pages(swp_entry_t entry, gfp_t gfp,
+				  struct vm_fault *vmf,
+				  struct swap_info_struct *si,
+				  unsigned int predicted,
+				  struct hermit_direct_batch **direct_out);
+void hermit_direct_batch_free(struct hermit_direct_batch *db);
 int hermit_swapout_order(struct folio *folio);
 struct hermit_io;
 int hermit_swap_read_folio_async(struct folio *folio, struct hermit_io *io,
@@ -205,11 +219,14 @@ int hermit_swap_read_folio_poll(struct folio *folio, struct hermit_io *io,
 				u64 start_ns);
 int hermit_swap_read_folio_sync(struct folio *folio);
 #else
-static inline int hermit_swapout_order(struct folio *folio) { return -1; }
+static inline int hermit_swapout_order(struct folio *folio)
+{
+	return -1;
+}
 #endif
 void swap_write_unplug(struct swap_iocb *sio);
 int swap_writeout_order(struct folio *folio, struct swap_iocb **swap_plug,
-		       int transfer_order);
+			int transfer_order);
 int swap_writeout(struct folio *folio, struct swap_iocb **swap_plug);
 void __swap_writepage(struct folio *folio, struct swap_iocb **swap_plug);
 
@@ -263,27 +280,30 @@ static inline bool folio_matches_swap_entry(const struct folio *folio,
  */
 struct folio *swap_cache_get_folio(swp_entry_t entry);
 void *swap_cache_get_shadow(swp_entry_t entry);
-void swap_cache_add_folio(struct folio *folio, swp_entry_t entry, void **shadow);
+void swap_cache_add_folio(struct folio *folio, swp_entry_t entry,
+			  void **shadow);
 void swap_cache_del_folio(struct folio *folio);
 /* Below helpers require the caller to lock and pass in the swap cluster. */
-void __swap_cache_del_folio(struct swap_cluster_info *ci,
-			    struct folio *folio, swp_entry_t entry, void *shadow);
-void __swap_cache_replace_folio(struct swap_cluster_info *ci,
-				struct folio *old, struct folio *new);
+void __swap_cache_del_folio(struct swap_cluster_info *ci, struct folio *folio,
+			    swp_entry_t entry, void *shadow);
+void __swap_cache_replace_folio(struct swap_cluster_info *ci, struct folio *old,
+				struct folio *new);
 void __swap_cache_clear_shadow(swp_entry_t entry, int nr_ents);
 
 void show_swap_cache_info(void);
 void swapcache_clear(struct swap_info_struct *si, swp_entry_t entry, int nr);
 struct folio *read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
-		struct vm_area_struct *vma, unsigned long addr,
-		struct swap_iocb **plug);
+				    struct vm_area_struct *vma,
+				    unsigned long addr,
+				    struct swap_iocb **plug);
 struct folio *__read_swap_cache_async(swp_entry_t entry, gfp_t gfp_flags,
-		struct mempolicy *mpol, pgoff_t ilx, bool *new_page_allocated,
-		bool skip_if_exists);
+				      struct mempolicy *mpol, pgoff_t ilx,
+				      bool *new_page_allocated,
+				      bool skip_if_exists);
 struct folio *swap_cluster_readahead(swp_entry_t entry, gfp_t flag,
-		struct mempolicy *mpol, pgoff_t ilx);
+				     struct mempolicy *mpol, pgoff_t ilx);
 struct folio *swapin_readahead(swp_entry_t entry, gfp_t flag,
-		struct vm_fault *vmf);
+			       struct vm_fault *vmf);
 void swap_update_readahead(struct folio *folio, struct vm_area_struct *vma,
 			   unsigned long addr);
 
@@ -298,7 +318,7 @@ static inline unsigned int folio_swap_flags(struct folio *folio)
  * it will return the zeromap status of the starting entry.
  */
 static inline int swap_zeromap_batch(swp_entry_t entry, int max_nr,
-		bool *is_zeromap)
+				     bool *is_zeromap)
 {
 	struct swap_info_struct *sis = __swap_entry_to_info(entry);
 	unsigned long start = swp_offset(entry);
@@ -338,20 +358,20 @@ static inline int non_swapcache_batch(swp_entry_t entry, int max_nr)
 
 #else /* CONFIG_SWAP */
 struct swap_iocb;
-static inline struct swap_cluster_info *swap_cluster_lock(
-	struct swap_info_struct *si, pgoff_t offset, bool irq)
+static inline struct swap_cluster_info *
+swap_cluster_lock(struct swap_info_struct *si, pgoff_t offset, bool irq)
 {
 	return NULL;
 }
 
-static inline struct swap_cluster_info *swap_cluster_get_and_lock(
-		struct folio *folio)
+static inline struct swap_cluster_info *
+swap_cluster_get_and_lock(struct folio *folio)
 {
 	return NULL;
 }
 
-static inline struct swap_cluster_info *swap_cluster_get_and_lock_irq(
-		struct folio *folio)
+static inline struct swap_cluster_info *
+swap_cluster_get_and_lock_irq(struct folio *folio)
 {
 	return NULL;
 }
@@ -381,7 +401,8 @@ static inline struct address_space *swap_address_space(swp_entry_t entry)
 	return NULL;
 }
 
-static inline bool folio_matches_swap_entry(const struct folio *folio, swp_entry_t entry)
+static inline bool folio_matches_swap_entry(const struct folio *folio,
+					    swp_entry_t entry)
 {
 	return false;
 }
@@ -391,37 +412,45 @@ static inline void show_swap_cache_info(void)
 }
 
 static inline struct folio *swap_cluster_readahead(swp_entry_t entry,
-			gfp_t gfp_mask, struct mempolicy *mpol, pgoff_t ilx)
+						   gfp_t gfp_mask,
+						   struct mempolicy *mpol,
+						   pgoff_t ilx)
 {
 	return NULL;
 }
 
 static inline struct folio *swapin_readahead(swp_entry_t swp, gfp_t gfp_mask,
-			struct vm_fault *vmf)
+					     struct vm_fault *vmf)
 {
 	return NULL;
 }
 
 static inline void swap_update_readahead(struct folio *folio,
-		struct vm_area_struct *vma, unsigned long addr)
+					 struct vm_area_struct *vma,
+					 unsigned long addr)
 {
 }
 
-static inline int hermit_swapout_order(struct folio *folio) { return -1; }
+static inline int hermit_swapout_order(struct folio *folio)
+{
+	return -1;
+}
 
 static inline int swap_writeout_order(struct folio *folio,
-		struct swap_iocb **swap_plug, int transfer_order)
+				      struct swap_iocb **swap_plug,
+				      int transfer_order)
 {
 	return 0;
 }
 
 static inline int swap_writeout(struct folio *folio,
-		struct swap_iocb **swap_plug)
+				struct swap_iocb **swap_plug)
 {
 	return 0;
 }
 
-static inline void swapcache_clear(struct swap_info_struct *si, swp_entry_t entry, int nr)
+static inline void swapcache_clear(struct swap_info_struct *si,
+				   swp_entry_t entry, int nr)
 {
 }
 
@@ -435,7 +464,8 @@ static inline void *swap_cache_get_shadow(swp_entry_t entry)
 	return NULL;
 }
 
-static inline void swap_cache_add_folio(struct folio *folio, swp_entry_t entry, void **shadow)
+static inline void swap_cache_add_folio(struct folio *folio, swp_entry_t entry,
+					void **shadow)
 {
 }
 
@@ -444,12 +474,14 @@ static inline void swap_cache_del_folio(struct folio *folio)
 }
 
 static inline void __swap_cache_del_folio(struct swap_cluster_info *ci,
-		struct folio *folio, swp_entry_t entry, void *shadow)
+					  struct folio *folio,
+					  swp_entry_t entry, void *shadow)
 {
 }
 
 static inline void __swap_cache_replace_folio(struct swap_cluster_info *ci,
-		struct folio *old, struct folio *new)
+					      struct folio *old,
+					      struct folio *new)
 {
 }
 
@@ -459,7 +491,7 @@ static inline unsigned int folio_swap_flags(struct folio *folio)
 }
 
 static inline int swap_zeromap_batch(swp_entry_t entry, int max_nr,
-		bool *has_zeromap)
+				     bool *has_zeromap)
 {
 	return 0;
 }

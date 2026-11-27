@@ -2056,10 +2056,6 @@ void unmap_page_range(struct mmu_gather *tlb, struct vm_area_struct *vma,
 	unsigned long next;
 
 	BUG_ON(addr >= end);
-#ifdef CONFIG_HERMIT
-	/* munmap, MADV_DONTNEED and friends: drop only this range's history. */
-	hermit_policy_unmap(vma, addr, end);
-#endif
 	tlb_start_vma(tlb, vma);
 	pgd = pgd_offset(vma->vm_mm, addr);
 	do {
@@ -4540,12 +4536,15 @@ static enum swapin_extent swapin_thp_check(struct vm_fault *vmf, pte_t *ptep,
 		if (any_remote) {
 			unsigned long first, offset;
 
-			if (!hermit_backend_range_remote(entry, ilog2(nr_pages)) ||
+			if (!hermit_backend_range_remote(entry,
+							 ilog2(nr_pages)) ||
 			    hermit_backend_offset(entry, &first))
 				return SWAPIN_EXTENT_REMOTE;
 			for (i = 1; i < nr_pages; i++)
-				if (hermit_backend_offset(swp_entry(swp_type(entry),
-						 swp_offset(entry) + i), &offset) ||
+				if (hermit_backend_offset(
+					    swp_entry(swp_type(entry),
+						      swp_offset(entry) + i),
+					    &offset) ||
 				    offset != first + i)
 					return SWAPIN_EXTENT_REMOTE;
 		}
@@ -4634,8 +4633,9 @@ static struct folio *alloc_swap_folio(struct vm_fault *vmf)
 	if (!orders) {
 #ifdef CONFIG_HERMIT
 		if (vmf->hermit_folio_order)
-			hermit_policy_medium_extent(vma_orders ? SWAPIN_EXTENT_ALIGN :
-						    SWAPIN_EXTENT_NO_ORDER);
+			hermit_policy_medium_extent(
+				vma_orders ? SWAPIN_EXTENT_ALIGN :
+					     SWAPIN_EXTENT_NO_ORDER);
 #endif
 		goto fallback;
 	}
@@ -4742,7 +4742,8 @@ static bool hermit_shadow_refault(swp_entry_t entry)
 	void *shadow = swap_cache_get_shadow(entry);
 	bool workingset = false;
 
-	return shadow && workingset_test_recent(shadow, false, &workingset, false) &&
+	return shadow &&
+	       workingset_test_recent(shadow, false, &workingset, false) &&
 	       workingset;
 }
 
@@ -4775,7 +4776,7 @@ static unsigned long hermit_swapin_orders(struct vm_fault *vmf)
  * guarantees the neighbouring pages belong to this segment.
  */
 static int hermit_swapin_order_valid(struct vm_fault *vmf, unsigned long orders,
-		int top, enum swapin_extent *reason)
+				     int top, enum swapin_extent *reason)
 {
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 	struct mm_struct *mm = vmf->vma->vm_mm;
@@ -4793,7 +4794,8 @@ static int hermit_swapin_order_valid(struct vm_fault *vmf, unsigned long orders,
 	orders &= ~(BIT(hermit_policy_medium_min_order()) - 1);
 	if (!orders)
 		return -1;
-	orders = thp_swap_suitable_orders(swp_offset(entry), vmf->address, orders);
+	orders = thp_swap_suitable_orders(swp_offset(entry), vmf->address,
+					  orders);
 	if (!orders) {
 		*reason = SWAPIN_EXTENT_ALIGN;
 		return -1;
@@ -4807,7 +4809,8 @@ static int hermit_swapin_order_valid(struct vm_fault *vmf, unsigned long orders,
 	}
 	while (orders) {
 		addr = ALIGN_DOWN(vmf->address, PAGE_SIZE << order);
-		result = swapin_thp_check(vmf, pte + pte_index(addr), 1 << order);
+		result = swapin_thp_check(vmf, pte + pte_index(addr),
+					  1 << order);
 		if (result == SWAPIN_EXTENT_OK)
 			break;
 		if (order == first)
@@ -4879,17 +4882,16 @@ static int hermit_direct_swapin(struct folio *folio, struct hermit_io *io,
  * the PTE lock the demand page already holds: the batch is PMD-contained, so
  * one PTE page covers all of it and the lock is taken once for the whole run.
  *
- * @ptep is the demand PTE, @address its address and @swap_pte the swap PTE the
- * batch was planned with. Every prefetched page is revalidated against that
- * snapshot and against its folio; the first mismatch stops the run and the
- * remaining prefetched pages keep their swap entries, i.e. they fault in
- * exactly as before this function existed.
+ * @ptep is the demand PTE, @address its address and @si its pinned swap
+ * device. Check each current PTE on that device against its swapcache folio.
+ * Local swap offsets can be scattered. The first failed check stops the run,
+ * leaving the remaining PTEs for the normal fault path.
  *
  * Returns the number of extra PTEs installed.
  */
 static unsigned int hermit_batch_ptes(struct vm_fault *vmf,
-		struct swap_info_struct *si, pte_t *ptep,
-		unsigned long address, pte_t swap_pte)
+				      struct swap_info_struct *si, pte_t *ptep,
+				      unsigned long address)
 {
 	struct vm_area_struct *vma = vmf->vma;
 	struct mm_struct *mm = vma->vm_mm;
@@ -4916,10 +4918,12 @@ static unsigned int hermit_batch_ptes(struct vm_fault *vmf,
 		struct page *page;
 
 		old = ptep_get(ptep + i);
-		/* Swap PTE unchanged and still the page the run planned for. */
-		if (!pte_same(old, pte_move_swp_offset(swap_pte, i)))
+		if (!is_swap_pte(old))
 			break;
 		entry = pte_to_swp_entry(old);
+		if (non_swap_entry(entry) ||
+		    swp_type(entry) != (unsigned int)si->type)
+			break;
 		folio = swap_cache_get_folio(entry);
 		if (!folio)
 			break;
@@ -4949,8 +4953,9 @@ static unsigned int hermit_batch_ptes(struct vm_fault *vmf,
 		    folio_order(folio) || !folio_test_uptodate(folio) ||
 		    folio_test_ksm(folio) || PageHWPoison(page) ||
 		    (folio_test_anon(folio) ?
-		     page_address_in_vma(folio, page, vma) != addr :
-		     (!vma->anon_vma || folio_test_mappedtodisk(folio)))) {
+			     page_address_in_vma(folio, page, vma) != addr :
+			     (!vma->anon_vma ||
+			      folio_test_mappedtodisk(folio)))) {
 			folio_unlock(folio);
 			folio_put(folio);
 			break;
@@ -4966,7 +4971,8 @@ static unsigned int hermit_batch_ptes(struct vm_fault *vmf,
 		 */
 		exclusive = pte_swp_exclusive(old);
 		if (exclusive && folio_test_writeback(folio) &&
-		    data_race(si->flags & SWP_STABLE_WRITES)) /* set at swapon */
+		    data_race(si->flags &
+			      SWP_STABLE_WRITES)) /* set at swapon */
 			exclusive = false;
 		arch_swap_restore(folio_swap(entry, folio), folio);
 		swap_free(entry);
@@ -4992,7 +4998,8 @@ static unsigned int hermit_batch_ptes(struct vm_fault *vmf,
 		new = pte_mkyoung(new);
 		flush_icache_pages(vma, page, 1);
 		if (folio_test_anon(folio))
-			folio_add_anon_rmap_pte(folio, page, vma, addr, rmap_flags);
+			folio_add_anon_rmap_pte(folio, page, vma, addr,
+						rmap_flags);
 		else
 			folio_add_new_anon_rmap(folio, vma, addr, rmap_flags);
 		set_ptes(mm, addr, ptep + i, new, 1);
@@ -5009,6 +5016,100 @@ static unsigned int hermit_batch_ptes(struct vm_fault *vmf,
 	if (i > 1)
 		hermit_policy_pte_installed(i - 1);
 	return i - 1;
+}
+
+/*
+ * Direct-bypass variant of hermit_batch_ptes(): the folios in @db were never
+ * exposed to swapcache and arrive locked and exclusive. Under the demand
+ * fault's PTE lock, verify each PTE matches its pre-read snapshot and install
+ * it directly without swapcache lookup, trylock, or folio_free_swap().
+ */
+static unsigned int hermit_batch_ptes_direct(struct vm_fault *vmf, pte_t *ptep,
+					     unsigned long address,
+					     struct hermit_direct_batch *db)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned long end, addr;
+	unsigned int pages, i, mapped;
+	struct hermit_adc_interval loop;
+
+	end = pmd_addr_end(address, vma->vm_end);
+	pages = min_t(unsigned int, db->nr, (end - address) >> PAGE_SHIFT);
+	if (pages < 2 || unlikely(userfaultfd_armed(vma)) || !vma->anon_vma)
+		return 0;
+	if (!hermit_policy_pte_install(vmf, pages))
+		return 0;
+
+	loop = hermit_adc_begin(ADC_PTEBATCH_INSTALL);
+	for (i = 1; i < pages; i++) {
+		struct folio *folio = db->folios[i];
+		swp_entry_t entry = db->entries[i];
+		struct page *page = &folio->page;
+		pte_t old, new;
+
+		if (!db->ok[i])
+			break;
+		old = ptep_get(ptep + i);
+		if (!pte_same(old, db->snapshots[i]))
+			break;
+		if (unlikely(!folio_test_uptodate(folio) || PageHWPoison(page)))
+			break;
+
+		addr = address + (unsigned long)i * PAGE_SIZE;
+		arch_swap_restore(folio_swap(entry, folio), folio);
+		swap_free(entry);
+
+		new = mk_pte(page, vma->vm_page_prot);
+		if (pte_swp_soft_dirty(old))
+			new = pte_mksoft_dirty(new);
+		if (pte_swp_uffd_wp(old))
+			new = pte_mkuffd_wp(new);
+		if ((vma->vm_flags & VM_WRITE) &&
+		    !userfaultfd_pte_wp(vma, new) &&
+		    !pte_needs_soft_dirty_wp(vma, new))
+			new = pte_mkwrite(new, vma);
+		new = pte_mkyoung(new);
+
+		flush_icache_pages(vma, page, 1);
+		folio_add_new_anon_rmap(folio, vma, addr, RMAP_EXCLUSIVE);
+		set_ptes(mm, addr, ptep + i, new, 1);
+		arch_do_swap_page_nr(mm, vma, addr, new, new, 1);
+		update_mmu_cache_range(vmf, vma, addr, ptep + i, 1);
+		folio_unlock(folio);
+	}
+	mapped = i - 1;
+	if (mapped) {
+		add_mm_counter(mm, MM_ANONPAGES, mapped);
+		add_mm_counter(mm, MM_SWAPENTS, -mapped);
+		hermit_policy_pte_installed(mapped);
+	}
+	if (i < pages) {
+		loop.subtype = ADC_PTEBATCH_SKIP;
+		hermit_policy_pte_skipped(pages - i);
+	}
+	hermit_adc_finish(&loop);
+	db->installed = mapped;
+	return mapped;
+}
+
+static void hermit_direct_batch_finish(struct hermit_direct_batch *db,
+				       struct swap_info_struct *si)
+{
+	unsigned int i;
+
+	if (!db)
+		return;
+	for (i = 1; i < db->nr; i++) {
+		if (i > db->installed) {
+			folio_unlock(db->folios[i]);
+			folio_put(db->folios[i]);
+		}
+		swapcache_clear(si, db->entries[i], 1);
+	}
+	if (db->nr > 1 && waitqueue_active(&swapcache_wq))
+		wake_up(&swapcache_wq);
+	hermit_direct_batch_free(db);
 }
 #endif
 
@@ -5041,8 +5142,8 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	pte_t *ptep;
 #ifdef CONFIG_HERMIT
 	struct hermit_io hermit_io = {};
+	struct hermit_direct_batch *hermit_direct_batch = NULL;
 	swp_entry_t hermit_fault_entry;
-	pte_t hermit_fault_pte;
 	u64 hermit_read_start_ns = 0;
 	u64 hermit_fault_start_ns = ktime_get_mono_fast_ns();
 	bool hermit_read_pending = false;
@@ -5050,8 +5151,11 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	bool hermit_major_fault = false;
 	bool hermit_remote_fault = false;
 	bool hermit_prefetch_hit = false;
+	bool hermit_force_base = false;
 	u64 hermit_observe_start_ns = READ_ONCE(hermit_pebs_enabled) &&
-		vmf->hermit_fault_pc ? ktime_get_ns() : 0;
+						      vmf->hermit_fault_pc ?
+					      ktime_get_ns() :
+					      0;
 #endif
 
 	if (!pte_unmap_same(vmf))
@@ -5060,11 +5164,6 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	entry = pte_to_swp_entry(vmf->orig_pte);
 #ifdef CONFIG_HERMIT
 	hermit_fault_entry = entry;
-	/* The SG batch installs PTEs for its own prefetched pages, which needs the
-	 * swap PTE this fault was planned with; vmf->orig_pte becomes the new
-	 * present PTE below.
-	 */
-	hermit_fault_pte = vmf->orig_pte;
 #endif
 	if (unlikely(non_swap_entry(entry))) {
 		if (is_migration_entry(entry)) {
@@ -5135,7 +5234,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 #endif
 
 	folio = hermit_adc_call(ADC_LOOKUP_SWAPCACHE,
-		swap_cache_get_folio(entry));
+				swap_cache_get_folio(entry));
 	if (folio) {
 		swap_update_readahead(folio, vma, vmf->address);
 #ifdef CONFIG_HERMIT
@@ -5145,7 +5244,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 		 * refault of a working-set folio, the same rule as
 		 * hermit_shadow_refault() on the direct path.
 		 */
-		if (hermit_remote_fault && lru_gen_enabled())
+		if (hermit_remote_fault)
 			vmf->hermit_refault = folio_test_workingset(folio);
 		/* Cost instrumentation: the page was already read, either by this
 		 * fault's own batch or by an earlier policy readahead.
@@ -5162,7 +5261,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 			data_race(si->flags & SWP_SYNCHRONOUS_IO);
 #ifdef CONFIG_HERMIT
 		/* Before any swap-in path below replaces the shadow. */
-		if (hermit_remote_fault && lru_gen_enabled())
+		if (hermit_remote_fault)
 			vmf->hermit_refault = hermit_shadow_refault(entry);
 		/* Long sequential streams keep the legacy large-folio read, which
 		 * needs one WR per contiguous extent; everything else uses 4 KiB
@@ -5171,11 +5270,34 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 		 */
 		if (hermit_remote_fault && hermit_policy_active(vma->vm_mm) &&
 		    hermit_policy_feature(HERMIT_POLICY_SWAPIN) &&
-		    !hermit_adc_call(ADC_POLICY_PLAN, hermit_swapin_folio(vmf))) {
-			folio = hermit_adc_call(ADC_PREFETCH,
-				hermit_swapin_pages(entry, GFP_HIGHUSER_MOVABLE, vmf));
-			swapcache = folio;
-			goto swapin_allocated;
+		    !hermit_adc_call(ADC_POLICY_PLAN,
+				     hermit_swapin_folio(vmf))) {
+			unsigned int hermit_pred = hermit_policy_predict(vmf);
+
+			/*
+			 * Single-page predictions bypass the SG work setup and
+			 * swapcache altogether when direct swap-in is legal.
+			 */
+			if (hermit_pred > 1 ||
+			    !(hmt_ctl_flag(HMT_BPS_SCACHE) &&
+			      hermit_backend_ready() &&
+			      hermit_backend_entry_remote(entry) &&
+			      __swap_count(entry) == 1)) {
+				folio = hermit_adc_call(
+					ADC_PREFETCH,
+					hermit_swapin_pages(
+						entry, GFP_HIGHUSER_MOVABLE,
+						vmf, si, hermit_pred,
+						&hermit_direct_batch));
+				if (hermit_direct_batch) {
+					swapcache = NULL;
+					need_clear_cache = true;
+				} else {
+					swapcache = folio;
+				}
+				goto swapin_allocated;
+			}
+			hermit_force_base = true;
 		}
 #endif
 #ifdef CONFIG_HERMIT
@@ -5202,8 +5324,12 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 		     ) &&
 		    __swap_count(entry) == 1) {
 			/* skip swapcache */
-			folio = hermit_adc_call(ADC_ALLOC_PAGE,
-				alloc_swap_folio(vmf));
+			folio = hermit_adc_call(
+				ADC_ALLOC_PAGE,
+#ifdef CONFIG_HERMIT
+				hermit_force_base ? __alloc_swap_folio(vmf) :
+#endif
+						    alloc_swap_folio(vmf));
 			if (folio) {
 				__folio_set_locked(folio);
 				__folio_set_swapbacked(folio);
@@ -5221,7 +5347,8 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 				 * to entry reuse.
 				 */
 				if (hermit_adc_call(ADC_DEDUP_SWAPIN,
-					swapcache_prepare(entry, nr_pages))) {
+						    swapcache_prepare(
+							    entry, nr_pages))) {
 					/*
 					 * Relax a bit to prevent rapid
 					 * repeated page faults.
@@ -5325,8 +5452,7 @@ swapin_allocated:
 		hermit_read_pending = false;
 	}
 #endif
-	ret |= hermit_adc_call(ADC_LOCK_FOLIO,
-		folio_lock_or_retry(folio, vmf));
+	ret |= hermit_adc_call(ADC_LOCK_FOLIO, folio_lock_or_retry(folio, vmf));
 	if (ret & VM_FAULT_RETRY)
 		goto out_release;
 
@@ -5385,9 +5511,9 @@ swapin_allocated:
 	/*
 	 * Back out if somebody else already faulted in this pte.
 	 */
-	vmf->pte = hermit_adc_call(ADC_LOCK_GET_PTE,
-		pte_offset_map_lock(vma->vm_mm, vmf->pmd, vmf->address,
-				       &vmf->ptl));
+	vmf->pte = hermit_adc_call(
+		ADC_LOCK_GET_PTE, pte_offset_map_lock(vma->vm_mm, vmf->pmd,
+						      vmf->address, &vmf->ptl));
 	if (unlikely(!vmf->pte || !pte_same(ptep_get(vmf->pte), vmf->orig_pte)))
 		goto out_nomap;
 
@@ -5573,7 +5699,7 @@ check_folio:
 	VM_BUG_ON(!folio_test_anon(folio) ||
 		  (pte_write(pte) && !PageAnonExclusive(page)));
 	hermit_adc_call(ADC_SETPTE,
-		set_ptes(vma->vm_mm, address, ptep, pte, nr_pages));
+			set_ptes(vma->vm_mm, address, ptep, pte, nr_pages));
 #ifdef CONFIG_HERMIT
 	if (hermit_remote_fault) {
 		unsigned int hermit_nr = nr_pages;
@@ -5586,11 +5712,17 @@ check_folio:
 		 * pages only, so the stream advances like a large folio install.
 		 */
 		if (nr_pages == 1)
-			hermit_nr += hermit_adc_call(ADC_BATCH_SETPTE,
-				hermit_batch_ptes(vmf, si, ptep, address,
-						      hermit_fault_pte));
-		hermit_policy_installed(vmf, page_to_pfn(page), address, hermit_nr);
-		hermit_pebs_fault(vma->vm_mm, vmf->address, vmf->hermit_fault_pc,
+			hermit_nr += hermit_adc_call(
+				ADC_BATCH_SETPTE,
+				hermit_direct_batch ?
+					hermit_batch_ptes_direct(
+						vmf, ptep, address,
+						hermit_direct_batch) :
+					hermit_batch_ptes(vmf, si, ptep,
+							  address));
+		hermit_policy_installed(vmf, address, hermit_nr);
+		hermit_pebs_fault(vma->vm_mm, vmf->address,
+				  vmf->hermit_fault_pc,
 				  hermit_observe_start_ns);
 		hermit_pebs_account_swapin(vma->vm_mm, folio_order(folio));
 	}
@@ -5607,7 +5739,8 @@ check_folio:
 		hermit_swapin_cost_add(folio_order(folio),
 				       installed_ns - hermit_fault_start_ns);
 		if (hermit_prefetch_hit)
-			hermit_swapin_cost_hit(installed_ns - hermit_fault_start_ns);
+			hermit_swapin_cost_hit(installed_ns -
+					       hermit_fault_start_ns);
 	}
 #endif
 	arch_do_swap_page_nr(vma->vm_mm, vma, address, pte, pte, nr_pages);
@@ -5645,6 +5778,9 @@ out:
 		if (waitqueue_active(&swapcache_wq))
 			wake_up(&swapcache_wq);
 	}
+#ifdef CONFIG_HERMIT
+	hermit_direct_batch_finish(hermit_direct_batch, si);
+#endif
 	if (si)
 		put_swap_device(si);
 #ifdef CONFIG_HERMIT
@@ -5671,6 +5807,9 @@ out_release:
 		if (waitqueue_active(&swapcache_wq))
 			wake_up(&swapcache_wq);
 	}
+#ifdef CONFIG_HERMIT
+	hermit_direct_batch_finish(hermit_direct_batch, si);
+#endif
 	if (si)
 		put_swap_device(si);
 #ifdef CONFIG_HERMIT
@@ -6909,10 +7048,14 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
 {
 	struct vm_fault vmf = {
 #ifdef CONFIG_HERMIT
-		.hermit_fault_pc = regs && (flags & FAULT_FLAG_USER) &&
-			!(flags & (FAULT_FLAG_REMOTE | FAULT_FLAG_INSTRUCTION)) &&
-			current->mm == vma->vm_mm && user_mode(regs) ?
-			instruction_pointer(regs) : 0,
+		.hermit_fault_pc =
+			regs && (flags & FAULT_FLAG_USER) &&
+					!(flags & (FAULT_FLAG_REMOTE |
+						   FAULT_FLAG_INSTRUCTION)) &&
+					current->mm == vma->vm_mm &&
+					user_mode(regs) ?
+				instruction_pointer(regs) :
+				0,
 #endif
 		.vma = vma,
 		.address = address & PAGE_MASK,

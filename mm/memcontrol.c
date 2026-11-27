@@ -1348,8 +1348,9 @@ hermit_reclaim_watermarks(struct mem_cgroup *memcg)
 	if (hermit_policy_reserve_mode()) {
 		unsigned long reserve = hermit_policy_reserve(memcg);
 
-		return (struct hmt_reclaim_watermarks) {
-			.low = reserve / 2, .high = reserve,
+		return (struct hmt_reclaim_watermarks){
+			.low = reserve / 2,
+			.high = reserve,
 		};
 	}
 	return hmt_reclaim_watermarks(
@@ -1411,8 +1412,7 @@ static void hermit_reclaim_workfn(struct work_struct *work)
 	headroom = hermit_reclaim_watermarks(memcg).high;
 	spin_lock_irqsave(&hwork->lock, flags);
 	if (made_progress && hmt_ctl_flag(HMT_APT_RECLAIM) && headroom &&
-	    !css_is_dying(&memcg->css) &&
-	    mem_cgroup_margin(memcg) < headroom &&
+	    !css_is_dying(&memcg->css) && mem_cgroup_margin(memcg) < headroom &&
 	    hwork->requeues < HMT_MAX_RECLAIM_REQUEUES &&
 	    queue_work(system_unbound_wq, &hwork->work)) {
 		hwork->requeues++;
@@ -4976,6 +4976,71 @@ int mem_cgroup_swapin_charge_folio(struct folio *folio, struct mm_struct *mm,
 	css_put(&memcg->css);
 	return ret;
 }
+
+#ifdef CONFIG_HERMIT
+unsigned int mem_cgroup_swapin_charge_batch(struct folio **folios,
+					    const swp_entry_t *entries,
+					    unsigned int nr,
+					    struct mm_struct *mm, gfp_t gfp)
+{
+	HERMIT_ADC_SCOPE(ADC_CGROUP_ACCOUNT);
+	struct mem_cgroup *memcg;
+	unsigned short first_id;
+	unsigned int i;
+	bool same_id = true;
+
+	if (mem_cgroup_disabled() || !nr)
+		return nr;
+
+	first_id = lookup_swap_cgroup_id(entries[0]);
+	for (i = 1; i < nr; i++) {
+		if (lookup_swap_cgroup_id(entries[i]) != first_id) {
+			same_id = false;
+			break;
+		}
+	}
+
+	if (same_id) {
+		rcu_read_lock();
+		memcg = mem_cgroup_from_id(first_id);
+		if (!memcg || !css_tryget_online(&memcg->css))
+			memcg = get_mem_cgroup_from_mm(mm);
+		rcu_read_unlock();
+
+		if (!try_charge(memcg, gfp, nr)) {
+			css_get_many(&memcg->css, nr);
+			for (i = 0; i < nr; i++) {
+				commit_charge(folios[i], memcg);
+				memcg1_commit_charge(folios[i], memcg);
+			}
+			css_put(&memcg->css);
+			return nr;
+		}
+		css_put(&memcg->css);
+	}
+
+	/*
+	 * Fallback when entries belong to multiple cgroups or when a tight
+	 * budget can only satisfy a prefix of the batch.
+	 */
+	for (i = 0; i < nr; i++) {
+		unsigned short id = lookup_swap_cgroup_id(entries[i]);
+		int ret;
+
+		rcu_read_lock();
+		memcg = mem_cgroup_from_id(id);
+		if (!memcg || !css_tryget_online(&memcg->css))
+			memcg = get_mem_cgroup_from_mm(mm);
+		rcu_read_unlock();
+
+		ret = charge_memcg(folios[i], memcg, gfp);
+		css_put(&memcg->css);
+		if (ret)
+			break;
+	}
+	return i;
+}
+#endif
 
 struct uncharge_gather {
 	struct mem_cgroup *memcg;

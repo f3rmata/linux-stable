@@ -676,6 +676,12 @@ int mem_cgroup_charge_hugetlb(struct folio *folio, gfp_t gfp);
 
 int mem_cgroup_swapin_charge_folio(struct folio *folio, struct mm_struct *mm,
 				   gfp_t gfp, swp_entry_t entry);
+#ifdef CONFIG_HERMIT
+unsigned int mem_cgroup_swapin_charge_batch(struct folio **folios,
+					    const swp_entry_t *entries,
+					    unsigned int nr,
+					    struct mm_struct *mm, gfp_t gfp);
+#endif
 
 void __mem_cgroup_uncharge(struct folio *folio);
 
@@ -1195,6 +1201,15 @@ static inline int mem_cgroup_swapin_charge_folio(struct folio *folio,
 {
 	return 0;
 }
+#ifdef CONFIG_HERMIT
+static inline unsigned int
+mem_cgroup_swapin_charge_batch(struct folio **folios,
+			       const swp_entry_t *entries, unsigned int nr,
+			       struct mm_struct *mm, gfp_t gfp)
+{
+	return nr;
+}
+#endif
 
 static inline void mem_cgroup_uncharge(struct folio *folio)
 {

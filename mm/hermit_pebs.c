@@ -121,27 +121,40 @@ struct hermit_pebs_state {
 };
 
 enum hermit_policy_counter {
-	HPC_COMPLETED, HPC_EXPIRED, HPC_LATE, HPC_ALLOC_FAIL, HPC_EVICT,
+	HPC_COMPLETED,
+	HPC_EXPIRED,
+	HPC_LATE,
+	HPC_ALLOC_FAIL,
+	HPC_EVICT,
 	/* Sample pipeline: tracked mm -> recorded in an open window. */
-	HPC_SAMPLE_TARGET, HPC_SAMPLE_WINDOW,
+	HPC_SAMPLE_TARGET,
+	HPC_SAMPLE_WINDOW,
 	/* 4 KiB predictor: why PEBS did or did not extend a batch. */
-	HPC_PRED_CALLS, HPC_PRED_NO_ENTRY, HPC_PRED_FEW_REGIONS,
-	HPC_PRED_FEW_SAMPLES, HPC_PRED_NO_VOTES, HPC_PRED_EXTENDED, HPC_NR,
+	HPC_PRED_CALLS,
+	HPC_PRED_NO_ENTRY,
+	HPC_PRED_FEW_REGIONS,
+	HPC_PRED_FEW_SAMPLES,
+	HPC_PRED_NO_VOTES,
+	HPC_PRED_EXTENDED,
+	HPC_NR,
 };
 static atomic_long_t hermit_policy_counters[HPC_NR];
 static atomic_long_t hermit_actual_orders[HERMIT_PEBS_MAX_ORDER + 1];
-static const char * const hermit_policy_names[HPC_NR] = {
-	"windows_completed", "history_expired", "samples_late_or_untracked",
-	"metadata_alloc_failed", "table_evictions",
-	"samples_target_mm", "samples_in_window",
-	"predict_calls", "predict_no_entry", "predict_few_regions",
-	"predict_few_samples", "predict_no_votes", "predict_extended",
+static const char *const hermit_policy_names[HPC_NR] = {
+	"windows_completed",	     "history_expired",
+	"samples_late_or_untracked", "metadata_alloc_failed",
+	"table_evictions",	     "samples_target_mm",
+	"samples_in_window",	     "predict_calls",
+	"predict_no_entry",	     "predict_few_regions",
+	"predict_few_samples",	     "predict_no_votes",
+	"predict_extended",
 };
 
 static bool hermit_pebs_tracks(struct mm_struct *mm)
 {
 	return READ_ONCE(hermit_pebs_enabled) &&
-		(READ_ONCE(hermit_pebs_all) || READ_ONCE(mm->hermit_pebs_enabled));
+	       (READ_ONCE(hermit_pebs_all) ||
+		READ_ONCE(mm->hermit_pebs_enabled));
 }
 
 static u64 hermit_state_epoch(struct hermit_pebs_state *st)
@@ -154,7 +167,9 @@ static struct hermit_region *hermit_region_lookup(struct hermit_pebs_state *st,
 {
 	struct hermit_region *r;
 
-	hlist_for_each_entry(r, &st->buckets[hash_long(vaddr >> HERMIT_REGION_SHIFT, 8)], hnode)
+	hlist_for_each_entry(
+		r, &st->buckets[hash_long(vaddr >> HERMIT_REGION_SHIFT, 8)],
+		hnode)
 		if (r->vaddr == vaddr)
 			return r;
 	return NULL;
@@ -190,7 +205,8 @@ static struct hermit_pebs_state *hermit_pebs_state_get(struct mm_struct *mm)
 }
 
 static struct hermit_pc_entry *hermit_pc_get(struct hermit_pebs_state *st,
-		unsigned long pc, unsigned int offset, bool create)
+					     unsigned long pc,
+					     unsigned int offset, bool create)
 {
 	unsigned int hash = hash_long(pc ^ (offset << 4), 8);
 	struct hermit_pc_entry *p;
@@ -215,7 +231,8 @@ static struct hermit_pc_entry *hermit_pc_get(struct hermit_pebs_state *st,
 	} else {
 		p = kzalloc(sizeof(*p), GFP_NOWAIT | __GFP_NOWARN);
 		if (!p) {
-			atomic_long_inc(&hermit_policy_counters[HPC_ALLOC_FAIL]);
+			atomic_long_inc(
+				&hermit_policy_counters[HPC_ALLOC_FAIL]);
 			return NULL;
 		}
 		st->nr_pcs++;
@@ -280,7 +297,8 @@ static void hermit_windows_finish(struct hermit_pebs_state *st, u64 now)
 		hermit_window_remove(st, w);
 		if (w->data.epoch != hermit_state_epoch(st) ||
 		    now - w->data.end_ns >=
-			    (u64)READ_ONCE(hermit_pebs_history_ms) * NSEC_PER_MSEC) {
+			    (u64)READ_ONCE(hermit_pebs_history_ms) *
+				    NSEC_PER_MSEC) {
 			atomic_long_inc(&hermit_policy_counters[HPC_EXPIRED]);
 			continue;
 		}
@@ -341,7 +359,8 @@ static u8 *hermit_region_heat(struct hermit_region *r, u64 now)
 		r->heat = kzalloc(HERMIT_REGION_NR_SUBPAGES,
 				  GFP_NOWAIT | __GFP_NOWARN);
 		if (!r->heat) {
-			atomic_long_inc(&hermit_policy_counters[HPC_ALLOC_FAIL]);
+			atomic_long_inc(
+				&hermit_policy_counters[HPC_ALLOC_FAIL]);
 			return NULL;
 		}
 		r->heat_ns = now;
@@ -350,7 +369,7 @@ static u8 *hermit_region_heat(struct hermit_region *r, u64 now)
 }
 
 static struct hermit_region *hermit_region_get(struct hermit_pebs_state *st,
-					      unsigned long addr)
+					       unsigned long addr)
 {
 	unsigned long vaddr = addr & ~((1UL << HERMIT_REGION_SHIFT) - 1);
 	struct hermit_region *r = hermit_region_lookup(st, vaddr);
@@ -361,7 +380,8 @@ static struct hermit_region *hermit_region_get(struct hermit_pebs_state *st,
 		list_move(&r->lru, &st->lru);
 		return r;
 	}
-	if (st->nr_regions >= max_t(u32, 1, READ_ONCE(hermit_pebs_region_max))) {
+	if (st->nr_regions >=
+	    max_t(u32, 1, READ_ONCE(hermit_pebs_region_max))) {
 		r = list_last_entry(&st->lru, struct hermit_region, lru);
 		for (i = 0; i < ARRAY_SIZE(r->window); i++)
 			hermit_window_remove(st, &r->window[i]);
@@ -372,7 +392,8 @@ static struct hermit_region *hermit_region_get(struct hermit_pebs_state *st,
 	} else {
 		r = kzalloc(sizeof(*r), GFP_NOWAIT | __GFP_NOWARN);
 		if (!r) {
-			atomic_long_inc(&hermit_policy_counters[HPC_ALLOC_FAIL]);
+			atomic_long_inc(
+				&hermit_policy_counters[HPC_ALLOC_FAIL]);
 			return NULL;
 		}
 		st->nr_regions++;
@@ -384,7 +405,9 @@ static struct hermit_region *hermit_region_get(struct hermit_pebs_state *st,
 	if (heat)
 		memset(heat, 0, HERMIT_REGION_NR_SUBPAGES);
 	r->vaddr = vaddr;
-	hlist_add_head(&r->hnode, &st->buckets[hash_long(vaddr >> HERMIT_REGION_SHIFT, 8)]);
+	hlist_add_head(
+		&r->hnode,
+		&st->buckets[hash_long(vaddr >> HERMIT_REGION_SHIFT, 8)]);
 	list_add(&r->lru, &st->lru);
 	return r;
 }
@@ -446,14 +469,15 @@ out:
 }
 
 static void hermit_region_sample(struct mm_struct *mm, unsigned long addr,
-				u64 time, bool store)
+				 u64 time, bool store)
 {
 	struct hermit_pebs_state *st = READ_ONCE(mm->hermit_pebs);
 	struct hermit_region *r;
 	u64 now = ktime_get_ns();
 	unsigned int i;
 	bool recorded = false;
-	bool heat_on = hermit_policy_feature(HERMIT_POLICY_SPLIT) &&
+	bool heat_on = (hermit_policy_feature(HERMIT_POLICY_SPLIT) ||
+			hermit_policy_feature(HERMIT_POLICY_SPLIT_OBS)) &&
 		       hermit_policy_active(mm);
 
 	/* A resident folio can be sampled before the mm's first swap fault. */
@@ -469,25 +493,30 @@ static void hermit_region_sample(struct mm_struct *mm, unsigned long addr,
 	if (heat_on)
 		r = hermit_region_get(st, addr);
 	else
-		r = hermit_region_lookup(st, addr & ~((1UL << HERMIT_REGION_SHIFT) - 1));
+		r = hermit_region_lookup(
+			st, addr & ~((1UL << HERMIT_REGION_SHIFT) - 1));
 	if (r) {
 		u8 *heat = heat_on ? hermit_region_heat(r, now) : NULL;
 
 		/* Load and store misses both count as an access to the page. */
 		if (heat)
-			hermit_heat_add(heat, &r->heat_ns, hermit_page_offset(addr),
-					now, hermit_heat_period());
+			hermit_heat_add(heat, &r->heat_ns,
+					hermit_page_offset(addr), now,
+					hermit_heat_period());
 		for (i = 0; i < ARRAY_SIZE(r->window); i++) {
 			struct hermit_pending_window *w = &r->window[i];
 
-			if (w->pending && w->data.epoch == hermit_state_epoch(st) &&
-			    hermit_window_sample(&w->data, addr, time, now, store)) {
+			if (w->pending &&
+			    w->data.epoch == hermit_state_epoch(st) &&
+			    hermit_window_sample(&w->data, addr, time, now,
+						 store)) {
 				recorded = true;
 				break;
 			}
 		}
 	}
-	atomic_long_inc(&hermit_policy_counters[recorded ? HPC_SAMPLE_WINDOW : HPC_LATE]);
+	atomic_long_inc(&hermit_policy_counters[recorded ? HPC_SAMPLE_WINDOW :
+							   HPC_LATE]);
 	spin_unlock(&st->lock);
 }
 
@@ -504,13 +533,15 @@ bool hermit_pebs_snapshot(struct mm_struct *mm, unsigned long addr,
 	if (!st || !hermit_pebs_tracks(mm))
 		return false;
 	spin_lock(&st->lock);
-	r = hermit_region_lookup(st, addr & ~((1UL << HERMIT_REGION_SHIFT) - 1));
+	r = hermit_region_lookup(st,
+				 addr & ~((1UL << HERMIT_REGION_SHIFT) - 1));
 	if (r) {
 		for (i = 0; i < ARRAY_SIZE(r->window); i++) {
 			struct hermit_footprint_window *w = &r->window[i].data;
 
 			if (w->epoch != hermit_state_epoch(st) || !w->end_ns ||
-			    now >= w->close_ns || (found && w->start_ns <= out->start_ns))
+			    now >= w->close_ns ||
+			    (found && w->start_ns <= out->start_ns))
 				continue;
 			out->start_ns = w->start_ns;
 			out->end_ns = w->end_ns;
@@ -537,13 +568,72 @@ bool hermit_pebs_heat_read(struct mm_struct *mm, unsigned long addr,
 		return false;
 	now = ktime_get_ns();
 	spin_lock(&st->lock);
-	r = hermit_region_lookup(st, addr & ~((1UL << HERMIT_REGION_SHIFT) - 1));
+	r = hermit_region_lookup(st,
+				 addr & ~((1UL << HERMIT_REGION_SHIFT) - 1));
 	if (r && r->heat) {
-		hermit_heat_decay(r->heat, &r->heat_ns, now, hermit_heat_period());
+		hermit_heat_decay(r->heat, &r->heat_ns, now,
+				  hermit_heat_period());
 		memcpy(out, r->heat + offset, nr_pages);
 		found = true;
 	}
 	spin_unlock(&st->lock);
+	return found;
+}
+
+bool hermit_pebs_heat_skew(struct mm_struct *mm, unsigned long addr,
+			   unsigned int nr_pages, unsigned int hot_cov,
+			   unsigned int *total_out, unsigned int *k_out)
+{
+	struct hermit_pebs_state *st = READ_ONCE(mm->hermit_pebs);
+	struct hermit_region *r;
+	unsigned int offset = hermit_page_offset(addr);
+	unsigned int total = 0, k = 0;
+	u64 now;
+	bool found = false;
+
+	*total_out = 0;
+	*k_out = 0;
+	if (!st || !nr_pages || offset + nr_pages > HERMIT_REGION_NR_SUBPAGES ||
+	    offset + nr_pages < offset)
+		return false;
+	now = ktime_get_ns();
+	spin_lock(&st->lock);
+	r = hermit_region_lookup(st,
+				 addr & ~((1UL << HERMIT_REGION_SHIFT) - 1));
+	if (r && r->heat) {
+		u16 hist[U8_MAX + 1] = {};
+		unsigned int i, covered = 0, target;
+
+		hermit_heat_decay(r->heat, &r->heat_ns, now,
+				  hermit_heat_period());
+		for (i = 0; i < nr_pages; i++) {
+			u8 v = r->heat[offset + i];
+
+			if (v) {
+				hist[v]++;
+				total += v;
+			}
+		}
+		target = (total * hot_cov + 99) / 100;
+		for (i = U8_MAX; i > 0 && covered < target; i--) {
+			if (!hist[i])
+				continue;
+			if (covered + hist[i] * i <= target) {
+				covered += hist[i] * i;
+				k += hist[i];
+			} else {
+				unsigned int rem = target - covered;
+				unsigned int need = (rem + i - 1) / i;
+
+				k += need;
+				covered = target;
+			}
+		}
+		found = true;
+	}
+	spin_unlock(&st->lock);
+	*total_out = total;
+	*k_out = k;
 	return found;
 }
 
@@ -589,7 +679,6 @@ static void hermit_pebs_record(struct hermit_pebs_sample *s, bool store)
 	if (enabled) {
 		atomic_long_inc(&hermit_policy_counters[HPC_SAMPLE_TARGET]);
 		hermit_region_sample(mm, s->addr, s->time, store);
-		hermit_policy_sample(mm, s->addr, s->time);
 	}
 	mmput(mm);
 }
@@ -948,7 +1037,8 @@ unsigned int hermit_pebs_predict_pages(struct vm_fault *vmf)
 	struct hermit_pebs_state *st;
 	struct hermit_pc_entry *p;
 	u64 ttl = (u64)READ_ONCE(hermit_pebs_history_ms) * NSEC_PER_MSEC;
-	unsigned int i, j, regions = 0, loads = 0, votes[HERMIT_SWAPIN_MAX] = {};
+	unsigned int i, j, regions = 0, loads = 0,
+			   votes[HERMIT_SWAPIN_MAX] = {};
 	unsigned int offset = hermit_page_offset(vmf->address), nr = 1;
 	unsigned int reason = HPC_PRED_NO_ENTRY;
 	unsigned long seen = 0;
@@ -972,15 +1062,19 @@ unsigned int hermit_pebs_predict_pages(struct vm_fault *vmf)
 			continue;
 		/* Repeated windows of one region are one piece of evidence. */
 		for (j = 0; j < i; j++)
-			if ((seen & BIT(j)) && p->history.slot[j].region == f->region)
+			if ((seen & BIT(j)) &&
+			    p->history.slot[j].region == f->region)
 				break;
 		if (j < i)
 			continue;
 		seen |= BIT(i);
 		regions++;
 		loads += f->loads;
-		for (j = 1; j < HERMIT_SWAPIN_MAX && offset + j < HERMIT_REGION_NR_SUBPAGES; j++)
-			if (f->load[(offset + j) / 64] & BIT_ULL((offset + j) % 64))
+		for (j = 1; j < HERMIT_SWAPIN_MAX &&
+			    offset + j < HERMIT_REGION_NR_SUBPAGES;
+		     j++)
+			if (f->load[(offset + j) / 64] &
+			    BIT_ULL((offset + j) % 64))
 				votes[j]++;
 	}
 	if (regions < max_t(u32, 1, READ_ONCE(hermit_pebs_predict_regions))) {
@@ -988,7 +1082,8 @@ unsigned int hermit_pebs_predict_pages(struct vm_fault *vmf)
 	} else if (loads < READ_ONCE(hermit_pebs_predict_samples)) {
 		reason = HPC_PRED_FEW_SAMPLES;
 	} else {
-		while (nr < HERMIT_SWAPIN_MAX && offset + nr < HERMIT_REGION_NR_SUBPAGES &&
+		while (nr < HERMIT_SWAPIN_MAX &&
+		       offset + nr < HERMIT_REGION_NR_SUBPAGES &&
 		       votes[nr] * 4 >= regions * 3)
 			nr++;
 		reason = nr > 1 ? HPC_PRED_EXTENDED : HPC_PRED_NO_VOTES;
@@ -1179,10 +1274,14 @@ DEFINE_SHOW_ATTRIBUTE(hermit_ring_test);
 
 void hermit_pebs_debugfs_init(struct dentry *root)
 {
-	debugfs_create_u32("pebs_window_ms", 0600, root, &hermit_pebs_window_ms);
-	debugfs_create_u32("pebs_history_ms", 0600, root, &hermit_pebs_history_ms);
-	debugfs_create_u32("pebs_predict_regions", 0600, root, &hermit_pebs_predict_regions);
-	debugfs_create_u32("pebs_predict_samples", 0600, root, &hermit_pebs_predict_samples);
+	debugfs_create_u32("pebs_window_ms", 0600, root,
+			   &hermit_pebs_window_ms);
+	debugfs_create_u32("pebs_history_ms", 0600, root,
+			   &hermit_pebs_history_ms);
+	debugfs_create_u32("pebs_predict_regions", 0600, root,
+			   &hermit_pebs_predict_regions);
+	debugfs_create_u32("pebs_predict_samples", 0600, root,
+			   &hermit_pebs_predict_samples);
 	debugfs_create_u32("pebs_pc_max", 0600, root, &hermit_pebs_pc_max);
 	debugfs_create_file("pebs_ring_test", S_IRUSR, root, NULL,
 			    &hermit_ring_test_fops);
