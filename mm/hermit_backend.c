@@ -283,6 +283,7 @@ static int hermit_prepare_entries(swp_entry_t *entries, unsigned int nr,
 		reserved++;
 	}
 	xa_lock(&hermit_remote_entries);
+	/* The power-of-two alignment above divides the chunk size when nr fits. */
 	if (!hermit_remote_used || nr > hermit_remote_boundary) {
 		ret = -ENOSPC;
 		goto unlock;
@@ -423,27 +424,34 @@ bool hermit_backend_entry_remote(swp_entry_t entry)
 }
 EXPORT_SYMBOL_GPL(hermit_backend_entry_remote);
 
-static int hermit_io_offset(struct hermit_io *io, bool write)
+static int hermit_io_offset_locked(struct hermit_io *io, bool write)
 {
 	struct hermit_remote_page *p;
-	unsigned int i;
-	int ret = 0;
+	unsigned int i, nr = 1U << io->folio_order;
 
-	xa_lock(&hermit_remote_entries);
-	for (i = 0; i < (1U << io->folio_order); i++) {
+	for (i = 0; i < nr; i++) {
 		p = xa_load(&hermit_remote_entries, hermit_entry_offset(io->entry, i).val);
 		if (!p || (!write && !p->valid) ||
-		    p->generation != hermit_remote_generation) {
-			ret = -ESTALE;
-			break;
-		}
-		if (!i)
+		    p->generation != hermit_remote_generation)
+			return -ESTALE;
+		if (!i) {
 			io->remote_offset = p->offset;
-		else if (p->offset != io->remote_offset + i) {
-			ret = -ERANGE;
-			break;
+			if (nr > 1 && nr > hermit_remote_boundary -
+					(p->offset & (hermit_remote_boundary - 1)))
+				return -ERANGE;
+		} else if (p->offset != io->remote_offset + i) {
+			return -ERANGE;
 		}
 	}
+	return 0;
+}
+
+static int hermit_io_offset(struct hermit_io *io, bool write)
+{
+	int ret;
+
+	xa_lock(&hermit_remote_entries);
+	ret = hermit_io_offset_locked(io, write);
 	xa_unlock(&hermit_remote_entries);
 	return ret;
 }
@@ -459,17 +467,44 @@ int hermit_backend_offset(swp_entry_t entry, unsigned long *offset)
 }
 EXPORT_SYMBOL_GPL(hermit_backend_offset);
 
-bool hermit_backend_range_remote(swp_entry_t entry, unsigned int order)
+static bool hermit_range_matches(swp_entry_t entry, unsigned int order,
+				 bool remote)
 {
+	struct hermit_remote_page *p;
 	unsigned int i;
 
-	/* Coverage is independent of the order of the original WRITE. */
-	for (i = 0; i < (1U << order); i++)
-		if (!hermit_backend_entry_remote(hermit_entry_offset(entry, i)))
+	for (i = 0; i < (1U << order); i++) {
+		p = xa_load(&hermit_remote_entries, hermit_entry_offset(entry, i).val);
+		if ((p && p->valid) != remote)
 			return false;
+	}
 	return true;
 }
+
+bool hermit_backend_range_remote(swp_entry_t entry, unsigned int order)
+{
+	bool remote;
+
+	/* Remote ownership survives backend generation changes. */
+	xa_lock(&hermit_remote_entries);
+	remote = hermit_range_matches(entry, order, true);
+	xa_unlock(&hermit_remote_entries);
+	return remote;
+}
 EXPORT_SYMBOL_GPL(hermit_backend_range_remote);
+
+bool hermit_backend_swapin_extent(swp_entry_t entry, unsigned int order)
+{
+	struct hermit_io io = { .entry = entry, .folio_order = order };
+	bool ok;
+
+	xa_lock(&hermit_remote_entries);
+	/* A folio may be wholly local or readable in one remote chunk. */
+	ok = hermit_range_matches(entry, order, false) ||
+	     !hermit_io_offset_locked(&io, false);
+	xa_unlock(&hermit_remote_entries);
+	return ok;
+}
 
 void hermit_backend_account(unsigned int order, bool store, bool fallback,
 			    int error)

@@ -79,6 +79,7 @@ int hermit_backend_commit_remote(swp_entry_t entry, unsigned int order);
 void hermit_backend_abort_remote(swp_entry_t entry, unsigned int order);
 bool hermit_backend_entry_remote(swp_entry_t entry);
 bool hermit_backend_range_remote(swp_entry_t entry, unsigned int order);
+bool hermit_backend_swapin_extent(swp_entry_t entry, unsigned int order);
 int hermit_backend_entry_order(swp_entry_t entry);
 void hermit_backend_invalidate(swp_entry_t entry);
 void hermit_backend_account(unsigned int order, bool store, bool fallback,

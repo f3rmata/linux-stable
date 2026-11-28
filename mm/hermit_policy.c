@@ -20,6 +20,8 @@
 #include <linux/slab.h>
 #include <linux/swapops.h>
 
+#include "internal.h"
+
 /* Stream state is set-associative: a key hashes to one set and may occupy any
  * of its ways. With one slot per hash, two threads that collided reset each
  * other's run on every fault and never reached the large-folio threshold.
@@ -72,8 +74,7 @@ struct policy_stream {
 	unsigned long pc, start, end, last;
 	u16 sequential; /* consecutive base pages, demand + prefetch */
 	/* The last predicted batch [batch_start, batch_end) as actually read.
-	 * Later faults on its prefetched pages advance s->last through it, so a
-	 * run that breaks before batch_end left part of it unused.
+	 * Demand faults and accessed speculative PTEs advance last through it.
 	 */
 	unsigned long batch_start, batch_end;
 	u16 fit; /* length of the last predicted run, 0 = none yet */
@@ -83,6 +84,7 @@ struct policy_stream {
 	 */
 	u8 fit_order; /* ilog2(fit) */
 	u8 fit_stable; /* consecutive completed segments of fit_order */
+	u8 mapped; /* speculative PTEs after last, awaiting access feedback */
 };
 struct hermit_policy_state {
 	spinlock_t lock;
@@ -240,12 +242,47 @@ static void policy_stream_break(struct policy_stream *s)
 	s->batch_start = s->batch_end = 0;
 }
 
-/* @start/@nr is the PTE range installed by this fault. A large folio maps
- * all of it at once, so the stream advances to its end; a base page installs
- * only itself and later swapcache hits report the prefetched pages.
+/*
+ * The stream key restricts the sample to the current, read-locked VMA.
+ * A PTE batch stays within one PMD. pte_offset_map() keeps the table alive
+ * under RCU; only sample access bits, without nesting a PTL under st->lock.
+ * Aging, reclaim or a missing table can shorten the observed prefix.
+ */
+static void policy_observe_mapped(struct policy_stream *s, struct vm_fault *vmf)
+{
+	unsigned long addr = s->last + PAGE_SIZE;
+	unsigned int used = 0;
+	pmd_t *pmd;
+	pte_t *ptep;
+
+	if (!s->mapped)
+		return;
+	pmd = mm_find_pmd(vmf->vma->vm_mm, addr);
+	ptep = pmd ? pte_offset_map(pmd, addr) : NULL;
+	if (ptep) {
+		for (; used < s->mapped; used++) {
+			pte_t pte = ptep_get_lockless(ptep + used);
+
+			if (!pte_present(pte) || !pte_young(pte))
+				break;
+		}
+		pte_unmap(ptep);
+	}
+	s->last += (unsigned long)used * PAGE_SIZE;
+	s->sequential = min_t(unsigned int, 1024, s->sequential + used);
+	if ((vmf->address & PAGE_MASK) != s->last + PAGE_SIZE) {
+		if (used < s->mapped)
+			s->fit_stable = 0;
+		policy_stream_break(s);
+	}
+	s->mapped = 0;
+}
+
+/* @nr counts the demand folio's PTEs. The @mapped speculative base PTEs
+ * after it earn credit when the next fault samples their accessed bits.
  */
 void hermit_policy_installed(struct vm_fault *vmf, unsigned long start,
-			     unsigned int nr)
+			     unsigned int nr, unsigned int mapped)
 {
 	struct hermit_policy_state *st;
 	struct policy_stream *s;
@@ -265,6 +302,7 @@ void hermit_policy_installed(struct vm_fault *vmf, unsigned long start,
 		atomic_long_inc(&refault_pages);
 	st->refault = (st->refault * 7 + (refault ? 1024 : 0)) / 8;
 	s = policy_stream(st, vmf, true);
+	policy_observe_mapped(s, vmf); /* also covers swapcache hits */
 	if (s->time && now - s->time < POLICY_TTL &&
 	    start <= s->last + PAGE_SIZE && addr >= s->last + PAGE_SIZE &&
 	    addr < end) {
@@ -281,10 +319,9 @@ void hermit_policy_installed(struct vm_fault *vmf, unsigned long start,
 		s->sequential = nr > 1 ? min_t(unsigned int, 1024, nr - 1) : 0;
 	}
 	s->last = end - PAGE_SIZE;
+	s->mapped = mapped;
 	s->time = now;
-	/* hermit_swapin_pages() read this many pages from the demand page on;
-	 * later faults on them advance s->last through the batch.
-	 */
+	/* Track the full SG read even if only a prefix could be mapped. */
 	if (vmf->hermit_batch_pages > 1 && nr == 1) {
 		s->batch_start = addr;
 		s->batch_end = addr + (unsigned long)vmf->hermit_batch_pages *
@@ -303,7 +340,8 @@ void hermit_policy_installed(struct vm_fault *vmf, unsigned long start,
 
 		if (memcg) {
 			atomic_set(&memcg->hermit_refault, st->refault);
-			if (s->sequential >= 2 && st->refault < 256)
+			/* Reserve headroom for the whole installed batch. */
+			if (s->sequential + mapped >= 2 && st->refault < 256)
 				atomic64_set(&memcg->hermit_stream_until,
 					     now + 10 * NSEC_PER_MSEC);
 			mem_cgroup_put(memcg);
@@ -333,6 +371,8 @@ static unsigned int policy_run(struct hermit_policy_state *st,
 
 	if (remaining)
 		*remaining = 0;
+	if (s)
+		policy_observe_mapped(s, vmf);
 	if (!s || now - s->time >= POLICY_TTL || st->refault >= 256 ||
 	    (vmf->address & PAGE_MASK) != s->last + PAGE_SIZE)
 		return 0;

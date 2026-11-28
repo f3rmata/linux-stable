@@ -4522,33 +4522,8 @@ static enum swapin_extent swapin_thp_check(struct vm_fault *vmf, pte_t *ptep,
 		return SWAPIN_EXTENT_CACHE;
 
 #ifdef CONFIG_HERMIT
-	/* Legacy large-folio allocation also requires actual remote adjacency. */
-	{
-		bool any_remote = false;
-		int i;
-
-		for (i = 0; i < nr_pages; i++)
-			if (hermit_backend_entry_remote(swp_entry(
-				    swp_type(entry), swp_offset(entry) + i))) {
-				any_remote = true;
-				break;
-			}
-		if (any_remote) {
-			unsigned long first, offset;
-
-			if (!hermit_backend_range_remote(entry,
-							 ilog2(nr_pages)) ||
-			    hermit_backend_offset(entry, &first))
-				return SWAPIN_EXTENT_REMOTE;
-			for (i = 1; i < nr_pages; i++)
-				if (hermit_backend_offset(
-					    swp_entry(swp_type(entry),
-						      swp_offset(entry) + i),
-					    &offset) ||
-				    offset != first + i)
-					return SWAPIN_EXTENT_REMOTE;
-		}
-	}
+	if (!hermit_backend_swapin_extent(entry, ilog2(nr_pages)))
+		return SWAPIN_EXTENT_REMOTE;
 #endif
 
 	return SWAPIN_EXTENT_OK;
@@ -4992,10 +4967,8 @@ static unsigned int hermit_batch_ptes(struct vm_fault *vmf,
 				new = pte_mkwrite(new, vma);
 			rmap_flags |= RMAP_EXCLUSIVE;
 		}
-		/* Young, not old: these pages are mapped for the app, so the aging
-		 * consumer must see a real access, not a prefetch guess.
-		 */
-		new = pte_mkyoung(new);
+		/* Let hardware record consumption of the speculative mapping. */
+		new = pte_mkold(new);
 		flush_icache_pages(vma, page, 1);
 		if (folio_test_anon(folio))
 			folio_add_anon_rmap_pte(folio, page, vma, addr,
@@ -5069,7 +5042,7 @@ static unsigned int hermit_batch_ptes_direct(struct vm_fault *vmf, pte_t *ptep,
 		    !userfaultfd_pte_wp(vma, new) &&
 		    !pte_needs_soft_dirty_wp(vma, new))
 			new = pte_mkwrite(new, vma);
-		new = pte_mkyoung(new);
+		new = pte_mkold(new);
 
 		flush_icache_pages(vma, page, 1);
 		folio_add_new_anon_rmap(folio, vma, addr, RMAP_EXCLUSIVE);
@@ -5081,7 +5054,7 @@ static unsigned int hermit_batch_ptes_direct(struct vm_fault *vmf, pte_t *ptep,
 	mapped = i - 1;
 	if (mapped) {
 		add_mm_counter(mm, MM_ANONPAGES, mapped);
-		add_mm_counter(mm, MM_SWAPENTS, -mapped);
+		add_mm_counter(mm, MM_SWAPENTS, -(long)mapped);
 		hermit_policy_pte_installed(mapped);
 	}
 	if (i < pages) {
@@ -5702,17 +5675,16 @@ check_folio:
 			set_ptes(vma->vm_mm, address, ptep, pte, nr_pages));
 #ifdef CONFIG_HERMIT
 	if (hermit_remote_fault) {
-		unsigned int hermit_nr = nr_pages;
+		unsigned int mapped = 0;
 
 		if (static_branch_unlikely(&hermit_adc_key) && !swapcache &&
 		    vmf->hermit_folio_order && nr_pages > 1)
 			adc_interval.subtype = ADC_MEDIUM_SWAPIN;
 		/* PTEBATCH: map what the SG batch read for the addresses after
-		 * this one, under the PTE lock already held. The batch covers base
-		 * pages only, so the stream advances like a large folio install.
+		 * this one, under the PTE lock already held.
 		 */
 		if (nr_pages == 1)
-			hermit_nr += hermit_adc_call(
+			mapped = hermit_adc_call(
 				ADC_BATCH_SETPTE,
 				hermit_direct_batch ?
 					hermit_batch_ptes_direct(
@@ -5720,7 +5692,7 @@ check_folio:
 						hermit_direct_batch) :
 					hermit_batch_ptes(vmf, si, ptep,
 							  address));
-		hermit_policy_installed(vmf, address, hermit_nr);
+		hermit_policy_installed(vmf, address, nr_pages, mapped);
 		hermit_pebs_fault(vma->vm_mm, vmf->address,
 				  vmf->hermit_fault_pc,
 				  hermit_observe_start_ns);

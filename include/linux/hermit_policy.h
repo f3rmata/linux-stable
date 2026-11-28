@@ -64,7 +64,7 @@ void hermit_policy_medium_extent(enum swapin_extent reason);
 bool hermit_policy_active(struct mm_struct *mm);
 void hermit_policy_mm_exit(struct mm_struct *mm);
 void hermit_policy_installed(struct vm_fault *vmf, unsigned long start,
-			     unsigned int nr);
+			     unsigned int nr, unsigned int mapped);
 unsigned int hermit_policy_predict(struct vm_fault *vmf);
 /*
  * Cost instrumentation (debugfs swapin_cost_enable) only. @entry_val is a
